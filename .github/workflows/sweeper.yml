@@ -1,0 +1,40 @@
+# 標準CI自動見回り（sweeper）
+#
+# 毎日、全リポジトリを走査して標準CI未導入のNode/Pythonリポジトリへ自動配置し、
+# ブランチ保護を冪等に適用する。新規リポジトリの作り方（gh / Web / テンプレ /
+# どのAIエージェント経由か）に関係なく、翌日には標準が強制される。
+#
+# 必要セットアップ（1回だけ）:
+#   fine-grained PAT（All repositories / Contents: RW / Administration: RW）を
+#   このリポジトリの Actions secret `ADMIN_TOKEN` に登録する。
+#   GITHUB_TOKEN では他リポジトリへ書き込めないため PAT が必須。
+name: sweeper
+
+on:
+  schedule:
+    - cron: "0 21 * * *" # 毎日 06:00 JST
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: ADMIN_TOKEN の存在確認
+        env:
+          GH_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Actions secret ADMIN_TOKEN が未設定です（fine-grained PAT: Contents RW + Administration RW）"
+            exit 1
+          fi
+
+      - name: 全リポジトリを見回り
+        env:
+          GH_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+        run: bash scripts/sweep.sh | tee -a "$GITHUB_STEP_SUMMARY"

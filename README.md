@@ -16,11 +16,25 @@ CIが緑でないと main にマージできない** 状態を作るための中
 | `templates/python-caller.yml` | 同（Python） |
 | `scripts/setup-ci.sh` | 既存リポジトリへの後付け（ci.yml配置＋ブランチ保護） |
 
-## 各リポジトリへの導入
+## 導入は自動（sweeper）
+
+**人間・エージェントの記憶に依存しない。** `.github/workflows/sweeper.yml` が毎日06:00 JSTに
+全リポジトリを見回り、標準CI未導入の Node/Python リポジトリへ ci.yml を自動配置し、
+ブランチ保護を冪等に適用する。新規リポジトリはどう作っても翌朝までに標準が強制される。
+
+初回セットアップ（1回だけ）:
+
+1. fine-grained PAT を作成: Settings → Developer settings → Fine-grained tokens →
+   Repository access: **All repositories** / Permissions: **Contents: Read and write**,
+   **Administration: Read and write**
+2. このリポジトリの Settings → Secrets and variables → Actions に `ADMIN_TOKEN` として登録
+3. Actions タブ → sweeper → Run workflow で初回実行（以後は毎日自動）
+
+手動での個別導入も可能:
 
 ```bash
-scripts/setup-ci.sh /path/to/repo
-# 配置された .github/workflows/ci.yml を確認してコミット・push
+scripts/setup-ci.sh /path/to/repo   # 1リポジトリ後付け
+scripts/sweep.sh                     # ローカルから全リポジトリ見回り（GH_TOKEN必要）
 ```
 
 ## 設計方針
