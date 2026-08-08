@@ -111,8 +111,8 @@ jobs:
           # lockfile はコミット対象という方針のため、無い場合は警告で是正を促す。
           case "$PM" in
             pnpm)
-              if [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile
-              else echo "::warning::pnpm-lock.yaml が無いためロック無しインストール（lockfile のコミットを推奨）"; pnpm install; fi ;;
+              if [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile --config.strict-dep-builds=false
+              else echo "::warning::pnpm-lock.yaml が無いためロック無しインストール（lockfile のコミットを推奨）"; pnpm install --config.strict-dep-builds=false; fi ;;
             yarn)
               if [ -f yarn.lock ]; then corepack yarn install --immutable || yarn install --frozen-lockfile
               else echo "::warning::yarn.lock が無いためロック無しインストール（lockfile のコミットを推奨）"; yarn install; fi ;;
@@ -182,8 +182,8 @@ jobs:
           # lockfile はコミット対象という方針のため、無い場合は警告で是正を促す。
           case "$PM" in
             pnpm)
-              if [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile
-              else echo "::warning::pnpm-lock.yaml が無いためロック無しインストール（lockfile のコミットを推奨）"; pnpm install; fi ;;
+              if [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile --config.strict-dep-builds=false
+              else echo "::warning::pnpm-lock.yaml が無いためロック無しインストール（lockfile のコミットを推奨）"; pnpm install --config.strict-dep-builds=false; fi ;;
             yarn)
               if [ -f yarn.lock ]; then corepack yarn install --immutable || yarn install --frozen-lockfile
               else echo "::warning::yarn.lock が無いためロック無しインストール（lockfile のコミットを推奨）"; yarn install; fi ;;
