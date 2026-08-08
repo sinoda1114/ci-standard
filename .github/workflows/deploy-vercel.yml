@@ -1,0 +1,89 @@
+# Vercel 標準デプロイ（Reusable Workflow）
+#
+# Vercel のダッシュボード git 連携ではなくこの方式を標準とする理由:
+#   git 連携は「CIが赤でもデプロイされる」。この方式は CI 成功をゲートにできる。
+#
+# ビルドは CI 環境で行い（vercel build）、成果物をそのままデプロイする（--prebuilt）。
+#
+# 必要シークレット（呼び出し側リポジトリに登録）:
+#   VERCEL_TOKEN … Vercel ダッシュボード → Settings → Tokens で作成
+#
+# 必要な非シークレット値（呼び出し側の .github/ci.env に記載）:
+#   VERCEL_ORG_ID / VERCEL_PROJECT_ID … 対象プロジェクトの .vercel/project.json の値
+#   （ローカルで `npx vercel link` すると生成される。IDは秘密情報ではない）
+#
+# ロールバック: `npx vercel rollback --token=...`（docs/CD.md 参照）。
+
+name: Deploy to Vercel (standard)
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Node.js のバージョン"
+        type: string
+        required: false
+        default: "20"
+    secrets:
+      VERCEL_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: CI用環境変数を読み込み (.github/ci.env)
+        run: |
+          if [ -f .github/ci.env ]; then
+            grep -v '^\s*#' .github/ci.env >> "$GITHUB_ENV"
+          fi
+
+      - name: VERCEL_ORG_ID / VERCEL_PROJECT_ID の存在確認
+        run: |
+          if [ -z "${VERCEL_ORG_ID:-}" ] || [ -z "${VERCEL_PROJECT_ID:-}" ]; then
+            echo "::error::.github/ci.env に VERCEL_ORG_ID / VERCEL_PROJECT_ID を設定してください（npx vercel link で取得）"
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Pull Vercel environment
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: npx vercel pull --yes --environment=production --token="$VERCEL_TOKEN"
+
+      - name: Build
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: npx vercel build --prod --token="$VERCEL_TOKEN"
+
+      - name: Deploy (prebuilt)
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: npx vercel deploy --prebuilt --prod --token="$VERCEL_TOKEN"
+
+      - name: デプロイ結果の疎通確認（DEPLOY_HEALTHCHECK_URL があれば）
+        run: |
+          if [ -n "${DEPLOY_HEALTHCHECK_URL:-}" ]; then
+            sleep 10
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' -L --max-time 20 "$DEPLOY_HEALTHCHECK_URL")
+            echo "healthcheck: $DEPLOY_HEALTHCHECK_URL => $CODE"
+            case "$CODE" in
+              2*|3*) echo "OK" ;;
+              *) echo "::error::デプロイ後の疎通確認に失敗 ($CODE)"; exit 1 ;;
+            esac
+          else
+            echo "DEPLOY_HEALTHCHECK_URL 未設定のためスキップ（.github/ci.env で設定可能）"
+          fi

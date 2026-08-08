@@ -1,0 +1,30 @@
+# このファイルを対象リポジトリの .github/workflows/deploy.yml に置く。
+# main へのマージ（push）で: 標準CI → 成功したら Vercel デプロイ、まで自動実行する。
+#
+# 事前準備:
+#   1. Settings → Secrets and variables → Actions へ VERCEL_TOKEN を登録
+#   2. .github/ci.env に VERCEL_ORG_ID / VERCEL_PROJECT_ID を記載（npx vercel link で取得）
+#   3. Vercel ダッシュボード側の git 連携（自動デプロイ）は無効化しておく（二重デプロイ防止）
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {} # 緊急再デプロイ用
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false # デプロイは途中キャンセルしない（中途半端な状態を避ける）
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: sinoda1114/ci-standard/.github/workflows/node-ci.yml@main
+
+  deploy:
+    needs: ci
+    uses: sinoda1114/ci-standard/.github/workflows/deploy-vercel.yml@main
+    secrets:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
