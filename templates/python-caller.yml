@@ -1,0 +1,13 @@
+# このファイルを対象リポジトリの .github/workflows/ci.yml に置く。
+# 中身の実体は sinoda1114/ci-standard 側にあり、標準の改善は全リポジトリへ自動反映される。
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  ci:
+    uses: sinoda1114/ci-standard/.github/workflows/python-ci.yml@main
+    secrets: inherit

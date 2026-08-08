@@ -1,0 +1,84 @@
+# Python 標準CI（Reusable Workflow）
+#
+# 呼び出し側リポジトリの構成を自動判定し、存在するものだけ実行する:
+#   - 依存インストール … requirements.txt / pyproject.toml から判定
+#   - ruff (lint) … pyproject.toml に [tool.ruff] があるか ruff.toml があれば実行
+#   - pytest … tests/ ディレクトリか test_*.py があれば実行
+#   - pip-audit … 依存定義があれば実行（既知脆弱性の検出）
+#
+# リポジトリ固有のCI用環境変数（非シークレット）は .github/ci.env に置く。
+# シークレットは呼び出し側の `secrets: inherit` で届く。
+#
+# ブランチ保護の必須チェックは「ci / build」を指定する想定。
+
+name: Python CI (standard)
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: "Python のバージョン"
+        type: string
+        required: false
+        default: "3.12"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: pip
+
+      - name: CI用環境変数を読み込み (.github/ci.env)
+        run: |
+          if [ -f .github/ci.env ]; then
+            grep -v '^\s*#' .github/ci.env >> "$GITHUB_ENV"
+          fi
+
+      - name: 実行対象を判定
+        run: |
+          echo "HAS_REQUIREMENTS=$([ -f requirements.txt ] && echo true || echo false)" >> "$GITHUB_ENV"
+          echo "HAS_PYPROJECT=$([ -f pyproject.toml ] && echo true || echo false)" >> "$GITHUB_ENV"
+          if [ -f ruff.toml ] || { [ -f pyproject.toml ] && grep -q '\[tool\.ruff' pyproject.toml; }; then
+            echo "HAS_RUFF=true" >> "$GITHUB_ENV"
+          else
+            echo "HAS_RUFF=false" >> "$GITHUB_ENV"
+          fi
+          if [ -d tests ] || ls test_*.py */test_*.py >/dev/null 2>&1; then
+            echo "HAS_TESTS=true" >> "$GITHUB_ENV"
+          else
+            echo "HAS_TESTS=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install dependencies (requirements.txt)
+        if: env.HAS_REQUIREMENTS == 'true'
+        run: pip install -r requirements.txt
+
+      - name: Install dependencies (pyproject.toml)
+        if: env.HAS_REQUIREMENTS == 'false' && env.HAS_PYPROJECT == 'true'
+        run: pip install -e .
+
+      - name: Lint (ruff)
+        if: env.HAS_RUFF == 'true'
+        run: |
+          pip install ruff
+          ruff check .
+
+      - name: Test (pytest)
+        if: env.HAS_TESTS == 'true'
+        run: |
+          pip install pytest
+          pytest -x -q
+
+      - name: Audit (pip-audit)
+        if: env.HAS_REQUIREMENTS == 'true' || env.HAS_PYPROJECT == 'true'
+        run: |
+          pip install pip-audit
+          pip-audit || true
+        # 注: pip-audit は当面 report-only（|| true）。誤検知・修正不能な
+        # 推移的依存で全PJのCIが赤くなるのを避けるため。運用が安定したら
+        # `|| true` を外して強制化する。
