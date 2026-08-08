@@ -25,10 +25,14 @@ on:
         description: "Node.js のバージョン"
         type: string
         required: false
-        default: "20"
+        default: "22"
 
 permissions:
   contents: read
+
+# corepack が pnpm/yarn を初回DLする際の対話プロンプトでCIが止まらないようにする
+env:
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
 
 jobs:
   detect:
