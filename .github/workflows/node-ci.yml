@@ -49,7 +49,13 @@ jobs:
             echo "has-node=false" >> "$GITHUB_OUTPUT"
             echo "::notice::package.json が無いため Node ステップをスキップ（テンプレ/初期リポジトリ）"
           fi
-          if ls playwright.config.* >/dev/null 2>&1; then
+          # .github/ci-skip-e2e が置いてあるリポジトリは e2e を CI 対象外にする
+          # （e2e がローカル専用設計でCI環境に対応していないリポジトリ用のオプトアウト。
+          #   CI対応が整備できたらマーカーを削除して有効化する）
+          if [ -f .github/ci-skip-e2e ]; then
+            echo "has-e2e=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::.github/ci-skip-e2e により e2e をスキップ"
+          elif ls playwright.config.* >/dev/null 2>&1; then
             echo "has-e2e=true" >> "$GITHUB_OUTPUT"
           else
             echo "has-e2e=false" >> "$GITHUB_OUTPUT"
