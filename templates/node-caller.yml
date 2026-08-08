@@ -7,6 +7,14 @@ on:
   push:
     branches: [main]
 
+# 同一refに新しいpushが来たら進行中の旧ジョブをキャンセル（無駄打ち防止）
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   ci:
     uses: sinoda1114/ci-standard/.github/workflows/node-ci.yml@main

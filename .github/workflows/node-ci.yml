@@ -2,12 +2,17 @@
 #
 # 呼び出し側リポジトリの構成を自動判定し、存在するものだけ実行する:
 #   - lint / typecheck / test(カバレッジ優先) / build … package.json の scripts から判定
-#   - npm audit … package-lock.json があれば実行
+#   - npm audit … 常時実行（high 以上で失敗、moderate 以下は許容）
 #   - e2e … playwright.config.* があればジョブごと実行（無ければ skipped）
+#   - package.json が無い場合（テンプレ直後の空リポジトリ）は全て skip して緑にする
 #
 # リポジトリ固有のCI用環境変数（非シークレット）は .github/ci.env に
 # KEY=VALUE 形式で置くと自動で読み込まれる。シークレットは呼び出し側の
 # `secrets: inherit` でそのまま届く。
+#
+# サプライチェーン規律:
+#   - 外部 action は SHA 固定（タグの改ざん・付け替えに追従しないため）
+#   - GITHUB_TOKEN は contents: read のみ（least privilege）
 #
 # ブランチ保護の必須チェックは「ci / build」「ci / e2e」を指定する想定
 # （e2e はジョブ skip 時も必須チェックを満たす）。
@@ -23,16 +28,27 @@ on:
         required: false
         default: "20"
 
+permissions:
+  contents: read
+
 jobs:
   detect:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
+      has-node: ${{ steps.checks.outputs.has-node }}
       has-e2e: ${{ steps.checks.outputs.has-e2e }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - id: checks
-        name: e2e 構成の有無を判定
+        name: リポジトリ構成を判定
         run: |
+          if [ -f package.json ]; then
+            echo "has-node=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has-node=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::package.json が無いため Node ステップをスキップ（テンプレ/初期リポジトリ）"
+          fi
           if ls playwright.config.* >/dev/null 2>&1; then
             echo "has-e2e=true" >> "$GITHUB_OUTPUT"
           else
@@ -40,22 +56,28 @@ jobs:
           fi
 
   build:
+    needs: detect
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.detect.outputs.has-node == 'true'
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: needs.detect.outputs.has-node == 'true'
         with:
           node-version: ${{ inputs.node-version }}
           cache: npm
 
       - name: CI用環境変数を読み込み (.github/ci.env)
+        if: needs.detect.outputs.has-node == 'true'
         run: |
           if [ -f .github/ci.env ]; then
             grep -v '^\s*#' .github/ci.env >> "$GITHUB_ENV"
           fi
 
       - name: 実行対象スクリプトを判定
+        if: needs.detect.outputs.has-node == 'true'
         run: |
           has() { node -e "process.exit(require('./package.json').scripts?.['$1'] ? 0 : 1)"; }
           echo "HAS_LINT=$(has lint && echo true || echo false)" >> "$GITHUB_ENV"
@@ -65,39 +87,42 @@ jobs:
           echo "HAS_BUILD=$(has build && echo true || echo false)" >> "$GITHUB_ENV"
 
       - name: Install dependencies
+        if: needs.detect.outputs.has-node == 'true'
         run: npm ci
 
       - name: Lint
-        if: env.HAS_LINT == 'true'
+        if: needs.detect.outputs.has-node == 'true' && env.HAS_LINT == 'true'
         run: npm run lint
 
       - name: Typecheck
-        if: env.HAS_TYPECHECK == 'true'
+        if: needs.detect.outputs.has-node == 'true' && env.HAS_TYPECHECK == 'true'
         run: npm run typecheck
 
       - name: Test (カバレッジ閾値チェック込み)
-        if: env.HAS_COVERAGE == 'true'
+        if: needs.detect.outputs.has-node == 'true' && env.HAS_COVERAGE == 'true'
         run: npm run test:coverage
 
       - name: Test
-        if: env.HAS_COVERAGE == 'false' && env.HAS_TEST == 'true'
+        if: needs.detect.outputs.has-node == 'true' && env.HAS_COVERAGE == 'false' && env.HAS_TEST == 'true'
         run: npm test
 
       - name: Build
-        if: env.HAS_BUILD == 'true'
+        if: needs.detect.outputs.has-node == 'true' && env.HAS_BUILD == 'true'
         run: npm run build
 
       - name: Audit (high以上を検出)
+        if: needs.detect.outputs.has-node == 'true'
         run: npm audit --audit-level=high
 
   e2e:
     needs: detect
-    if: needs.detect.outputs.has-e2e == 'true'
+    if: needs.detect.outputs.has-node == 'true' && needs.detect.outputs.has-e2e == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ inputs.node-version }}
           cache: npm
@@ -125,7 +150,7 @@ jobs:
 
       - name: Upload Playwright report
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: playwright-report
           path: playwright-report/
