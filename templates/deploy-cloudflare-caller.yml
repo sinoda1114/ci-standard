@@ -24,6 +24,8 @@ jobs:
 
   deploy:
     needs: ci
+    # workflow_dispatch を任意ブランチで実行しても main 以外は本番に届かないようガード
+    if: github.ref == 'refs/heads/main'
     uses: sinoda1114/ci-standard/.github/workflows/deploy-cloudflare.yml@main
     secrets:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

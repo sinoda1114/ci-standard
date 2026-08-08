@@ -77,9 +77,13 @@ jobs:
       - name: デプロイ結果の疎通確認（DEPLOY_HEALTHCHECK_URL があれば）
         run: |
           if [ -n "${DEPLOY_HEALTHCHECK_URL:-}" ]; then
-            sleep 10
-            CODE=$(curl -s -o /dev/null -w '%{http_code}' -L --max-time 20 "$DEPLOY_HEALTHCHECK_URL")
-            echo "healthcheck: $DEPLOY_HEALTHCHECK_URL => $CODE"
+            # 反映伝播を考慮して最大3回（10秒間隔）リトライ
+            for i in 1 2 3; do
+              sleep 10
+              CODE=$(curl -s -o /dev/null -w '%{http_code}' -L --max-time 20 "$DEPLOY_HEALTHCHECK_URL")
+              echo "healthcheck($i): $DEPLOY_HEALTHCHECK_URL => $CODE"
+              case "$CODE" in 2*|3*) break ;; esac
+            done
             case "$CODE" in
               2*|3*) echo "OK" ;;
               *) echo "::error::デプロイ後の疎通確認に失敗 ($CODE)"; exit 1 ;;
