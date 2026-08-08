@@ -1,0 +1,54 @@
+# 本番URL死活監視（最小構成・追加アカウント不要）
+#
+# monitor-urls.txt の各URLへ30分ごとに疎通確認し、失敗したらこのリポジトリに
+# Issue を自動起票する（同一URLのオープンIssueがあれば重複起票しない）。
+# 回復時のクローズは人間が確認して行う（誤クローズ防止のため自動化しない）。
+#
+# 対象の追加/削除は monitor-urls.txt を編集するだけ。
+
+name: monitor
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: URL疎通確認と障害Issue起票
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          FAIL=0
+          while IFS= read -r URL; do
+            case "$URL" in ""|\#*) continue;; esac
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' -L --max-time 20 "$URL" || echo "000")
+            # 一時的な揺らぎ対策: 失敗時は20秒後に1回だけ再試行
+            if ! case "$CODE" in 2*|3*) true;; *) false;; esac; then
+              sleep 20
+              CODE=$(curl -s -o /dev/null -w '%{http_code}' -L --max-time 20 "$URL" || echo "000")
+            fi
+            case "$CODE" in
+              2*|3*) echo "OK   $CODE $URL" ;;
+              *)
+                echo "FAIL $CODE $URL"
+                FAIL=1
+                TITLE="[monitor] DOWN: $URL"
+                if [ -z "$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$TITLE\" in:title" --json number -q '.[0].number')" ]; then
+                  gh issue create --repo "$GITHUB_REPOSITORY" \
+                    --title "$TITLE" \
+                    --body "$(printf '死活監視が失敗しました。\n\n- URL: %s\n- HTTPコード: %s\n- 時刻: %s\n\n回復を確認したらこのIssueをクローズしてください。' "$URL" "$CODE" "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
+                fi
+                ;;
+            esac
+          done < monitor-urls.txt
+          exit $FAIL

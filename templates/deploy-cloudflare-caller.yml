@@ -1,0 +1,30 @@
+# このファイルを対象リポジトリの .github/workflows/deploy.yml に置く。
+# main へのマージ（push）で: 標準CI → 成功したらデプロイ、まで自動実行する。
+# 手動デプロイ（npm run deploy のローカル実行）は原則廃止し、この経路に一本化する。
+#
+# 事前に対象リポジトリの Settings → Secrets and variables → Actions へ登録:
+#   CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {} # 緊急再デプロイ用
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false # デプロイは途中キャンセルしない（中途半端な状態を避ける）
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: sinoda1114/ci-standard/.github/workflows/node-ci.yml@main
+
+  deploy:
+    needs: ci
+    uses: sinoda1114/ci-standard/.github/workflows/deploy-cloudflare.yml@main
+    secrets:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

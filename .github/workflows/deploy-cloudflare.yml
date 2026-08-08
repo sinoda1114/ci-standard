@@ -1,0 +1,72 @@
+# Cloudflare (Pages/Workers) 標準デプロイ（Reusable Workflow）
+#
+# 前提: 呼び出し側リポジトリの package.json に `deploy` スクリプトがあること
+# （例: "deploy": "npm run build && wrangler pages deploy dist"）。
+# wrangler は CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID 環境変数で非対話認証される。
+#
+# 必要シークレット（呼び出し側リポジトリに登録）:
+#   CLOUDFLARE_API_TOKEN … ダッシュボード → My Profile → API Tokens で作成
+#                          （テンプレート「Cloudflare Pages:Edit」等、最小権限で）
+#   CLOUDFLARE_ACCOUNT_ID … ダッシュボード右下の Account ID
+#
+# ロールバック: docs/CD.md 参照（wrangler pages deployment list → rollback）。
+
+name: Deploy to Cloudflare (standard)
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Node.js のバージョン"
+        type: string
+        required: false
+        default: "20"
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        required: true
+      CLOUDFLARE_ACCOUNT_ID:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: CI用環境変数を読み込み (.github/ci.env)
+        run: |
+          if [ -f .github/ci.env ]; then
+            grep -v '^\s*#' .github/ci.env >> "$GITHUB_ENV"
+          fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npm run deploy
+
+      - name: デプロイ結果の疎通確認（DEPLOY_HEALTHCHECK_URL があれば）
+        run: |
+          if [ -n "${DEPLOY_HEALTHCHECK_URL:-}" ]; then
+            sleep 10
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' -L --max-time 20 "$DEPLOY_HEALTHCHECK_URL")
+            echo "healthcheck: $DEPLOY_HEALTHCHECK_URL => $CODE"
+            case "$CODE" in
+              2*|3*) echo "OK" ;;
+              *) echo "::error::デプロイ後の疎通確認に失敗 ($CODE)"; exit 1 ;;
+            esac
+          else
+            echo "DEPLOY_HEALTHCHECK_URL 未設定のためスキップ（.github/ci.env で設定可能）"
+          fi

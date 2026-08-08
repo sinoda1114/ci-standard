@@ -1,0 +1,4 @@
+# 死活監視対象URL（1行1URL。#で始まる行と空行は無視）
+# 監視間隔: 30分（.github/workflows/monitor.yml）。失敗時はこのリポジトリにIssue起票。
+https://nozei-schedule.pages.dev
+https://shinoda-dev-lp.vercel.app
