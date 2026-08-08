@@ -1,14 +1,13 @@
 # Node/TS 標準CI（Reusable Workflow）
 #
 # 呼び出し側リポジトリの構成を自動判定し、存在するものだけ実行する:
+#   - パッケージマネージャ … lockfile から自動判定（npm / pnpm / yarn）。corepack で有効化
 #   - lint / typecheck / test(カバレッジ優先) / build … package.json の scripts から判定
-#   - npm audit … 常時実行（high 以上で失敗、moderate 以下は許容）
-#   - e2e … playwright.config.* があればジョブごと実行（無ければ skipped）
+#   - audit … high 以上で失敗（yarn のみ best-effort）
+#   - e2e … playwright.config.* があればジョブごと実行（.github/ci-skip-e2e でオプトアウト可）
 #   - package.json が無い場合（テンプレ直後の空リポジトリ）は全て skip して緑にする
 #
-# リポジトリ固有のCI用環境変数（非シークレット）は .github/ci.env に
-# KEY=VALUE 形式で置くと自動で読み込まれる。シークレットは呼び出し側の
-# `secrets: inherit` でそのまま届く。
+# リポジトリ固有のCI用環境変数（非シークレット）は .github/ci.env に KEY=VALUE で置く。
 #
 # サプライチェーン規律:
 #   - 外部 action は SHA 固定（タグの改ざん・付け替えに追従しないため）
@@ -38,10 +37,11 @@ jobs:
     outputs:
       has-node: ${{ steps.checks.outputs.has-node }}
       has-e2e: ${{ steps.checks.outputs.has-e2e }}
+      pm: ${{ steps.checks.outputs.pm }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - id: checks
-        name: リポジトリ構成を判定
+        name: リポジトリ構成とパッケージマネージャを判定
         run: |
           if [ -f package.json ]; then
             echo "has-node=true" >> "$GITHUB_OUTPUT"
@@ -49,9 +49,15 @@ jobs:
             echo "has-node=false" >> "$GITHUB_OUTPUT"
             echo "::notice::package.json が無いため Node ステップをスキップ（テンプレ/初期リポジトリ）"
           fi
-          # .github/ci-skip-e2e が置いてあるリポジトリは e2e を CI 対象外にする
-          # （e2e がローカル専用設計でCI環境に対応していないリポジトリ用のオプトアウト。
-          #   CI対応が整備できたらマーカーを削除して有効化する）
+          # パッケージマネージャは lockfile で判定（setup-node の cache 指定にも使う）
+          if [ -f pnpm-lock.yaml ]; then
+            echo "pm=pnpm" >> "$GITHUB_OUTPUT"
+          elif [ -f yarn.lock ]; then
+            echo "pm=yarn" >> "$GITHUB_OUTPUT"
+          else
+            echo "pm=npm" >> "$GITHUB_OUTPUT"
+          fi
+          # .github/ci-skip-e2e が置いてあるリポジトリは e2e を CI 対象外にする（ローカル専用e2e向け）
           if [ -f .github/ci-skip-e2e ]; then
             echo "has-e2e=false" >> "$GITHUB_OUTPUT"
             echo "::notice::.github/ci-skip-e2e により e2e をスキップ"
@@ -63,27 +69,28 @@ jobs:
 
   build:
     needs: detect
+    if: needs.detect.outputs.has-node == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: needs.detect.outputs.has-node == 'true'
+
+      # corepack で package.json の packageManager フィールドに従い pnpm/yarn を有効化
+      - name: Enable corepack
+        run: corepack enable
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        if: needs.detect.outputs.has-node == 'true'
         with:
           node-version: ${{ inputs.node-version }}
-          cache: npm
+          cache: ${{ needs.detect.outputs.pm }}
 
       - name: CI用環境変数を読み込み (.github/ci.env)
-        if: needs.detect.outputs.has-node == 'true'
         run: |
           if [ -f .github/ci.env ]; then
             grep -v '^\s*#' .github/ci.env >> "$GITHUB_ENV"
           fi
 
       - name: 実行対象スクリプトを判定
-        if: needs.detect.outputs.has-node == 'true'
         run: |
           has() { node -e "process.exit(require('./package.json').scripts?.['$1'] ? 0 : 1)"; }
           echo "HAS_LINT=$(has lint && echo true || echo false)" >> "$GITHUB_ENV"
@@ -93,32 +100,45 @@ jobs:
           echo "HAS_BUILD=$(has build && echo true || echo false)" >> "$GITHUB_ENV"
 
       - name: Install dependencies
-        if: needs.detect.outputs.has-node == 'true'
-        run: npm ci
+        env:
+          PM: ${{ needs.detect.outputs.pm }}
+        run: |
+          case "$PM" in
+            pnpm) pnpm install --frozen-lockfile ;;
+            yarn) corepack yarn install --immutable || yarn install --frozen-lockfile ;;
+            *)    npm ci ;;
+          esac
 
       - name: Lint
-        if: needs.detect.outputs.has-node == 'true' && env.HAS_LINT == 'true'
-        run: npm run lint
+        if: env.HAS_LINT == 'true'
+        run: ${{ needs.detect.outputs.pm }} run lint
 
       - name: Typecheck
-        if: needs.detect.outputs.has-node == 'true' && env.HAS_TYPECHECK == 'true'
-        run: npm run typecheck
+        if: env.HAS_TYPECHECK == 'true'
+        run: ${{ needs.detect.outputs.pm }} run typecheck
 
       - name: Test (カバレッジ閾値チェック込み)
-        if: needs.detect.outputs.has-node == 'true' && env.HAS_COVERAGE == 'true'
-        run: npm run test:coverage
+        if: env.HAS_COVERAGE == 'true'
+        run: ${{ needs.detect.outputs.pm }} run test:coverage
 
       - name: Test
-        if: needs.detect.outputs.has-node == 'true' && env.HAS_COVERAGE == 'false' && env.HAS_TEST == 'true'
-        run: npm test
+        if: env.HAS_COVERAGE == 'false' && env.HAS_TEST == 'true'
+        run: ${{ needs.detect.outputs.pm }} test
 
       - name: Build
-        if: needs.detect.outputs.has-node == 'true' && env.HAS_BUILD == 'true'
-        run: npm run build
+        if: env.HAS_BUILD == 'true'
+        run: ${{ needs.detect.outputs.pm }} run build
 
       - name: Audit (high以上を検出)
-        if: needs.detect.outputs.has-node == 'true'
-        run: npm audit --audit-level=high
+        env:
+          PM: ${{ needs.detect.outputs.pm }}
+        run: |
+          case "$PM" in
+            pnpm) pnpm audit --audit-level high ;;
+            # yarn は classic/berry で audit の作法が違うため best-effort（CIを落とさない）
+            yarn) yarn npm audit --severity high || yarn audit --level high || true ;;
+            *)    npm audit --audit-level=high ;;
+          esac
 
   e2e:
     needs: detect
@@ -128,10 +148,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Enable corepack
+        run: corepack enable
+
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ inputs.node-version }}
-          cache: npm
+          cache: ${{ needs.detect.outputs.pm }}
 
       - name: CI用環境変数を読み込み (.github/ci.env)
         run: |
@@ -140,19 +163,28 @@ jobs:
           fi
 
       - name: Install dependencies
-        run: npm ci
+        env:
+          PM: ${{ needs.detect.outputs.pm }}
+        run: |
+          case "$PM" in
+            pnpm) pnpm install --frozen-lockfile ;;
+            yarn) corepack yarn install --immutable || yarn install --frozen-lockfile ;;
+            *)    npm ci ;;
+          esac
 
       - name: DBマイグレーション（スクリプトがあれば）
+        env:
+          PM: ${{ needs.detect.outputs.pm }}
         run: |
           if node -e "process.exit(require('./package.json').scripts?.['db:migrate'] ? 0 : 1)"; then
-            npm run db:migrate
+            "$PM" run db:migrate
           fi
 
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium
 
       - name: E2E tests
-        run: npm run test:e2e
+        run: ${{ needs.detect.outputs.pm }} run test:e2e
 
       - name: Upload Playwright report
         if: failure()
