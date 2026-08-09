@@ -177,10 +177,9 @@ jobs:
     if: needs.detect.outputs.has-node == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    permissions:
-      contents: read
-      pull-requests: write # React Doctor のPRサマリーコメント
-      statuses: write      # React Doctor のスコア commit status
+    # 権限は要求しない。Reusable Workflow は呼び出し側（contents: read のみ）より
+    # 広い権限を要求すると startup_failure で起動できないため（実測で確認）。
+    # そのため React Doctor の PRコメント / commit status は無効にして走らせる。
     steps:
       # React Doctor の changed スコープは base との比較に全履歴が要る
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -200,6 +199,11 @@ jobs:
         uses: millionco/react-doctor@d23a0d723c1f56a691c39203036b763299eff012 # react-doctor@0.9.11
         with:
           blocking: ${{ needs.detect.outputs.fallow-strict == 'true' && 'error' || 'none' }}
+          # 書き込み権限が無いため出力はジョブログのみ（PRコメント/レビュー/statusは無効）
+          comment: "false"
+          review-comments: "false"
+          commit-status: "false"
+
 
   e2e:
     needs: detect
