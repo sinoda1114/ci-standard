@@ -7,17 +7,27 @@ jobs:
   probe:
     runs-on: ubuntu-latest
     steps:
-      - name: トークンの実権限を確認
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: sweeper と同一の呼び出しで再現確認
         env:
           GH_TOKEN: ${{ secrets.ADMIN_TOKEN }}
         run: |
-          echo "--- /user ---"
-          gh api /user -q '.login' || echo "user取得失敗"
-          echo "--- 対象リポジトリの参照 ---"
-          gh api /repos/sinoda1114/GAS -q '.full_name' || echo "repo参照失敗"
-          echo "--- ラベル一覧(GET) ---"
-          gh api /repos/sinoda1114/GAS/labels -q 'length' || echo "labels GET失敗"
-          echo "--- ラベル作成(POST) ---"
-          gh api -X POST /repos/sinoda1114/GAS/labels -f name="probe-tmp" -f color="ededed" 2>&1 | head -3
+          R=Dir
+          echo "--- 1) description付き POST（sweeperと同形） ---"
+          gh api -X POST "/repos/sinoda1114/$R/labels" -f name="probe-a" -f color="0e8a16" -f description="新機能" 2>&1 | head -2
+          echo "--- 2) sweeper の LABELS 変数を再現して1件だけ ---"
+          LABELS="type:perf|1d76db|パフォーマンス改善"
+          while IFS='|' read -r LN LC LD; do
+            echo "LN=[$LN] LC=[$LC] LD=[$LD]"
+            CUR=$(gh api "/repos/sinoda1114/$R/labels/${LN}" 2>/dev/null || true)
+            echo "CUR is empty? [${CUR:-EMPTY}]" | head -1
+            if [ -z "$CUR" ]; then
+              if ERR=$(gh api -X POST "/repos/sinoda1114/$R/labels" -f name="$LN" -f color="$LC" -f description="$LD" 2>&1 >/dev/null); then
+                echo "作成OK"
+              else
+                echo "作成NG: $ERR"
+              fi
+            fi
+          done <<< "$LABELS"
           echo "--- 後始末 ---"
-          gh api -X DELETE /repos/sinoda1114/GAS/labels/probe-tmp 2>&1 | head -2 || true
+          gh api -X DELETE "/repos/sinoda1114/$R/labels/probe-a" >/dev/null 2>&1 || true
