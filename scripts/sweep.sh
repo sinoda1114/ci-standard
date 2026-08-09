@@ -77,25 +77,41 @@ type:test|c5def5|テストの追加・修正
 type:docs|0075ca|ドキュメント
 type:chore|ededed|雑務・依存更新・CI設定など"
 
-sync_labels() { # sync_labels <repo> → 作成/更新した数を返す
-  local R=$1 CHANGED=0
+sync_labels() { # sync_labels <repo> → "N件是正" / "OK" / "失敗(理由)"
+  local R=$1 CHANGED=0 FAILED=0 REASON=""
   while IFS='|' read -r LN LC LD; do
     [ -z "$LN" ] && continue
     local CUR
     CUR=$(gh api "/repos/${OWNER}/${R}/labels/${LN}" 2>/dev/null || true)
     if [ -z "$CUR" ]; then
-      gh api -X POST "/repos/${OWNER}/${R}/labels" -f name="$LN" -f color="$LC" -f description="$LD" >/dev/null 2>>"$ERRLOG" && CHANGED=$((CHANGED+1))
+      if gh api -X POST "/repos/${OWNER}/${R}/labels" -f name="$LN" -f color="$LC" -f description="$LD" >/dev/null 2>>"$ERRLOG"; then
+        CHANGED=$((CHANGED+1))
+      else
+        FAILED=$((FAILED+1)); REASON=$(tail -1 "$ERRLOG")
+      fi
     else
       # 色/説明がポリシーと違えば是正（冪等）
       local CC CDESC
       CC=$(printf '%s' "$CUR" | jq -r '.color // empty')
       CDESC=$(printf '%s' "$CUR" | jq -r '.description // empty')
       if [ "$CC" != "$LC" ] || [ "$CDESC" != "$LD" ]; then
-        gh api -X PATCH "/repos/${OWNER}/${R}/labels/${LN}" -f new_name="$LN" -f color="$LC" -f description="$LD" >/dev/null 2>>"$ERRLOG" && CHANGED=$((CHANGED+1))
+        if gh api -X PATCH "/repos/${OWNER}/${R}/labels/${LN}" -f new_name="$LN" -f color="$LC" -f description="$LD" >/dev/null 2>>"$ERRLOG"; then
+          CHANGED=$((CHANGED+1))
+        else
+          FAILED=$((FAILED+1)); REASON=$(tail -1 "$ERRLOG")
+        fi
       fi
     fi
   done <<< "$LABELS"
-  echo "$CHANGED"
+  # 失敗を黙って握り潰さない（0件是正に見えて実は権限不足、という事故を防ぐ）
+  if [ "$FAILED" -gt 0 ]; then
+    echo "::warning::${R} ラベル同期に失敗 ${FAILED}件: ${REASON}"
+    echo "失敗${FAILED}件"
+  elif [ "$CHANGED" -gt 0 ]; then
+    echo "${CHANGED}件是正"
+  else
+    echo "OK"
+  fi
 }
 
 sync_secret_scanning() { # sync_secret_scanning <repo> → "on" / "既on" / "不可"
@@ -169,7 +185,7 @@ while IFS=$'\t' read -r NAME BRANCH; do
   LBL=$(sync_labels "$NAME")
   SS=$(sync_secret_scanning "$NAME")
   DEP=$(sync_dependabot "$NAME" "$BRANCH")
-  OPS="ラベル:${LBL}件是正 / scanning:${SS} / dependabot:${DEP}"
+  OPS="ラベル:${LBL} / scanning:${SS} / dependabot:${DEP}"
 
   # ---- B. CI/CD（Node/Python のみ） ----
   # 言語判定（Contents API のみ、clone不要）
