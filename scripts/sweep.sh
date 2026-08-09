@@ -9,7 +9,6 @@
 #   2. origin/HEAD 相当（既定ブランチ）の確認 ※GitHub側は常に設定済みのため報告のみ
 #   3. Secret scanning / push protection の有効化（public は無料）
 #   4. Dependabot 設定ファイルの配布
-#   4b. セッション間連絡スキル（.claude/skills/pair-message/）の配布
 #
 # B. Node/Python リポジトリの CI/CD
 #   5. 標準CI呼び出し（ci.yml）が無ければ自動配置（既存の独自CIは .github/ci.yml.bak へ退避）
@@ -29,9 +28,6 @@ STANDARD_REPO="${OWNER}/ci-standard"
 # 除外: 標準リポ自身 / チーム開発 / 空チュートリアル
 EXCLUDE="ci-standard teamdev-2023-apr-team1 desktop-tutorial flue-test2"
 ERRLOG=$(mktemp)
-# 配布テンプレートの参照用。Actions でも手元でも同じ場所を指すよう、cwd ではなく
-# スクリプトの位置から解決する。
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 exists() { # exists <repo> <path> → 0/1
   gh api "/repos/${OWNER}/$1/contents/$2" -q .sha >/dev/null 2>&1
@@ -154,31 +150,6 @@ sync_dependabot() { # sync_dependabot <repo> <branch> → "配布" / "既存" / 
   fi
 }
 
-# クラウド↔ローカルのセッション間連絡スキル（規約は docs/AGENT-PAIRING.md）
-#
-# プラグインではなくリポジトリに直接置く。クラウドセッションでは marketplace が
-# clone されずプラグインが一切ロードされないため、必須のものは repo-native で持つ。
-#
-# 配布するのはファイルまで。セッションへのタグ付けや trigger の作成はリポジトリの
-# 状態ではないので収束の対象にしない（スキルが実行時に行う）。
-PAIR_SKILL_PATH=".claude/skills/pair-message/SKILL.md"
-PAIR_SKILL_FILE="${REPO_ROOT}/templates/pair-message-skill.md"
-
-sync_pair_skill() { # sync_pair_skill <repo> <branch> → "配布" / "既存" / "元なし" / "失敗"
-  local R=$1 B=$2 BODY
-  # テンプレートが見つからないときは黙って配らない代わりに、その旨を出して気づけるようにする
-  [ -f "$PAIR_SKILL_FILE" ] || { echo "元なし"; return; }
-  if gh api "/repos/${OWNER}/${R}/contents/${PAIR_SKILL_PATH}?ref=${B}" -q .sha >/dev/null 2>&1; then
-    echo "既存"; return
-  fi
-  BODY=$(cat "$PAIR_SKILL_FILE")
-  if put_file "$R" "$B" "$PAIR_SKILL_PATH" "chore: セッション間連絡スキルを配布 [sweeper]" "$BODY"; then
-    echo "配布"
-  else
-    echo "失敗"
-  fi
-}
-
 standard_ci_body() { # standard_ci_body <kind> <branch>
   cat <<EOF
 # 標準CI呼び出し（実体: https://github.com/${STANDARD_REPO}）
@@ -214,8 +185,7 @@ while IFS=$'\t' read -r NAME BRANCH; do
   LBL=$(sync_labels "$NAME")
   SS=$(sync_secret_scanning "$NAME")
   DEP=$(sync_dependabot "$NAME" "$BRANCH")
-  PAIR=$(sync_pair_skill "$NAME" "$BRANCH")
-  OPS="ラベル:${LBL} / scanning:${SS} / dependabot:${DEP} / pair-skill:${PAIR}"
+  OPS="ラベル:${LBL} / scanning:${SS} / dependabot:${DEP}"
 
   # ---- B. CI/CD（Node/Python のみ） ----
   # 言語判定（Contents API のみ、clone不要）
