@@ -112,13 +112,18 @@ set_session_tags(session_ids: [<相手>], add: ["pair:<repo>", "pair-role:<相�
 ```
 create_trigger(
   name: "pair:<repo> / <自分の役割>→<相手の役割>",   # ← 再利用の照合キー。必ず付ける
-  persistent_session_id: "<相手の session id>",
+  persistent_session_id: "<手順1で見つけた相手の session_… >",  # ← 配送先。自分のではない
   prompt: "<下の封筒>"
 )
 ```
 
 `cron_expression` と `run_once_at` は**指定しない**。どちらも省くと poke 専用の trigger になる。
 
+> **`persistent_session_id` は配送先であって送信元ではない。** 名前から
+> 「自分のセッションを persist する」と読めてしまうが、入れるのは手順1で見つけた
+> **相手**の id。ここに自分の id を入れて、送ったつもりのメッセージが自分自身に
+> 届いた実例がある。送信後に `get_session` で確認するのはこの取り違えも検出できる。
+>
 > **`name` を省かないこと。** 手順1の照合は名前で行うため、名前が無いと毎回新しい
 > trigger が作られ、「方向ごとに1本」が崩れる。
 >
