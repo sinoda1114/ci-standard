@@ -108,11 +108,15 @@ set_session_tags(session_ids: [<相手>], add: ["pair:<repo>", "pair-role:<相�
 
 ```
 create_trigger(
-  name: "pair:<repo> / <自分の役割>→<相手の役割>",
+  name: "pair:<repo> / <自分の役割>→<相手の役割> #<一意な識別子>",
   persistent_session_id: "<手順1で見つけた相手の session_… >",  # ← 配送先。自分のではない
   prompt: "<封筒 + 本文>"
 )
 ```
+
+> **名前は必ず一意にする。** 1通ごとに作るので、同じ名前を使い回すと同名の trigger が
+> 並び、手順5で「どれを消すか」を名前で識別できなくなる。連番でも用件の短い名前でもよい。
+> 特にローカルは削除できず無効化しか行えないため、回収する側が見分けられないと詰む。
 
 `cron_expression` と `run_once_at` は**指定しない**。どちらも省くと poke 専用の trigger になる。
 
@@ -144,8 +148,12 @@ fire_trigger(trigger_id: "<上の trigger>")     # ← 引数は trigger_id だ�
 
 ### 4. 配送先を検証する
 
-`fire_trigger` の戻り値の `session_id` が **`cse_` + 宛先 session id の suffix** と一致することを確認する。
+戻り値の `session_id` が **`cse_` + 宛先 session id の suffix** と一致することを確認する。
 不一致なら配送失敗として扱う。手順3の事故はこれで即座に検出できる。
+
+**クラウドの `fire_trigger` でもローカルの `run` でも同じ形式の `session_id` が返る。**
+ローカル側で実際にこの比較を行い、不一致（`cse_014FYDLW…` ≠ 宛先 `cse_01DeRCQL…`）から
+配送失敗を検出した実績がある。どちらの経路でもこの検証は省略しない。
 
 念のため `get_session(<相手>)` が `SESSION_STATUS_RUNNING` に変わったかも見るとよい。
 
