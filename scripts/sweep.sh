@@ -81,8 +81,10 @@ sync_labels() { # sync_labels <repo> → "N件是正" / "OK" / "失敗N件"
   local R=$1 CHANGED=0 FAILED=0 REASON="" LN LC LD CUR CC CDESC ERR
   while IFS='|' read -r LN LC LD; do
     [ -z "$LN" ] && continue
-    # 存在確認（404 は「未作成」を意味する正常系。ERRLOG には混ぜない）
-    CUR=$(gh api "/repos/${OWNER}/${R}/labels/${LN}" 2>/dev/null || true)
+    # 存在確認。gh api は失敗時もエラーJSONを stdout に出すため、空判定ではなく
+    # 終了コードで判定する（空判定だと 404 の本文が入って「存在する」と誤判定し、
+    # 作成がスキップされていた。実測で確認）
+    if CUR=$(gh api "/repos/${OWNER}/${R}/labels/${LN}" 2>/dev/null); then :; else CUR=""; fi
     if [ -z "$CUR" ]; then
       # 作成。エラーはその場で捕捉する（ERRLOG の末尾を後から読むと、
       # 直前の存在確認の 404 を誤って理由に拾ってしまうため）
