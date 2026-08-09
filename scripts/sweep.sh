@@ -1,18 +1,26 @@
 #!/usr/bin/env bash
-# 標準CI自動見回り（sweeper）
+# リポジトリ設定の収束エンジン（sweeper）
 #
-# 全リポジトリを走査し、以下を強制する。人間・エージェントの記憶に依存しない。
-#   1. Node/Python リポジトリに標準CI呼び出し（ci.yml）が無ければ自動配置
-#      （既存の独自 ci.yml は .github/ci.yml.bak として退避コミット）
-#   2. 標準CI導入「済み」を検証できたリポジトリだけにブランチ保護を適用（冪等）
+# 全リポジトリを走査し、repo-policy.yml が宣言する「あるべき状態」へ毎日収束させる。
+# 人間・エージェントの記憶に依存しない。何度実行しても同じ結果になる（冪等）。
+#
+# A. 全リポジトリ共通の運用設定
+#   1. type:* ラベル（種別分類）の作成・説明/色の是正
+#   2. origin/HEAD 相当（既定ブランチ）の確認 ※GitHub側は常に設定済みのため報告のみ
+#   3. Secret scanning / push protection の有効化（public は無料）
+#   4. Dependabot 設定ファイルの配布
+#
+# B. Node/Python リポジトリの CI/CD
+#   5. 標準CI呼び出し（ci.yml）が無ければ自動配置（既存の独自CIは .github/ci.yml.bak へ退避）
+#   6. 標準CI導入「済み」を検証できたリポジトリだけにブランチ保護を適用
 #      ※ CI無しで保護だけ効くと push/マージ不能に陥るため、順序を厳守する
-#   3. 「保護あり・標準CI無し」の矛盾状態を検出したら、保護を一時解除して
-#      導入→再保護で自動復旧する
+#   7. 「保護あり・標準CI無し」の矛盾状態は、保護を一時解除して導入→再保護で自動復旧
 #
 # GitHub Actions（.github/workflows/sweeper.yml）から日次実行される想定。
 # ローカルでも `GH_TOKEN=... bash scripts/sweep.sh` で実行可能。
 #
-# 必要権限（fine-grained PAT）: All repositories / Contents: RW / Administration: RW
+# 必要権限（fine-grained PAT）: All repositories /
+#   Contents: RW / Administration: RW / Workflows: RW / Issues: RW（ラベル用）
 set -uo pipefail
 
 OWNER="sinoda1114"
@@ -57,6 +65,75 @@ protect() { # protect <repo> <branch> <contexts-json>
 EOF
 }
 
+# ---- 運用設定の収束（全リポジトリ共通） ----
+
+# repo-policy.yml のラベル定義（sweep.sh 単体でも動くようここに展開する。
+# 変更時は repo-policy.yml と両方を更新すること）
+LABELS="type:feat|0e8a16|新機能
+type:fix|d73a4a|バグ修正
+type:refactor|fbca04|リファクタリング（挙動不変）
+type:perf|1d76db|パフォーマンス改善
+type:test|c5def5|テストの追加・修正
+type:docs|0075ca|ドキュメント
+type:chore|ededed|雑務・依存更新・CI設定など"
+
+sync_labels() { # sync_labels <repo> → 作成/更新した数を返す
+  local R=$1 CHANGED=0
+  while IFS='|' read -r LN LC LD; do
+    [ -z "$LN" ] && continue
+    local CUR
+    CUR=$(gh api "/repos/${OWNER}/${R}/labels/${LN}" 2>/dev/null || true)
+    if [ -z "$CUR" ]; then
+      gh api -X POST "/repos/${OWNER}/${R}/labels" -f name="$LN" -f color="$LC" -f description="$LD" >/dev/null 2>>"$ERRLOG" && CHANGED=$((CHANGED+1))
+    else
+      # 色/説明がポリシーと違えば是正（冪等）
+      local CC CDESC
+      CC=$(printf '%s' "$CUR" | jq -r '.color // empty')
+      CDESC=$(printf '%s' "$CUR" | jq -r '.description // empty')
+      if [ "$CC" != "$LC" ] || [ "$CDESC" != "$LD" ]; then
+        gh api -X PATCH "/repos/${OWNER}/${R}/labels/${LN}" -f new_name="$LN" -f color="$LC" -f description="$LD" >/dev/null 2>>"$ERRLOG" && CHANGED=$((CHANGED+1))
+      fi
+    fi
+  done <<< "$LABELS"
+  echo "$CHANGED"
+}
+
+sync_secret_scanning() { # sync_secret_scanning <repo> → "on" / "既on" / "不可"
+  local R=$1 CUR
+  CUR=$(gh api "/repos/${OWNER}/${R}" -q '.security_and_analysis.secret_scanning.status // "unknown"' 2>/dev/null)
+  if [ "$CUR" = "enabled" ]; then echo "既on"; return; fi
+  if gh api -X PATCH "/repos/${OWNER}/${R}" --input - >/dev/null 2>>"$ERRLOG" <<EOF
+{"security_and_analysis":{"secret_scanning":{"status":"enabled"},"secret_scanning_push_protection":{"status":"enabled"}}}
+EOF
+  then echo "on"; else echo "不可"; fi
+}
+
+DEPENDABOT_BODY='# 依存更新の自動PR（sweeper が配布。編集は ci-standard 側で）
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+'
+
+sync_dependabot() { # sync_dependabot <repo> <branch> → "配布" / "既存" / "失敗"
+  local R=$1 B=$2
+  if gh api "/repos/${OWNER}/${R}/contents/.github/dependabot.yml?ref=${B}" -q .sha >/dev/null 2>&1; then
+    echo "既存"; return
+  fi
+  if put_file "$R" "$B" ".github/dependabot.yml" "chore: Dependabot 設定を配布 [sweeper]" "$DEPENDABOT_BODY"; then
+    echo "配布"
+  else
+    echo "失敗"
+  fi
+}
+
 standard_ci_body() { # standard_ci_body <kind> <branch>
   cat <<EOF
 # 標準CI呼び出し（実体: https://github.com/${STANDARD_REPO}）
@@ -88,6 +165,13 @@ gh api '/user/repos?per_page=100' -q '.[] | select(.archived==false and .fork==f
 while IFS=$'\t' read -r NAME BRANCH; do
   case " $EXCLUDE " in *" $NAME "*) continue;; esac
 
+  # ---- A. 運用設定の収束（言語を問わず全リポジトリ） ----
+  LBL=$(sync_labels "$NAME")
+  SS=$(sync_secret_scanning "$NAME")
+  DEP=$(sync_dependabot "$NAME" "$BRANCH")
+  OPS="ラベル:${LBL}件是正 / scanning:${SS} / dependabot:${DEP}"
+
+  # ---- B. CI/CD（Node/Python のみ） ----
   # 言語判定（Contents API のみ、clone不要）
   if exists "$NAME" package.json; then
     KIND="node"
@@ -100,6 +184,8 @@ while IFS=$'\t' read -r NAME BRANCH; do
   elif exists "$NAME" pyproject.toml || exists "$NAME" requirements.txt; then
     KIND="python"; CONTEXTS='["ci / build"]'
   else
+    # CI対象外の言語でも運用設定は収束済みなので結果を出す
+    echo "| $NAME | $OPS / CI:対象外 |"
     continue
   fi
 
@@ -145,7 +231,7 @@ while IFS=$'\t' read -r NAME BRANCH; do
       STATUS="$STATUS / 保護不可(private+Free?)"
     fi
   fi
-  echo "| $NAME | $STATUS |"
+  echo "| $NAME | $OPS / CI:$STATUS |"
 done
 echo ""
 echo "sweep 完了: $(date -u +%Y-%m-%dT%H:%M:%SZ)"

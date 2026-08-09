@@ -16,17 +16,33 @@ CIが緑でないと main にマージできない** 状態を作るための中
 | `templates/python-caller.yml` | 同（Python） |
 | `scripts/setup-ci.sh` | 既存リポジトリへの後付け（ci.yml配置＋ブランチ保護） |
 
-## 導入は自動（sweeper）
+## 導入は自動（sweeper = リポジトリ設定の収束エンジン）
 
 **人間・エージェントの記憶に依存しない。** `.github/workflows/sweeper.yml` が毎日06:00 JSTに
-全リポジトリを見回り、標準CI未導入の Node/Python リポジトリへ ci.yml を自動配置し、
-ブランチ保護を冪等に適用する。新規リポジトリはどう作っても翌朝までに標準が強制される。
+全リポジトリを見回り、[`repo-policy.yml`](repo-policy.yml) が宣言する「あるべき状態」へ収束させる。
+新規リポジトリはどう作っても翌朝までに標準が強制される。何度実行しても同じ結果になる（冪等）。
+
+収束させる対象:
+
+| 分類 | 内容 | 適用範囲 |
+|---|---|---|
+| 運用設定 | `type:*` ラベル（7種・色/説明の是正含む） | 全リポジトリ |
+| 運用設定 | Secret scanning / push protection の有効化 | 全リポジトリ（public は無料） |
+| 運用設定 | Dependabot 設定の配布（npm / github-actions / weekly） | 全リポジトリ |
+| CI/CD | 標準CI呼び出し（ci.yml）の配置 | Node / Python |
+| CI/CD | ブランチ保護（CI必須・会話解決必須・admin含む） | 標準CI導入済みのみ |
+
+**型に入れないもの**（理由は repo-policy.yml の `excluded` を参照）: GitHub Project 板の作成
+（Status カラム定義が Web UI 必須で冪等化できない）、GitHub 既定ラベルの削除（破壊的）。
+
+> 設計原則: **冪等に自動化できるものだけを型にする。** 自動化できないものを標準に入れると、
+> 毎日「差分あり」と言い続ける壊れた仕組みになる。
 
 初回セットアップ（1回だけ）:
 
 1. fine-grained PAT を作成: Settings → Developer settings → Fine-grained tokens →
-   Repository access: **All repositories** / Permissions: **Contents: Read and write**,
-   **Administration: Read and write**
+   Repository access: **All repositories** / Permissions: **Contents: RW**,
+   **Administration: RW**, **Workflows: RW**, **Issues: RW**（ラベル操作に必要）
 2. このリポジトリの Settings → Secrets and variables → Actions に `ADMIN_TOKEN` として登録
 3. Actions タブ → sweeper → Run workflow で初回実行（以後は毎日自動）
 

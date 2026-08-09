@@ -1,0 +1,53 @@
+# リポジトリ運用ポリシー（あるべき状態の宣言）
+#
+# sweeper（.github/workflows/sweeper.yml → scripts/sweep.sh）が毎日この定義と
+# 各リポジトリの現状を突き合わせ、差分を是正する。個別リポジトリでの手動設定は不要。
+#
+# 収録の原則: **冪等に自動化できるものだけを型にする**。
+# Web UI 必須の設定（GitHub Project の Status カラム定義など）は、毎日「差分あり」と
+# 言い続ける壊れた仕組みになるため意図的に除外する。
+
+# Issue/PR の種別ラベル（状態は Project カラムで持つため status:* は作らない）
+# Conventional Commits の type に対応させる。
+labels:
+  - name: "type:feat"
+    color: "0e8a16"
+    description: "新機能"
+  - name: "type:fix"
+    color: "d73a4a"
+    description: "バグ修正"
+  - name: "type:refactor"
+    color: "fbca04"
+    description: "リファクタリング（挙動不変）"
+  - name: "type:perf"
+    color: "1d76db"
+    description: "パフォーマンス改善"
+  - name: "type:test"
+    color: "c5def5"
+    description: "テストの追加・修正"
+  - name: "type:docs"
+    color: "0075ca"
+    description: "ドキュメント"
+  - name: "type:chore"
+    color: "ededed"
+    description: "雑務・依存更新・CI設定など"
+
+# リポジトリ設定として強制するもの
+settings:
+  # git remote show origin で参照される既定ブランチのシンボリック参照。
+  # /security-review が origin/HEAD を必要とするため必須。
+  default_branch_head: true
+
+  # Secret scanning / push protection（public は無料。private は Advanced Security 必要）
+  secret_scanning: true
+  secret_scanning_push_protection: true
+
+  # Dependabot（npm / weekly / ルート）設定ファイルを配布
+  dependabot: true
+
+# 型から意図的に除外するもの（理由を明記して、再検討時の判断材料にする）
+excluded:
+  - item: "GitHub Project（板）の作成"
+    reason: "板を作れてもStatusカラムの定義がWeb UI必須で冪等化できない。実運用していない板を増やすと管理対象の水増しになる"
+  - item: "GitHub既定ラベル（bug / enhancement 等）の削除"
+    reason: "削除は破壊的で復元コストがある。差分として報告するに留め、判断は人間に委ねる"
