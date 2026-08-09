@@ -77,35 +77,38 @@ type:test|c5def5|テストの追加・修正
 type:docs|0075ca|ドキュメント
 type:chore|ededed|雑務・依存更新・CI設定など"
 
-sync_labels() { # sync_labels <repo> → "N件是正" / "OK" / "失敗(理由)"
-  local R=$1 CHANGED=0 FAILED=0 REASON=""
+sync_labels() { # sync_labels <repo> → "N件是正" / "OK" / "失敗N件"
+  local R=$1 CHANGED=0 FAILED=0 REASON="" LN LC LD CUR CC CDESC ERR
   while IFS='|' read -r LN LC LD; do
     [ -z "$LN" ] && continue
-    local CUR
+    # 存在確認（404 は「未作成」を意味する正常系。ERRLOG には混ぜない）
     CUR=$(gh api "/repos/${OWNER}/${R}/labels/${LN}" 2>/dev/null || true)
     if [ -z "$CUR" ]; then
-      if gh api -X POST "/repos/${OWNER}/${R}/labels" -f name="$LN" -f color="$LC" -f description="$LD" >/dev/null 2>>"$ERRLOG"; then
+      # 作成。エラーはその場で捕捉する（ERRLOG の末尾を後から読むと、
+      # 直前の存在確認の 404 を誤って理由に拾ってしまうため）
+      if ERR=$(gh api -X POST "/repos/${OWNER}/${R}/labels" \
+                 -f name="$LN" -f color="$LC" -f description="$LD" 2>&1 >/dev/null); then
         CHANGED=$((CHANGED+1))
       else
-        FAILED=$((FAILED+1)); REASON=$(tail -1 "$ERRLOG")
+        FAILED=$((FAILED+1)); REASON="$ERR"
       fi
     else
       # 色/説明がポリシーと違えば是正（冪等）
-      local CC CDESC
       CC=$(printf '%s' "$CUR" | jq -r '.color // empty')
       CDESC=$(printf '%s' "$CUR" | jq -r '.description // empty')
       if [ "$CC" != "$LC" ] || [ "$CDESC" != "$LD" ]; then
-        if gh api -X PATCH "/repos/${OWNER}/${R}/labels/${LN}" -f new_name="$LN" -f color="$LC" -f description="$LD" >/dev/null 2>>"$ERRLOG"; then
+        if ERR=$(gh api -X PATCH "/repos/${OWNER}/${R}/labels/${LN}" \
+                   -f new_name="$LN" -f color="$LC" -f description="$LD" 2>&1 >/dev/null); then
           CHANGED=$((CHANGED+1))
         else
-          FAILED=$((FAILED+1)); REASON=$(tail -1 "$ERRLOG")
+          FAILED=$((FAILED+1)); REASON="$ERR"
         fi
       fi
     fi
   done <<< "$LABELS"
   # 失敗を黙って握り潰さない（0件是正に見えて実は権限不足、という事故を防ぐ）
   if [ "$FAILED" -gt 0 ]; then
-    echo "::warning::${R} ラベル同期に失敗 ${FAILED}件: ${REASON}"
+    echo "::warning::${R} ラベル同期に失敗 ${FAILED}件: ${REASON}" >&2
     echo "失敗${FAILED}件"
   elif [ "$CHANGED" -gt 0 ]; then
     echo "${CHANGED}件是正"
