@@ -5,6 +5,8 @@
 #   - lint / typecheck / test(カバレッジ優先) / build … package.json の scripts から判定
 #   - audit … high 以上で失敗（yarn のみ best-effort）
 #   - e2e … playwright.config.* があればジョブごと実行（.github/ci-skip-e2e でオプトアウト可）
+#   - quality … Fallow によるコード健全性（未使用コード/重複/複雑度）。既定 report-only、
+#               .github/fallow-strict を置くと指摘でCIを落とす（オプトイン）
 #   - package.json が無い場合（テンプレ直後の空リポジトリ）は全て skip して緑にする
 #
 # リポジトリ固有のCI用環境変数（非シークレット）は .github/ci.env に KEY=VALUE で置く。
@@ -42,6 +44,7 @@ jobs:
       has-node: ${{ steps.checks.outputs.has-node }}
       has-e2e: ${{ steps.checks.outputs.has-e2e }}
       pm: ${{ steps.checks.outputs.pm }}
+      fallow-strict: ${{ steps.checks.outputs.fallow-strict }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - id: checks
@@ -60,6 +63,13 @@ jobs:
             echo "pm=yarn" >> "$GITHUB_OUTPUT"
           else
             echo "pm=npm" >> "$GITHUB_OUTPUT"
+          fi
+          # .github/fallow-strict があるリポジトリは Fallow の指摘でCIを落とす（オプトイン）。
+          # 既定は report-only（既存コードベースに後付けしても赤くならないようにするため）。
+          if [ -f .github/fallow-strict ]; then
+            echo "fallow-strict=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "fallow-strict=false" >> "$GITHUB_OUTPUT"
           fi
           # .github/ci-skip-e2e が置いてあるリポジトリは e2e を CI 対象外にする（ローカル専用e2e向け）
           if [ -f .github/ci-skip-e2e ]; then
@@ -151,6 +161,23 @@ jobs:
             yarn) yarn npm audit --severity high || yarn audit --level high || true ;;
             *)    npm audit --audit-level=high ;;
           esac
+
+  # コード健全性ゲート（Fallow）: 未使用コード・重複・複雑度・アーキテクチャ境界の検出。
+  # 既定は report-only（fail-on-issues: false）。強制したいリポジトリは .github/fallow-strict を置く。
+  # ブランチ保護の必須チェックには含めない想定（report-only の間は落ちないため意味がない）。
+  quality:
+    needs: detect
+    if: needs.detect.outputs.has-node == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Fallow (コード健全性)
+        uses: fallow-rs/fallow@3cf8074a0e2e91c895c0a4224ba1c3bec4630d65 # v3.14.0
+        with:
+          format: markdown
+          fail-on-issues: ${{ needs.detect.outputs.fallow-strict }}
 
   e2e:
     needs: detect

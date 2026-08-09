@@ -10,7 +10,7 @@ CIが緑でないと main にマージできない** 状態を作るための中
 
 | ファイル | 役割 |
 |---|---|
-| `.github/workflows/node-ci.yml` | Node/TS 標準CI（lint / typecheck / test+カバレッジ / build / audit / e2e） |
+| `.github/workflows/node-ci.yml` | Node/TS 標準CI（lint / typecheck / test+カバレッジ / build / audit / e2e / quality） |
 | `.github/workflows/python-ci.yml` | Python 標準CI（ruff / pytest / pip-audit） |
 | `templates/node-caller.yml` | 各リポジトリに置く呼び出し側 ci.yml（Node） |
 | `templates/python-caller.yml` | 同（Python） |
@@ -33,6 +33,7 @@ CIが緑でないと main にマージできない** 状態を作るための中
 | 運用設定 | Dependabot 設定の配布（npm / github-actions / weekly） | 全リポジトリ |
 | CI/CD | 標準CI呼び出し（ci.yml）の配置 | Node / Python |
 | CI/CD | ブランチ保護（CI必須・会話解決必須・admin含む） | 標準CI導入済みのみ |
+| CI/CD | コード健全性ゲート（Fallow: 未使用コード/重複/複雑度） | Node（既定 report-only） |
 
 **型に入れないもの**（理由は repo-policy.yml の `excluded` を参照）: GitHub Project 板の作成
 （Status カラム定義が Web UI 必須で冪等化できない）、GitHub 既定ラベルの削除（破壊的）、
@@ -73,6 +74,8 @@ scripts/sweep.sh                     # ローカルから全リポジトリ見�
 4. **CI用の非シークレット環境変数は `.github/ci.env`**: KEY=VALUE 形式でリポジトリにコミットする（例: Better Auth のCI専用ダミー値）。シークレットは GitHub Secrets + `secrets: inherit`
 5. **参照は `@main`**: ソロ運用のため即時反映を優先。壊れる変更を入れる時はブランチで検証してからマージする
 6. **ブランチ保護は strict: false**: main 追従の強制はしない（ソロ運用では PR ごとの update-branch 往復が過大なため）
+7. **Fallow は report-only で始める**: 既存コードベースに後付けしても赤くならないよう `fail-on-issues: false` が既定。
+   指摘を強制したいリポジトリだけ `.github/fallow-strict` を置いてオプトインする（新規PJは最初から置くと良い）
 
 ## AIレビューボット（Cursor Bugbot / Amazon Q / Devin / Socket）
 
