@@ -74,7 +74,15 @@ scripts/sweep.sh                     # ローカルから全リポジトリ見�
 2. **必須チェック名は固定**: `ci / build`（Node は加えて `ci / e2e`）。e2e はジョブごと skip されても必須チェックを満たす（GitHub の仕様）
 3. **カバレッジ閾値は各リポジトリ側**: vitest.config.ts の `coverage.thresholds` に置く（ラチェット方式: 実測の少し下に設定し退行だけ止める。向上したら引き上げる）
 4. **CI用の非シークレット環境変数は `.github/ci.env`**: KEY=VALUE 形式でリポジトリにコミットする（例: Better Auth のCI専用ダミー値）。シークレットは GitHub Secrets + `secrets: inherit`
-5. **参照は `@main`**: ソロ運用のため即時反映を優先。壊れる変更を入れる時はブランチで検証してからマージする
+5. **参照は `@main`**: ソロ運用のため即時反映を優先。**その裏返しとして、このリポジトリの
+   main への変更は全リポジトリのCIに即時波及する**（壊れる変更も同様）。したがって
+   **ワークフローの変更は main 直 push ではなく必ずPR経由**にし、マージ前に実リポジトリで
+   1本再ランして緑を確認する。
+   - 実例: quality ジョブに `pull-requests: write` を要求したところ、Reusable Workflow は
+     呼び出し側（`contents: read` のみ）より広い権限を要求できないため、全リポジトリの
+     CI が `startup_failure`（ジョブが1つも起動しない）になった。
+   - **呼び出し先で `permissions:` を増やさない。** 必要な場合は呼び出し側テンプレートと
+     配布済み全リポジトリの ci.yml を先に更新する必要がある（実質不可能なので設計で避ける）
 6. **ブランチ保護は strict: false**: main 追従の強制はしない（ソロ運用では PR ごとの update-branch 往復が過大なため）
 7. **健全性ゲートは report-only で始める**: 既存コードベースに後付けしても赤くならないよう、
    Fallow は `fail-on-issues: false`、React Doctor は `blocking: none` が既定。
