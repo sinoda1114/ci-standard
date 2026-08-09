@@ -1,0 +1,23 @@
+name: token-probe
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: トークンの実権限を確認
+        env:
+          GH_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+        run: |
+          echo "--- /user ---"
+          gh api /user -q '.login' || echo "user取得失敗"
+          echo "--- 対象リポジトリの参照 ---"
+          gh api /repos/sinoda1114/GAS -q '.full_name' || echo "repo参照失敗"
+          echo "--- ラベル一覧(GET) ---"
+          gh api /repos/sinoda1114/GAS/labels -q 'length' || echo "labels GET失敗"
+          echo "--- ラベル作成(POST) ---"
+          gh api -X POST /repos/sinoda1114/GAS/labels -f name="probe-tmp" -f color="ededed" 2>&1 | head -3
+          echo "--- 後始末 ---"
+          gh api -X DELETE /repos/sinoda1114/GAS/labels/probe-tmp 2>&1 | head -2 || true
