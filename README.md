@@ -14,6 +14,8 @@ CIが緑でないと main にマージできない** 状態を作るための中
 | `.github/workflows/python-ci.yml` | Python 標準CI（ruff / pytest / pip-audit） |
 | `templates/node-caller.yml` | 各リポジトリに置く呼び出し側 ci.yml（Node） |
 | `templates/python-caller.yml` | 同（Python） |
+| `docs/AGENT-PAIRING.md` | クラウド↔ローカルのセッション間連絡の手順（配布しない。必要時に参照） |
+| `templates/claude-md-pairing-snippet.md` | 上の存在を知らせる数行。使うプロジェクトの CLAUDE.md に貼る |
 | `scripts/setup-ci.sh` | 既存リポジトリへの後付け（ci.yml配置＋ブランチ保護） |
 
 ## 導入は自動（sweeper = リポジトリ設定の収束エンジン）
@@ -33,7 +35,17 @@ CIが緑でないと main にマージできない** 状態を作るための中
 | CI/CD | ブランチ保護（CI必須・会話解決必須・admin含む） | 標準CI導入済みのみ |
 
 **型に入れないもの**（理由は repo-policy.yml の `excluded` を参照）: GitHub Project 板の作成
-（Status カラム定義が Web UI 必須で冪等化できない）、GitHub 既定ラベルの削除（破壊的）。
+（Status カラム定義が Web UI 必須で冪等化できない）、GitHub 既定ラベルの削除（破壊的）、
+セッション間連絡の配布（使うプロジェクトが限られ、かつリポジトリの状態ではない）。
+
+## 全リポジトリに配らないもの: セッション間連絡
+
+クラウドセッションが egress ポリシーで詰まったとき、ローカルセッションへ実測や
+ブラウザ操作を依頼できる（逆も可）。手順は [docs/AGENT-PAIRING.md](docs/AGENT-PAIRING.md)。
+
+**配布はしない。** 必要になった時点で raw から取得する（クラウドからは `api.github.com` が
+403 でも `raw.githubusercontent.com` は 200）。使うプロジェクトだけ、
+[存在を知らせる数行](templates/claude-md-pairing-snippet.md)を `CLAUDE.md` に貼る。
 
 > 設計原則: **冪等に自動化できるものだけを型にする。** 自動化できないものを標準に入れると、
 > 毎日「差分あり」と言い続ける壊れた仕組みになる。

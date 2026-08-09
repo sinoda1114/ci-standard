@@ -45,9 +45,12 @@ settings:
   # Dependabot（npm / weekly / ルート）設定ファイルを配布
   dependabot: true
 
+
 # 型から意図的に除外するもの（理由を明記して、再検討時の判断材料にする）
 excluded:
   - item: "GitHub Project（板）の作成"
     reason: "板を作れてもStatusカラムの定義がWeb UI必須で冪等化できない。実運用していない板を増やすと管理対象の水増しになる"
   - item: "GitHub既定ラベル（bug / enhancement 等）の削除"
     reason: "削除は破壊的で復元コストがある。差分として報告するに留め、判断は人間に委ねる"
+  - item: "セッション間連絡（agent pairing）の各リポジトリへの配布"
+    reason: "使うのはクラウドとローカルで並行作業するプロジェクトだけで、全リポジトリではない。配ると使わない .claude/ が増える。加えてタグ付けも trigger 作成も実行時の操作でリポジトリの状態ではないため、そもそも収束の対象にならない。正本は docs/AGENT-PAIRING.md に置き、必要になった時点で raw.githubusercontent.com から取得する（クラウドからは api.github.com が 403 でも raw.githubusercontent.com は 200）。存在を知らせる数行だけ templates/claude-md-pairing-snippet.md として用意し、必要なプロジェクトの CLAUDE.md に貼る"
