@@ -5,8 +5,8 @@
 #   - lint / typecheck / test(カバレッジ優先) / build … package.json の scripts から判定
 #   - audit … high 以上で失敗（yarn のみ best-effort）
 #   - e2e … playwright.config.* があればジョブごと実行（.github/ci-skip-e2e でオプトアウト可）
-#   - quality … Fallow によるコード健全性（未使用コード/重複/複雑度）。既定 report-only、
-#               .github/fallow-strict を置くと指摘でCIを落とす（オプトイン）
+#   - quality … Fallow（未使用コード/重複/複雑度）+ React Doctor（Reactアンチパターン）。
+#               既定 report-only/advisory、.github/fallow-strict を置くと両方が強制モードになる
 #   - package.json が無い場合（テンプレ直後の空リポジトリ）は全て skip して緑にする
 #
 # リポジトリ固有のCI用環境変数（非シークレット）は .github/ci.env に KEY=VALUE で置く。
@@ -45,6 +45,7 @@ jobs:
       has-e2e: ${{ steps.checks.outputs.has-e2e }}
       pm: ${{ steps.checks.outputs.pm }}
       fallow-strict: ${{ steps.checks.outputs.fallow-strict }}
+      has-react: ${{ steps.checks.outputs.has-react }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - id: checks
@@ -63,6 +64,12 @@ jobs:
             echo "pm=yarn" >> "$GITHUB_OUTPUT"
           else
             echo "pm=npm" >> "$GITHUB_OUTPUT"
+          fi
+          # React 系リポジトリのみ React Doctor を走らせる（依存に react があるかで判定）
+          if [ -f package.json ] && node -e "const p=require('./package.json');process.exit((p.dependencies?.react||p.devDependencies?.react)?0:1)" 2>/dev/null; then
+            echo "has-react=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has-react=false" >> "$GITHUB_OUTPUT"
           fi
           # .github/fallow-strict があるリポジトリは Fallow の指摘でCIを落とす（オプトイン）。
           # 既定は report-only（既存コードベースに後付けしても赤くならないようにするため）。
@@ -170,14 +177,29 @@ jobs:
     if: needs.detect.outputs.has-node == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write # React Doctor のPRサマリーコメント
+      statuses: write      # React Doctor のスコア commit status
     steps:
+      # React Doctor の changed スコープは base との比較に全履歴が要る
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
       - name: Fallow (コード健全性)
         uses: fallow-rs/fallow@3cf8074a0e2e91c895c0a4224ba1c3bec4630d65 # v3.14.0
         with:
           format: markdown
           fail-on-issues: ${{ needs.detect.outputs.fallow-strict }}
+
+      # React アンチパターン検出（AIエージェントが書きがちな不適切なReactコードを捕まえる）。
+      # 既定は advisory（blocking: none）。強制は Fallow と同じ .github/fallow-strict でオプトイン。
+      - name: React Doctor
+        if: needs.detect.outputs.has-react == 'true'
+        uses: millionco/react-doctor@d23a0d723c1f56a691c39203036b763299eff012 # react-doctor@0.9.11
+        with:
+          blocking: ${{ needs.detect.outputs.fallow-strict == 'true' && 'error' || 'none' }}
 
   e2e:
     needs: detect
