@@ -14,6 +14,7 @@ CIが緑でないと main にマージできない** 状態を作るための中
 | `.github/workflows/python-ci.yml` | Python 標準CI（ruff / pytest / pip-audit） |
 | `templates/node-caller.yml` | 各リポジトリに置く呼び出し側 ci.yml（Node） |
 | `templates/python-caller.yml` | 同（Python） |
+| `templates/pair-message-skill.md` | 各リポジトリに配る `pair-message` スキル（[規約](docs/AGENT-PAIRING.md)） |
 | `scripts/setup-ci.sh` | 既存リポジトリへの後付け（ci.yml配置＋ブランチ保護） |
 
 ## 導入は自動（sweeper = リポジトリ設定の収束エンジン）
@@ -29,6 +30,7 @@ CIが緑でないと main にマージできない** 状態を作るための中
 | 運用設定 | `type:*` ラベル（7種・色/説明の是正含む） | 全リポジトリ |
 | 運用設定 | Secret scanning / push protection の有効化 | 全リポジトリ（public は無料） |
 | 運用設定 | Dependabot 設定の配布（npm / github-actions / weekly） | 全リポジトリ |
+| 運用設定 | セッション間連絡スキルの配布（[AGENT-PAIRING](docs/AGENT-PAIRING.md)） | 全リポジトリ |
 | CI/CD | 標準CI呼び出し（ci.yml）の配置 | Node / Python |
 | CI/CD | ブランチ保護（CI必須・会話解決必須・admin含む） | 標準CI導入済みのみ |
 

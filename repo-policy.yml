@@ -45,6 +45,17 @@ settings:
   # Dependabot（npm / weekly / ルート）設定ファイルを配布
   dependabot: true
 
+  # クラウド↔ローカルのセッション間連絡スキルを配布（規約は docs/AGENT-PAIRING.md）
+  # 実体は templates/pair-message-skill.md → 各リポジトリの
+  # .claude/skills/pair-message/SKILL.md
+  #
+  # プラグインにしないのは、クラウドセッションでは marketplace が clone されず
+  # プラグインが一切ロードされないため。必須のものは repo-native で持つ。
+  #
+  # 型にするのは配布まで。セッションへのタグ付けや trigger の作成はリポジトリの
+  # 状態ではないため収束の対象にしない（スキルが実行時に行う）。
+  agent_pairing_skill: true
+
 # 型から意図的に除外するもの（理由を明記して、再検討時の判断材料にする）
 excluded:
   - item: "GitHub Project（板）の作成"
