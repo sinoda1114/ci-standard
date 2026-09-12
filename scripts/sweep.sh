@@ -174,7 +174,7 @@ permissions:
 
 jobs:
   ci:
-    # secrets: inherit は付けない（最小権限。標準CIはシークレット不使用、値は .github/ci.env 供給）
+    # secrets: inherit は付けない（最小権限。必要なリポだけ呼び出し側で secrets 明示マップ）
     uses: ${STANDARD_REPO}/.github/workflows/$1-ci.yml@main
 EOF
 }

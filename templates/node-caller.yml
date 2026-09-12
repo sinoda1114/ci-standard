@@ -17,8 +17,6 @@ permissions:
 
 jobs:
   ci:
-    # 必要なシークレットだけ明示マップ（inherit は使わない）。未設定でも optional なので他リポは壊さない。
+    # `secrets: inherit` は付けない（最小権限）。Clerk 等が要るリポだけ呼び出し側で
+    # `secrets:` 明示マップ。未設定なら空。非シークレットは .github/ci.env。
     uses: sinoda1114/ci-standard/.github/workflows/node-ci.yml@main
-    secrets:
-      NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY }}
-      CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
