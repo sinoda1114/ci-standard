@@ -217,9 +217,6 @@ jobs:
     if: needs.detect.outputs.has-node == 'true' && needs.detect.outputs.has-e2e == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY }}
-      CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -267,6 +264,9 @@ jobs:
         run: npx playwright install --with-deps chromium
 
       - name: E2E tests
+        env:
+          NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY }}
+          CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
         run: ${{ needs.detect.outputs.pm }} run test:e2e
 
       - name: Upload Playwright report
