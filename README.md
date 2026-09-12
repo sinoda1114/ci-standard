@@ -73,7 +73,7 @@ scripts/sweep.sh                     # ローカルから全リポジトリ見�
 1. **自動判定・グレースフルデグレード**: リポジトリに存在する構成（lint script、playwright.config、tests/ 等）だけ実行。無いステップは黙って skip。PoC リポジトリに入れてもCIは壊れない
 2. **必須チェック名は固定**: `ci / build`（Node は加えて `ci / e2e`）。e2e はジョブごと skip されても必須チェックを満たす（GitHub の仕様）
 3. **カバレッジ閾値は各リポジトリ側**: vitest.config.ts の `coverage.thresholds` に置く（ラチェット方式: 実測の少し下に設定し退行だけ止める。向上したら引き上げる）
-4. **CI用の非シークレット環境変数は `.github/ci.env`**: KEY=VALUE 形式でリポジトリにコミットする（例: Better Auth のCI専用ダミー値）。シークレットは GitHub Secrets + `secrets: inherit`
+4. **CI用の非シークレット環境変数は `.github/ci.env`**: KEY=VALUE 形式でリポジトリにコミットする（例: Better Auth のCI専用ダミー値）。シークレットが要るリポだけ `secrets:` で明示マップ（optional。未設定なら空）
 5. **参照は `@main`**: ソロ運用のため即時反映を優先。**その裏返しとして、このリポジトリの
    main への変更は全リポジトリのCIに即時波及する**（壊れる変更も同様）。したがって
    **ワークフローの変更は main 直 push ではなく必ずPR経由**にし、マージ前に実リポジトリで
