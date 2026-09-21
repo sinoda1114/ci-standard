@@ -17,7 +17,7 @@ STATE="$STUB/state"; A="\$*"
 case "$1" in
   empty) case "\$A" in *"/user/repos"*) exit 0;; esac; exit 1;;
   fail)  case "\$A" in *"/user/repos"*) echo "gh: HTTP 401" >&2; exit 1;; esac; exit 1;;
-  one)   case "\$A" in *"/user/repos"*) printf 'smoke-repo\tmain\n'; exit 0;; esac; exit 1;;
+  one)   case "\$A" in *"/user/repos"*) printf 'smoke-repo\tmain\n'; exit 0;; *"contents/"*) echo "gh: HTTP 404 Not Found" >&2; exit 1;; esac; exit 1;;
   prpath)   # CI 対象外リポジトリ。既定ブランチは PR 必須の手動保護。PR の有無を STATE で追跡
     case "\$A" in
       *"/user/repos"*)                       printf 'manual\tmain\n'; exit 0;;
@@ -27,7 +27,7 @@ case "$1" in
       *"git/ref/heads/main"*)                echo deadbeef; exit 0;;
       *"git/ref/heads/sweeper/"*)            exit 1;;                       # ブランチ未作成
       *"-X POST"*"git/refs"*)                exit 0;;
-      *"contents/"*)                         exit 1;;
+      *"contents/"*)                         echo "gh: HTTP 404 Not Found" >&2; exit 1;;   # 未配布
       *"/branches?"*)                        exit 1;;
       *"/labels/"*)                          echo '{"color":"x","description":"y"}'; exit 0;;
       *"-X PATCH"*|*"-X POST"*)              exit 0;;
@@ -50,7 +50,7 @@ case "$1" in
       *"-X PUT"*"contents/"*)                # ファイル配布: 保護中は 409、解除後は成功
         if [ "\$(tail -1 "\$STATE" 2>/dev/null)" = UNPROTECTED ]; then exit 0; fi
         echo 'gh: Could not create file: Required status check "ci / build" is expected. (HTTP 409)' >&2; exit 1;;
-      *"contents/"*)                         exit 1;;                       # dependabot.yml / pr-triage.yml は未配布
+      *"contents/"*)                         echo "gh: HTTP 404 Not Found" >&2; exit 1;;   # dependabot.yml / pr-triage.yml は未配布
       *"/labels/"*)                          echo '{"color":"x","description":"y"}'; exit 0;;
       *"-X PATCH"*|*"-X POST"*)              exit 0;;
       "secret set"*)                         exit 0;;

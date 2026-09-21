@@ -268,6 +268,9 @@ def main():
         status = "unavailable"          # 1 回も呼んでいない（キー無し・全件が秘密情報該当）なら ok を名乗らない
     else:
         status = "ok" if (jev_ok and not errors) else "partial"
+    for t in threads:   # 秘密情報らしき本文は結果ファイルにも残さない（将来 artifact に上げても漏れないように）
+        if t.get("has_secret"):
+            t["text"] = "(redacted)"; t["body"] = "(redacted)"
     result = {"jev": status, "errors": errors[:20], "calls": calls, "seconds": round(time.time() - t0, 1),
               "dropped": dropped, "threads": threads, "pairs": pairs, "groups": out_groups}
     Path(a.out).write_text(json.dumps(result, ensure_ascii=False, indent=1))

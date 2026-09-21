@@ -50,14 +50,14 @@ GH_STDERR=$(mktemp)               # gh の stderr を JSON と混ぜないため
 # deliver_file / CI 導入で unprotect したら REPROTECT_* に積み、末尾か終了シグナルで protect() を掛け直す
 REPROTECT_REPO=""; REPROTECT_BRANCH=""; REPROTECT_CONTEXTS=""
 reprotect_pending() {
-  local TRY
+  local TRY TRIES=${1:-3}   # 引数 1 でリトライ無し（シグナル経路: ランナーのキャンセル猶予内に収める）
   if [ -n "$REPROTECT_REPO" ]; then
-    for TRY in 1 2 3; do   # 一時的な API 失敗に備えて 3 回まで（その場で粘る。次のリポジトリの解除で上書きされる前に決着させる）
+    for TRY in $(seq 1 "$TRIES"); do   # 一時的な API 失敗に備えて既定 3 回（その場で粘る。次のリポジトリの解除で上書きされる前に決着させる）
       if protect "$REPROTECT_REPO" "$REPROTECT_BRANCH" "$REPROTECT_CONTEXTS"; then
         echo "::notice::${REPROTECT_REPO}: 保護を再適用（末尾の protect が走らなかった経路）"
         REPROTECT_REPO=""; return 0
       fi
-      sleep $((TRY * 2))
+      [ "$TRY" -lt "$TRIES" ] && sleep $((TRY * 2))
     done
     echo "::error::${REPROTECT_REPO}: 保護の再適用に 3 回失敗。手で確認すること"
     echo "$REPROTECT_REPO" >>"$REPROTECT_FAILED_FLAG"     # 末尾で非ゼロ終了させる（緑のまま未保護で残さない）
@@ -67,7 +67,7 @@ reprotect_pending() {
 }
 on_signal() { # TERM/INT: 復旧してから終了する（終了しないと bash はループを再開し、次のリポジトリを解除しにいく）
   echo "::warning::シグナルで中断。保護を復旧して終了する"
-  reprotect_pending
+  reprotect_pending 1
   if [ -s "$REPROTECT_FAILED_FLAG" ]; then
     echo "::error::保護を戻せなかったリポジトリ: $(tr '\n' ' ' <"$REPROTECT_FAILED_FLAG")。手で確認すること"
   fi
@@ -275,25 +275,24 @@ EOF
   then echo "on"; else echo "不可"; fi
 }
 
-DEPENDABOT_BODY='# 依存更新の自動PR（sweeper が配布。編集は ci-standard 側で）
-version: 2
-updates:
-  - package-ecosystem: "npm"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 5
-  - package-ecosystem: "github-actions"
-    directory: "/"
-    schedule:
-      interval: "weekly"'
+dependabot_body() { # dependabot_body <kind> : node → npm + github-actions / python → pip + github-actions / それ以外 → github-actions のみ
+  local ECO=""
+  case "$1" in node) ECO=npm;; python) ECO=pip;; esac
+  printf '%s\n' '# 依存更新の自動PR（sweeper が配布。編集は ci-standard 側で）' 'version: 2' 'updates:'
+  if [ -n "$ECO" ]; then
+    printf '%s\n' "  - package-ecosystem: \"$ECO\"" '    directory: "/"' '    schedule:' '      interval: "weekly"' '    open-pull-requests-limit: 5'
+  fi
+  printf '%s\n' '  - package-ecosystem: "github-actions"' '    directory: "/"' '    schedule:' '      interval: "weekly"'
+}
 
-sync_dependabot() { # sync_dependabot <repo> <branch> → DEP="既存" / "配布" / "PR作成" / "PR済み" / "失敗"
+sync_dependabot() { # sync_dependabot <repo> <branch> → DEP="既存" / "配布" / "PR作成" / "PR済み" / "失敗" / "取得失敗"
   local R=$1 B=$2
-  if gh api "/repos/${OWNER}/${R}/contents/.github/dependabot.yml?ref=${B}" -q .sha >/dev/null 2>&1; then
+  : > "$GH_STDERR"
+  if gh api "/repos/${OWNER}/${R}/contents/.github/dependabot.yml?ref=${B}" -q .sha >/dev/null 2>"$GH_STDERR"; then
     DEP="既存"; return
   fi
-  deliver_file "$R" "$B" ".github/dependabot.yml" "chore: Dependabot 設定を配布 [sweeper]" "$DEPENDABOT_BODY"
+  grep -q 'HTTP 404' "$GH_STDERR" || { DEP="取得失敗"; return; }   # 障害日に sha 無し PUT で 422 を量産しない
+  deliver_file "$R" "$B" ".github/dependabot.yml" "chore: Dependabot 設定を配布 [sweeper]" "$(dependabot_body "${KIND:-}")"
   DEP="$DELIVER"
 }
 
@@ -303,7 +302,11 @@ sync_pr_triage() { # sync_pr_triage <repo> <branch> → PRT="既存" / "配布" 
   local R=$1 B=$2 J SHA BODY MSG
   PRT_PRESENT=false   # 既定ブランチに標準の呼び出しが既にあるか（secret の同期可否に使う。配布結果とは別）
   [ -n "$PR_TRIAGE_BODY" ] || { PRT="雛形なし"; return; }
-  J=$(gh api "/repos/${OWNER}/${R}/contents/.github/workflows/pr-triage.yml?ref=${B}" 2>/dev/null || true)
+  : > "$GH_STDERR"
+  if ! J=$(gh api "/repos/${OWNER}/${R}/contents/.github/workflows/pr-triage.yml?ref=${B}" 2>"$GH_STDERR"); then
+    J=""
+    grep -q 'HTTP 404' "$GH_STDERR" || { PRT="取得失敗"; return; }   # 障害日は触らない（404 = 未配布のときだけ進む）
+  fi
   SHA=$(printf '%s' "$J" | jq -r '.sha // empty' 2>/dev/null)
   BODY=$(printf '%s' "$J" | jq -r '.content // empty' 2>/dev/null | base64 -d 2>/dev/null || true)
   printf '%s' "$BODY" | grep -q "$STANDARD_REPO" && PRT_PRESENT=true
@@ -370,7 +373,7 @@ if ! gh api --paginate "/user/repos?per_page=100&affiliation=owner" \
 fi
 trap reprotect_pending EXIT
 trap on_signal INT TERM
-while IFS=$'\t' read -r NAME BRANCH; do
+while IFS=$'\t' read -r NAME BRANCH <&3; do   # 一覧は fd 3 から読む（ループ内の gh が stdin を読んでも行を食わない）
   case " $EXCLUDE " in *" $NAME "*) continue;; esac
   if [ -n "${ONLY:-}" ]; then case " $ONLY " in *" $NAME "*) ;; *) continue;; esac; fi
 
@@ -451,10 +454,14 @@ while IFS=$'\t' read -r NAME BRANCH; do
         "ci: 標準CI導入に伴い旧ci.ymlを退避 [sweeper]" "$CI_BODY" "$OLD_BAK_SHA" || true
     fi
 
-    if put_file "$NAME" "$BRANCH" ".github/workflows/ci.yml" \
-      "ci: 標準CI（${STANDARD_REPO}）を自動導入 [sweeper]" "$(standard_ci_body "$KIND" "$BRANCH")" "$CI_SHA"; then
+    put_file "$NAME" "$BRANCH" ".github/workflows/ci.yml" \
+      "ci: 標準CI（${STANDARD_REPO}）を自動導入 [sweeper]" "$(standard_ci_body "$KIND" "$BRANCH")" "$CI_SHA"; CI_PUT_RC=$?
+    if [ $CI_PUT_RC -eq 0 ]; then
       INSTALLED=true
       STATUS="導入 ($KIND)"
+    elif [ $CI_PUT_RC -eq 2 ]; then
+      # ruleset 等、sweeper が解除できない保護で拒否された（is_protected はクラシック保護しか見ない）。ERRLOG には残らない
+      STATUS="導入不可（ruleset 等の保護で直接 push 不可。ci.yml は手で PR すること）"
     else
       STATUS="導入失敗（ログ参照）"
       # CI 無しで保護すると push/マージ不能に詰むため、保険（reprotect_pending）の対象からも外す
@@ -476,7 +483,7 @@ while IFS=$'\t' read -r NAME BRANCH; do
   fi
   echo "| $NAME | $OPS / CI:$STATUS |"
   reprotect_pending          # 末尾の protect が失敗したときの再試行。最後のリポジトリでもここで戻る
-done < "$LIST_FILE"
+done 3< "$LIST_FILE"
 rm -f "$LIST_FILE"
 echo ""
 echo "sweep 完了: $(date -u +%Y-%m-%dT%H:%M:%SZ)"

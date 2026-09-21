@@ -49,6 +49,7 @@ class TriageTests(unittest.TestCase):
         r, md = run([th(1, "a.py", 1, body="token = 'AKIAIOSFODNN7EXAMPLE' leaked")], env={"TYPESAFE_API_KEY": "dummy"})
         self.assertEqual(r["calls"], 0); self.assertEqual(r["jev"], "unavailable")
         self.assertIn("秘密情報らしき値を含むため要旨を省略", md); self.assertNotIn("AKIAIOSFODNN7EXAMPLE", md)
+        self.assertNotIn("AKIAIOSFODNN7EXAMPLE", json.dumps(r))   # 結果 JSON にも残さない
 
     def test_circuit_breaker_stops_after_first_error(self):
         saved = triage.ROUTES, triage.TIMEOUT
