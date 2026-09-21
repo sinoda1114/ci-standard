@@ -30,8 +30,8 @@ jobs:
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository &&
       (github.event_name == 'pull_request_review_thread' ||
-       endsWith(github.event.review.user.login, '[bot]') ||
-       contains(fromJSON('["cursor","devin-ai-integration","copilot-pull-request-reviewer","chatgpt-codex-connector","amazon-q-developer"]'), github.event.review.user.login))
+      endsWith(github.event.review.user.login, '[bot]') ||
+      contains(fromJSON('["cursor","devin-ai-integration","copilot-pull-request-reviewer","chatgpt-codex-connector","amazon-q-developer"]'), github.event.review.user.login))
     # @main 参照は意図的（標準CIと同じ）。ci-standard は同一オーナーの標準リポジトリ（main は PR 経由・self-test 必須）で、
     # SHA 固定にすると sweeper が毎日全リポジトリを書き換えることになる。ci-standard 側で第三者 Action は SHA 固定している
     uses: sinoda1114/ci-standard/.github/workflows/pr-triage.yml@main

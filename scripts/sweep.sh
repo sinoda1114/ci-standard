@@ -36,6 +36,7 @@ set -uo pipefail
 
 OWNER="sinoda1114"
 STANDARD_REPO="${OWNER}/ci-standard"
+SUPERSEDED_MARK="[sweeper-superseded]"   # sweeper 自身が置き換えで閉じた PR の印（人の却下と区別する）
 # 除外: 標準リポ自身 / チーム開発 / 空チュートリアル
 EXCLUDE="ci-standard teamdev-2023-apr-team1 desktop-tutorial flue-test2"
 ERRLOG=$(mktemp)
@@ -58,8 +59,7 @@ reprotect_pending() {
 on_signal() { # TERM/INT: 復旧してから終了する（終了しないと bash はループを再開し、次のリポジトリを解除しにいく）
   echo "::warning::シグナルで中断。保護を復旧して終了する"
   reprotect_pending
-  rm -f "$ERRLOG" "$REPROTECT_FAILED_FLAG"
-  exit 130
+  exit 130     # 一時ファイルは親の末尾が読んでから消す（ここで消すと「どのリポジトリが未保護か」が失われる）
 }
 
 exists() { # exists <repo> <path> → 0/1
@@ -116,7 +116,9 @@ open_pr_with_file() { # open_pr_with_file <repo> <base> <path> <message> <conten
   # 取得に失敗した日は配布を見送る（0 件と区別しないと、却下済み PR を作り直してしまう）
   OPEN=$(gh pr list -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --state open --json number -q 'length' 2>>"$ERRLOG") || { DELIVER="PR状態の取得に失敗"; return 1; }
   if [ "${OPEN:-0}" -gt 0 ]; then DELIVER="PR済み"; return 0; fi
-  REJECTED=$(gh pr list -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --state closed --json mergedAt -q '[.[]|select(.mergedAt==null)]|length' 2>>"$ERRLOG") || { DELIVER="PR状態の取得に失敗"; return 1; }
+  # 却下 = 人がマージせずに閉じた PR。sweeper 自身が置き換えで閉じたもの（本文に SUPERSEDED_MARK）は数えない
+  REJECTED=$(gh pr list -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --state closed --json mergedAt,body \
+               -q "[.[]|select(.mergedAt==null)|select((.body // \"\")|contains(\"${SUPERSEDED_MARK}\")|not)]|length" 2>>"$ERRLOG") || { DELIVER="PR状態の取得に失敗"; return 1; }
   if [ "${REJECTED:-0}" -gt 0 ]; then DELIVER="PR却下済み"; return 0; fi
   if ! gh api "/repos/${OWNER}/${R}/git/ref/heads/${SLUG}" >/dev/null 2>&1; then
     HEAD=$(gh api "/repos/${OWNER}/${R}/git/ref/heads/${B}" -q .object.sha 2>>"$ERRLOG") || { DELIVER="失敗"; return 1; }
@@ -128,18 +130,19 @@ open_pr_with_file() { # open_pr_with_file <repo> <base> <path> <message> <conten
   if [ "$BC" != "$C" ]; then
     put_file "$R" "$SLUG" "$P" "$M" "$C" "$BS" || { DELIVER="失敗"; return 1; }
   fi
-  # 同じファイルの古い内容の sweeper PR（別ハッシュ）が開いていれば、置き換えとして閉じる（同じ設定の PR を 2 本並べない）
-  local PREFIX OLD
-  PREFIX="sweeper/$(basename "$P" | sed 's/\.[^.]*$//')-"
-  gh pr list -R "${OWNER}/${R}" --base "$B" --state open --json number,headRefName \
-    -q ".[] | select(.headRefName | startswith(\"${PREFIX}\")) | select(.headRefName != \"${SLUG}\") | .number" 2>/dev/null |
-  while IFS= read -r OLD; do
-    gh pr close "$OLD" -R "${OWNER}/${R}" --delete-branch --comment "内容を更新した新しい PR に置き換えます（sweeper）。" >/dev/null 2>>"$ERRLOG" || true
-  done
-  local PRERR
+  local PRERR PREFIX OLD
   if PRERR=$(gh pr create -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --title "$M" \
        --body "sweeper（${STANDARD_REPO}）が配布する標準設定です。既定ブランチが保護されているため PR で届けます。CI が緑なら squash マージしてください。" \
        2>&1 >/dev/null); then
+    # 新 PR ができてから、同じファイルの古い内容の sweeper PR（別ハッシュ）を置き換えとして閉じる
+    # （先に閉じると、作成が一時失敗した日に配布 PR が 1 本も無くなる）。本文に印を付けてから閉じ、却下判定から除外する
+    PREFIX="sweeper/$(basename "$P" | sed 's/\.[^.]*$//')-"
+    gh pr list -R "${OWNER}/${R}" --base "$B" --state open --json number,headRefName \
+      -q ".[] | select(.headRefName | startswith(\"${PREFIX}\")) | select(.headRefName != \"${SLUG}\") | .number" 2>/dev/null |
+    while IFS= read -r OLD; do
+      gh pr edit "$OLD" -R "${OWNER}/${R}" --body "${SUPERSEDED_MARK} 内容を更新した新しい PR に置き換えました（sweeper）。" >/dev/null 2>>"$ERRLOG" || true
+      gh pr close "$OLD" -R "${OWNER}/${R}" --delete-branch --comment "内容を更新した新しい PR に置き換えます（sweeper）。" >/dev/null 2>>"$ERRLOG" || true
+    done
     DELIVER="PR作成"; return 0
   fi
   printf '%s\n' "$PRERR" >>"$ERRLOG"
