@@ -117,9 +117,8 @@ deliver_file() {
       if [ $rc -eq 0 ]; then DELIVER="配布(保護を一時解除)"; return 0; fi
       # 2 回目も保護で拒否 = ruleset 等の別の保護が併用されている → PR 経路へ
       [ $rc -ne 2 ] && { DELIVER="失敗"; return 1; }
-    else
-      REPROTECT_REPO=""   # 解除できていないので戻す必要はない
     fi
+    # unprotect が非ゼロでも予約は残す（DELETE がサーバー側で通った後に応答が落ちることがある。protect は冪等なので掛け直して害はない）
   fi
   open_pr_with_file "$R" "$B" "$P" "$M" "$C"
 }
@@ -147,7 +146,7 @@ open_pr_with_file() { # open_pr_with_file <repo> <base> <path> <message> <conten
   if [ "$BC" != "$C" ]; then
     put_file "$R" "$SLUG" "$P" "$M" "$C" "$BS" || { DELIVER="失敗"; return 1; }
   fi
-  local PRERR PREFIX OLD
+  local PRERR
   if PRERR=$(gh pr create -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --title "$M" \
        --body "sweeper（${STANDARD_REPO}）が配布する標準設定です。既定ブランチが保護されているため PR で届けます。CI が緑なら squash マージしてください。" \
        2>&1 >/dev/null); then
@@ -168,7 +167,7 @@ supersede_old_prs() { # supersede_old_prs <repo> <base> <path> <現行slug>: 同
   # 失敗分は翌日の PR済み 経路で再試行される
   local R=$1 B=$2 P=$3 SLUG=$4 PREFIX OLD
   PREFIX="sweeper/$(basename "$P" | sed 's/\.[^.]*$//')-"
-  gh pr list -R "${OWNER}/${R}" --base "$B" --state open --json number,headRefName \
+  gh pr list -R "${OWNER}/${R}" --base "$B" --state open --limit 100 --json number,headRefName \
     -q ".[] | select(.headRefName | startswith(\"${PREFIX}\")) | select(.headRefName != \"${SLUG}\") | .number" 2>/dev/null |
   while IFS= read -r OLD; do
     gh pr edit "$OLD" -R "${OWNER}/${R}" --body "${SUPERSEDED_MARK} 内容を更新した新しい PR に置き換えました（sweeper）。" >/dev/null 2>>"$ERRLOG" || continue
@@ -439,11 +438,9 @@ while IFS=$'\t' read -r NAME BRANCH; do
   else
     # 「保護あり・標準CI無し」の矛盾状態なら保護を一時解除して復旧する（deliver_file が既に解除済みならそのまま）
     if ! $UNPROTECTED_FOR_FIX && is_protected "$NAME" "$BRANCH"; then
-      REPROTECT_REPO="$NAME"; REPROTECT_BRANCH="$BRANCH"; REPROTECT_CONTEXTS="$CONTEXTS"   # 解除の前に積む
+      REPROTECT_REPO="$NAME"; REPROTECT_BRANCH="$BRANCH"; REPROTECT_CONTEXTS="$CONTEXTS"   # 解除の前に積む（失敗しても残す。protect は冪等）
       if unprotect "$NAME" "$BRANCH"; then
         UNPROTECTED_FOR_FIX=true
-      else
-        REPROTECT_REPO=""
       fi
     fi
 
@@ -462,7 +459,10 @@ while IFS=$'\t' read -r NAME BRANCH; do
       STATUS="導入失敗（ログ参照）"
       # CI 無しで保護すると push/マージ不能に詰むため、保険（reprotect_pending）の対象からも外す
       REPROTECT_REPO=""
-      $UNPROTECTED_FOR_FIX && STATUS="$STATUS ※保護は解除したまま（CI無しで保護すると詰むため）"
+      if $UNPROTECTED_FOR_FIX; then
+        STATUS="$STATUS ※保護は解除したまま（CI無しで保護すると詰むため）"
+        echo "::warning::${NAME}: 標準CIの導入に失敗したため保護を解除したまま。翌日の sweep で再試行される"
+      fi
     fi
   fi
 
