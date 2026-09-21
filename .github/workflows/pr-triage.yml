@@ -79,9 +79,12 @@ jobs:
           S=ci-standard/scripts/pr-triage
           mkdir -p out
           "$S/fetch-threads.sh" "$REPO" "$PR" > out/threads.json   # 失敗すれば set -e でここで止まる
-          python3 "$S/triage.py" --threads out/threads.json --out out/triage.json --md out/triage.md > /dev/null
-          n=$(python3 -c 'import json;print(len(json.load(open("out/triage.json"))["threads"]))')
+          # 対象件数（Bot 起票・未解決）だけ先に数える。閾値未満なら JEV を呼ばずに終わる（有料呼び出しを無駄にしない）
+          n=$(python3 "$S/triage.py" --threads out/threads.json --out /dev/null --count-only)
           echo "threads=$n（Bot 起票・未解決のみ）"
+          if [ "$n" -ge "$MIN_THREADS" ]; then
+            python3 "$S/triage.py" --threads out/threads.json --out out/triage.json --md out/triage.md > /dev/null
+          fi
           # 既存の固定コメント（全ページを見る。1 ページだけだと長い PR で二重投稿になる）。
           # `| head -1` は gh を SIGPIPE(141) で落とし set -e で止まるので、全部読む awk で先頭だけ取る
           # 自分（github-actions[bot]）が投稿したマーカー付きコメントだけを対象にする（人が表を引用したコメントを消さない）

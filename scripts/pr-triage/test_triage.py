@@ -88,8 +88,21 @@ class TriageTests(unittest.TestCase):
                         ([{"category": "bug"}], None),                                             # dict でない
                         ])
         r = self._run_with_call(lambda *a: next(answers), [th(1, "a.py", 1), th(2, "b.py", 2)])
-        self.assertIsNone(r["threads"][0]["is_security"]); self.assertEqual(r["threads"][0]["category"], "bug")
+        self.assertIsNone(r["threads"][0]["is_security"]); self.assertEqual(r["threads"][0]["category"], "unknown")
+        self.assertEqual(r["calls"], 1)                     # 最初の不正応答で遮断（2 件目は呼ばれない）
         self.assertIn("bad-response", r["errors"]); self.assertEqual(r["jev"], "partial")
+
+    def test_bool_is_not_a_probability(self):
+        bad = ({"category": {"choice": "bug"}, "is_security": {"noul": True}}, None)
+        r = self._run_with_call(lambda *a: bad, [th(1, "a.py", 1)])
+        self.assertIsNone(r["threads"][0]["is_security"]); self.assertIn("bad-response", r["errors"])
+
+    def test_count_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d, "t.json"); src.write_text(json.dumps([th(1, "a.py", 1), th(2, "a.py", 2, author="x", atype="User"), th(3, "a.py", 3, resolved=True)]))
+            p = subprocess.run([sys.executable, str(HERE / "triage.py"), "--threads", str(src), "--out", "/dev/null", "--count-only"],
+                               capture_output=True, text=True, env={**os.environ, "TYPESAFE_API_KEY": "dummy", "HOME": "/nonexistent"})
+            self.assertEqual(p.stdout.strip(), "1")
 
     def test_malformed_pairing_answers_fall_back_to_line_proximity(self):
         # 同一ファイル 3 件 → 分類 3 回のあとペア 3 回。same_issue が数値・null・辞書でない形で返っても落ちず、行近接（±5）で束ねる

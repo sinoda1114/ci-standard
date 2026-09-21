@@ -125,6 +125,10 @@ def summarize(text):
     return re.sub(r"\s+", " ", first).strip(" :-|").strip()[:120]
 
 
+def is_number(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)   # bool は int のサブクラスなので除外
+
+
 def near(A, B):
     return bool(A.get("line") and B.get("line") and abs(A["line"] - B["line"]) <= 5)
 
@@ -134,6 +138,7 @@ def main():
     ap.add_argument("--threads", required=True); ap.add_argument("--out", required=True); ap.add_argument("--md", default="")
     ap.add_argument("--include-humans", action="store_true", help="人が起票したスレッドも対象にする")
     ap.add_argument("--include-resolved", action="store_true", help="解決済みスレッドも対象にする")
+    ap.add_argument("--count-only", action="store_true", help="対象スレッド数だけ出して終わる（JEV を呼ばない）")
     a = ap.parse_args()
     raw = json.loads(Path(a.threads).read_text())
     if not isinstance(raw, list):
@@ -148,6 +153,8 @@ def main():
         if not a.include_resolved and t.get("isResolved"):
             dropped["resolved"] += 1; continue
         threads.append(t)
+    if a.count_only:
+        print(len(threads)); return 0
     for i, t in enumerate(threads):
         t["idx"] = i; t["text"] = clean(t.get("body") or "")[:6000]
         t["file"] = t.get("path") or ""          # フルパスで比較（basename だと別ディレクトリの同名ファイルが混ざる）
@@ -192,11 +199,14 @@ def main():
         })
         if ans is None:
             continue
-        c = ans.get("category") if isinstance(ans.get("category"), dict) else {}
-        t["category"] = c.get("choice", "unknown") if c.get("choice") in CATEGORIES else "unknown"; t["category_conf"] = c.get("confidence")
-        sec = (ans.get("is_security") or {}).get("noul") if isinstance(ans.get("is_security"), dict) else None
-        t["is_security"] = sec if isinstance(sec, (int, float)) else None   # 数値以外が返っても落とさない
-        if t["is_security"] is not None and t["is_security"] >= 0.7:
+        c = ans.get("category"); s_ = ans.get("is_security")
+        sec = s_.get("noul") if isinstance(s_, dict) else None
+        if not (isinstance(c, dict) and c.get("choice") in CATEGORIES and is_number(sec)):
+            # HTTP は成功したが必須フィールドが欠落・型不正。ok を名乗らないよう記録し、以後は呼ばない
+            errors.append("bad-response"); jev_ok = False
+            continue
+        t["category"] = c["choice"]; t["category_conf"] = c.get("confidence"); t["is_security"] = sec
+        if sec >= 0.7:
             t["category"] = "security"
 
     # 2. 同一問題のグループ化（同じファイル内のペア。ファイル不明同士も比較）
@@ -227,7 +237,7 @@ def main():
                               {"same_issue": {"type": "noul", "instructions": SAME_Q}})
                     sa = ans.get("same_issue") if ans is not None else None
                     same = sa.get("noul") if isinstance(sa, dict) else None
-                    if ans is not None and not isinstance(same, (int, float)):
+                    if ans is not None and not is_number(same):
                         # HTTP は成功したが形が不正。ok を名乗らないよう記録し、以後は呼ばず行近接フォールバックへ
                         errors.append("bad-response"); jev_ok = False; same = None
             if same is None:

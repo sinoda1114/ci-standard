@@ -11,6 +11,9 @@
 #   4. Dependabot 設定ファイルの配布
 #   5. PR Bot コメント仕分け（pr-triage 呼び出しワークフロー）の配布と TYPESAFE_API_KEY の配布
 #
+# 保護の復旧（reprotect_pending）: 一時解除したら REPROTECT_* に積み、各リポジトリの末尾・次のリポジトリの先頭・
+#   スクリプトの EXIT / シグナルで protect() を掛け直す。戻せなければ末尾で非ゼロ終了する
+#
 # ファイル配布と保護ブランチ（deliver_file）:
 #   既定ブランチへの直接 PUT が保護で拒否（HTTP 409）されたら、
 #   - sweeper 自身が掛けた保護（必須チェック "ci / build"）なら一時解除して PUT し、末尾の protect() で再保護する
@@ -40,7 +43,8 @@ SUPERSEDED_MARK="[sweeper-superseded]"   # sweeper 自身が置き換えで閉�
 # 除外: 標準リポ自身 / チーム開発 / 空チュートリアル
 EXCLUDE="ci-standard teamdev-2023-apr-team1 desktop-tutorial flue-test2"
 ERRLOG=$(mktemp)
-REPROTECT_FAILED_FLAG=$(mktemp)   # 再保護に失敗したら中身を書く（ループはサブシェルなので変数では親に伝わらない）
+REPROTECT_FAILED_FLAG=$(mktemp)   # 再保護に失敗したリポジトリ名を書く（末尾で非ゼロ終了させる）
+GH_STDERR=$(mktemp)               # gh の stderr を JSON と混ぜないための受け皿
 
 # 保護を一時解除したまま中断（キャンセル・タイムアウト）しないための保険。
 # deliver_file / CI 導入で unprotect したら REPROTECT_* に積み、末尾か終了シグナルで protect() を掛け直す
@@ -59,7 +63,12 @@ reprotect_pending() {
 on_signal() { # TERM/INT: 復旧してから終了する（終了しないと bash はループを再開し、次のリポジトリを解除しにいく）
   echo "::warning::シグナルで中断。保護を復旧して終了する"
   reprotect_pending
-  exit 130     # 一時ファイルは親の末尾が読んでから消す（ここで消すと「どのリポジトリが未保護か」が失われる）
+  if [ -s "$REPROTECT_FAILED_FLAG" ]; then
+    echo "::error::保護を戻せなかったリポジトリ: $(tr '\n' ' ' <"$REPROTECT_FAILED_FLAG")。手で確認すること"
+  fi
+  rm -f "$ERRLOG" "$REPROTECT_FAILED_FLAG" "${LIST_FILE:-}" "${GH_STDERR:-}"
+  trap - EXIT
+  exit 130
 }
 
 exists() { # exists <repo> <path> → 0/1
@@ -115,7 +124,7 @@ open_pr_with_file() { # open_pr_with_file <repo> <base> <path> <message> <conten
   # 先に PR の状態を見る（ブランチを作ってから却下に気づくと、毎日「作成→削除」を往復し配布先の on: push CI を起動してしまう）。
   # 取得に失敗した日は配布を見送る（0 件と区別しないと、却下済み PR を作り直してしまう）
   OPEN=$(gh pr list -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --state open --json number -q 'length' 2>>"$ERRLOG") || { DELIVER="PR状態の取得に失敗"; return 1; }
-  if [ "${OPEN:-0}" -gt 0 ]; then DELIVER="PR済み"; return 0; fi
+  if [ "${OPEN:-0}" -gt 0 ]; then supersede_old_prs "$R" "$B" "$P" "$SLUG"; DELIVER="PR済み"; return 0; fi   # 前回閉じ損ねた旧 PR があれば再試行
   # 却下 = 人がマージせずに閉じた PR。sweeper 自身が置き換えで閉じたもの（本文に SUPERSEDED_MARK）は数えない
   REJECTED=$(gh pr list -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --state closed --json mergedAt,body \
                -q "[.[]|select(.mergedAt==null)|select((.body // \"\")|contains(\"${SUPERSEDED_MARK}\")|not)]|length" 2>>"$ERRLOG") || { DELIVER="PR状態の取得に失敗"; return 1; }
@@ -135,14 +144,8 @@ open_pr_with_file() { # open_pr_with_file <repo> <base> <path> <message> <conten
        --body "sweeper（${STANDARD_REPO}）が配布する標準設定です。既定ブランチが保護されているため PR で届けます。CI が緑なら squash マージしてください。" \
        2>&1 >/dev/null); then
     # 新 PR ができてから、同じファイルの古い内容の sweeper PR（別ハッシュ）を置き換えとして閉じる
-    # （先に閉じると、作成が一時失敗した日に配布 PR が 1 本も無くなる）。本文に印を付けてから閉じ、却下判定から除外する
-    PREFIX="sweeper/$(basename "$P" | sed 's/\.[^.]*$//')-"
-    gh pr list -R "${OWNER}/${R}" --base "$B" --state open --json number,headRefName \
-      -q ".[] | select(.headRefName | startswith(\"${PREFIX}\")) | select(.headRefName != \"${SLUG}\") | .number" 2>/dev/null |
-    while IFS= read -r OLD; do
-      gh pr edit "$OLD" -R "${OWNER}/${R}" --body "${SUPERSEDED_MARK} 内容を更新した新しい PR に置き換えました（sweeper）。" >/dev/null 2>>"$ERRLOG" || true
-      gh pr close "$OLD" -R "${OWNER}/${R}" --delete-branch --comment "内容を更新した新しい PR に置き換えます（sweeper）。" >/dev/null 2>>"$ERRLOG" || true
-    done
+    # （先に閉じると、作成が一時失敗した日に配布 PR が 1 本も無くなる）
+    supersede_old_prs "$R" "$B" "$P" "$SLUG"
     DELIVER="PR作成"; return 0
   fi
   printf '%s\n' "$PRERR" >>"$ERRLOG"
@@ -150,6 +153,20 @@ open_pr_with_file() { # open_pr_with_file <repo> <base> <path> <message> <conten
     DELIVER="PR作成不可(PAT に Pull requests: RW が必要)"; return 1   # ブランチは残す（掃除対象外）。権限を足せば翌日 PR が出る
   fi
   DELIVER="失敗"; return 1
+}
+
+supersede_old_prs() { # supersede_old_prs <repo> <base> <path> <現行slug>: 同じファイルの別ハッシュの sweeper PR を置き換えとして閉じる
+  # 本文に印を付けてから閉じる（却下判定から除外するため）。印付けに失敗したら閉じない（印無しで閉じると「人の却下」と誤判定される）。
+  # 失敗分は翌日の PR済み 経路で再試行される
+  local R=$1 B=$2 P=$3 SLUG=$4 PREFIX OLD
+  PREFIX="sweeper/$(basename "$P" | sed 's/\.[^.]*$//')-"
+  gh pr list -R "${OWNER}/${R}" --base "$B" --state open --json number,headRefName \
+    -q ".[] | select(.headRefName | startswith(\"${PREFIX}\")) | select(.headRefName != \"${SLUG}\") | .number" 2>/dev/null |
+  while IFS= read -r OLD; do
+    gh pr edit "$OLD" -R "${OWNER}/${R}" --body "${SUPERSEDED_MARK} 内容を更新した新しい PR に置き換えました（sweeper）。" >/dev/null 2>>"$ERRLOG" || continue
+    gh pr close "$OLD" -R "${OWNER}/${R}" --delete-branch --comment "内容を更新した新しい PR に置き換えます（sweeper）。" >/dev/null 2>>"$ERRLOG" || true
+  done
+  return 0
 }
 
 cleanup_sweeper_branches() { # cleanup_sweeper_branches <repo>: sweeper が作った名前（sweeper/<name>-<hash8>）で、
@@ -335,8 +352,17 @@ echo "|---|---|"
 
 # affiliation=owner と owner.login の二重で自分のリポジトリに絞る（既定は collaborator / organization_member も含み、
 # 他オーナーのリポジトリを sinoda1114/<name> として叩いて 404 を量産する）
-gh api --paginate "/user/repos?per_page=100&affiliation=owner" \
-  -q ".[] | select(.archived==false and .fork==false and .owner.login==\"$OWNER\") | \"\\(.name)\\t\\(.default_branch)\"" |
+# 一覧は先にファイルへ取り、ループは親シェルで回す（`gh | while` だとループがパイプのサブシェルになり、
+# 中で設定した EXIT トラップは正常終了時に発火しない = 最後のリポジトリの再保護が漏れる。PIPESTATUS も不要になる）
+LIST_FILE=$(mktemp)
+if ! gh api --paginate "/user/repos?per_page=100&affiliation=owner" \
+     -q ".[] | select(.archived==false and .fork==false and .owner.login==\"$OWNER\") | \"\\(.name)\\t\\(.default_branch)\"" \
+     > "$LIST_FILE" 2>>"$ERRLOG"; then
+  echo "::error::リポジトリ一覧の取得に失敗（収束は走っていない）: $(tail -1 "$ERRLOG")"
+  rm -f "$LIST_FILE" "$ERRLOG" "$REPROTECT_FAILED_FLAG" "$GH_STDERR"; exit 1
+fi
+trap reprotect_pending EXIT
+trap on_signal INT TERM
 while IFS=$'\t' read -r NAME BRANCH; do
   case " $EXCLUDE " in *" $NAME "*) continue;; esac
   if [ -n "${ONLY:-}" ]; then case " $ONLY " in *" $NAME "*) ;; *) continue;; esac; fi
@@ -361,20 +387,18 @@ while IFS=$'\t' read -r NAME BRANCH; do
     CI_INSTALLED_NOW=true
   fi
   reprotect_pending          # 前のリポジトリで protect が失敗・スキップされていたらここで戻す（値を捨てない）
-  trap reprotect_pending EXIT
-  trap on_signal INT TERM
 
   # ---- A. 運用設定の収束（言語を問わず全リポジトリ） ----
   LBL=$(sync_labels "$NAME")
   SS=$(sync_secret_scanning "$NAME")
   sync_dependabot "$NAME" "$BRANCH"        # → DEP（サブシェルにしない: UNPROTECTED_FOR_FIX を親へ伝えるため）
   sync_pr_triage "$NAME" "$BRANCH"         # → PRT
-  # 鍵は「標準の呼び出しが既定ブランチにある」か「今回届いた/届く見込み」のリポジトリだけに同期する
-  # （古い標準 caller が残っていて更新 PR が却下された場合もローテーションは追従させる）
+  # 鍵は「標準の呼び出しが既定ブランチにある」リポジトリだけに同期する（今回置いた直後も含む）。
+  # PR で届ける途中のリポジトリには置かない（マージされれば翌日 PRT_PRESENT で同期される）
   if $PRT_PRESENT; then sync_pr_triage_secret "$NAME"; else
     case "$PRT" in
-      配布|"配布(保護を一時解除)"|更新|PR作成|PR済み) sync_pr_triage_secret "$NAME";;   # → PRS
-      *) PRS="対象外";;   # 独自 / 失敗 / 雛形なし / 却下済み / 作成不可 / 取得失敗: 標準の呼び出しが無いリポジトリに鍵だけ置かない
+      配布|"配布(保護を一時解除)"|更新) sync_pr_triage_secret "$NAME";;   # → PRS
+      *) PRS="対象外";;   # 独自 / 失敗 / 雛形なし / PR で配布中 / 却下済み / 作成不可 / 取得失敗
     esac
   fi
   cleanup_sweeper_branches "$NAME"         # 閉じた/マージ済み sweeper PR のブランチを掃除（却下の記録は閉じた PR 自体に残る）
@@ -384,16 +408,17 @@ while IFS=$'\t' read -r NAME BRANCH; do
   if [ -z "$KIND" ]; then
     # CI対象外の言語でも運用設定は収束済みなので結果を出す
     echo "| $NAME | $OPS / CI:対象外 |"
-    continue
+    reprotect_pending; continue
   fi
 
   # 404（未導入）と API 障害を区別する。障害を「CI なし」と扱うと、導入済みリポジトリの保護を外して sha 無し PUT に失敗し、未保護で終わる
-  CI_ERR=""
-  if ! CI_JSON=$(gh api "/repos/${OWNER}/${NAME}/contents/.github/workflows/ci.yml?ref=${BRANCH}" 2>&1); then
-    CI_ERR="$CI_JSON"; CI_JSON=""
-    if ! printf '%s' "$CI_ERR" | grep -q 'HTTP 404'; then
-      echo "| $NAME | $OPS / CI:状態取得に失敗のためスキップ（$(printf '%s' "$CI_ERR" | tail -1 | cut -c1-80)） |"
-      continue
+  # stderr は JSON と混ぜない（gh が成功しつつ stderr に更新通知などを出すと jq が壊れ「未導入」と誤判定する）
+  : > "$GH_STDERR"
+  if ! CI_JSON=$(gh api "/repos/${OWNER}/${NAME}/contents/.github/workflows/ci.yml?ref=${BRANCH}" 2>"$GH_STDERR"); then
+    CI_JSON=""
+    if ! grep -q 'HTTP 404' "$GH_STDERR"; then
+      echo "| $NAME | $OPS / CI:状態取得に失敗のためスキップ（$(tail -1 "$GH_STDERR" | cut -c1-80)） |"
+      reprotect_pending; continue
     fi
   fi
   CI_SHA=$(printf '%s' "$CI_JSON" | jq -r '.sha // empty' 2>/dev/null)
@@ -440,21 +465,19 @@ while IFS=$'\t' read -r NAME BRANCH; do
     fi
   fi
   echo "| $NAME | $OPS / CI:$STATUS |"
-done
-# ループはパイプのサブシェル。一覧取得の失敗とシグナル中断（130）を親の終了コードに反映する。
-# 2 つの代入は必ず 1 コマンドで行う（1 つ目の代入自体が PIPESTATUS を上書きし、2 つ目が set -u で落ちる）
-LIST_RC=${PIPESTATUS[0]} LOOP_RC=${PIPESTATUS[1]}
+  reprotect_pending          # 末尾の protect が失敗したときの再試行。最後のリポジトリでもここで戻る
+done < "$LIST_FILE"
+rm -f "$LIST_FILE"
 echo ""
 echo "sweep 完了: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # 失敗の詳細（「ログ参照」の参照先）。Actions ならジョブサマリーにも出す
 if [ -s "$ERRLOG" ]; then
   echo ""; echo "<details><summary>エラー詳細（$(wc -l < "$ERRLOG" | tr -d ' ') 行）</summary>"; echo ""; echo '```'; cat "$ERRLOG"; echo '```'; echo "</details>"
 fi
-rm -f "$ERRLOG"
+rm -f "$ERRLOG" "$GH_STDERR"
+trap - EXIT
 if [ -s "$REPROTECT_FAILED_FLAG" ]; then
   echo "::error::保護を戻せなかったリポジトリ: $(tr '\n' ' ' <"$REPROTECT_FAILED_FLAG")。手で確認すること"; rm -f "$REPROTECT_FAILED_FLAG"; exit 1
 fi
 rm -f "$REPROTECT_FAILED_FLAG"
-[ "${LIST_RC:-0}" = 0 ] || { echo "::error::リポジトリ一覧の取得に失敗（収束は走っていない）"; exit 1; }
-[ "${LOOP_RC:-0}" = 130 ] && { echo "::error::シグナルで中断された（保護は復旧済み）"; exit 130; }
 exit 0
