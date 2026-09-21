@@ -44,10 +44,15 @@ REPROTECT_REPO=""; REPROTECT_BRANCH=""; REPROTECT_CONTEXTS=""
 reprotect_pending() {
   if [ -n "$REPROTECT_REPO" ]; then
     protect "$REPROTECT_REPO" "$REPROTECT_BRANCH" "$REPROTECT_CONTEXTS" \
-      && echo "::notice::${REPROTECT_REPO}: 中断時に保護を再適用" \
+      && echo "::notice::${REPROTECT_REPO}: 保護を再適用（末尾の protect が走らなかった経路）" \
       || echo "::error::${REPROTECT_REPO}: 保護の再適用に失敗。手で確認すること"
     REPROTECT_REPO=""
   fi
+}
+on_signal() { # TERM/INT: 復旧してから終了する（終了しないと bash はループを再開し、次のリポジトリを解除しにいく）
+  echo "::warning::シグナルで中断。保護を復旧して終了する"
+  reprotect_pending
+  exit 130
 }
 
 exists() { # exists <repo> <path> → 0/1
@@ -59,10 +64,10 @@ put_file() { # put_file <repo> <branch> <path> <message> <content> [sha] → 0 �
   local ARGS=(-X PUT "/repos/${OWNER}/${R}/contents/${P}" -f message="$M" -f branch="$B" -f content="$(printf '%s\n' "$C" | base64 | tr -d '\n')")
   [ -n "$S" ] && ARGS+=(-f sha="$S")
   if ! ERR=$(gh api "${ARGS[@]}" 2>&1 >/dev/null); then
-    printf '%s\n' "$ERR" >>"$ERRLOG"
     if printf '%s' "$ERR" | grep -Eqi 'status check|pull request|protected branch|rule'; then
-      return 2
+      return 2   # 保護による拒否は想定内（deliver_file が別経路へ回す）。ERRLOG には残さない
     fi
+    printf '%s\n' "$ERR" >>"$ERRLOG"
     echo "::warning::put_file 失敗 ${R}/${P}: $(printf '%s' "$ERR" | tail -1)"
     return 1
   fi
@@ -96,7 +101,9 @@ deliver_file() {
 
 open_pr_with_file() { # open_pr_with_file <repo> <base> <path> <message> <content> → DELIVER="PR作成" / "PR済み" / "失敗"
   local R=$1 B=$2 P=$3 M=$4 C=$5 SLUG HEAD BJ BS BC OPEN
-  SLUG="sweeper/$(basename "$P" | sed 's/\.[^.]*$//')"
+  # ブランチ名に内容ハッシュを含める: 人が閉じた PR は「その内容」の却下として翌日作り直さないが、
+  # 雛形を直して内容が変われば別ブランチで新しい PR が出る
+  SLUG="sweeper/$(basename "$P" | sed 's/\.[^.]*$//')-$(printf '%s\n' "$C" | shasum | cut -c1-8)"
   if ! gh api "/repos/${OWNER}/${R}/git/ref/heads/${SLUG}" >/dev/null 2>&1; then
     HEAD=$(gh api "/repos/${OWNER}/${R}/git/ref/heads/${B}" -q .object.sha 2>>"$ERRLOG") || { DELIVER="失敗"; return 1; }
     gh api -X POST "/repos/${OWNER}/${R}/git/refs" -f ref="refs/heads/${SLUG}" -f sha="$HEAD" >/dev/null 2>>"$ERRLOG" || { DELIVER="失敗"; return 1; }
@@ -109,7 +116,7 @@ open_pr_with_file() { # open_pr_with_file <repo> <base> <path> <message> <conten
   fi
   OPEN=$(gh pr list -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --state open --json number -q 'length' 2>/dev/null || echo 0)
   if [ "${OPEN:-0}" -gt 0 ]; then DELIVER="PR済み"; return 0; fi
-  # 人がマージせずに閉じた PR があれば、意思表示とみなして翌日また作らない
+  # 人がマージせずに閉じた PR があれば、この内容への意思表示とみなして翌日また作らない（内容が変わればブランチ名が変わる）
   local REJECTED
   REJECTED=$(gh pr list -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --state closed --json mergedAt -q '[.[]|select(.mergedAt==null)]|length' 2>/dev/null || echo 0)
   if [ "${REJECTED:-0}" -gt 0 ]; then DELIVER="PR却下済み"; return 0; fi
@@ -312,8 +319,9 @@ while IFS=$'\t' read -r NAME BRANCH; do
   if [ -n "$KIND" ] && gh api "/repos/${OWNER}/${NAME}/contents/.github/workflows/ci.yml?ref=${BRANCH}" -q .content 2>/dev/null | base64 -d 2>/dev/null | grep -q "$STANDARD_REPO"; then
     CI_INSTALLED_NOW=true
   fi
-  REPROTECT_REPO=""
-  trap reprotect_pending EXIT TERM INT
+  reprotect_pending          # 前のリポジトリで protect が失敗・スキップされていたらここで戻す（値を捨てない）
+  trap reprotect_pending EXIT
+  trap on_signal INT TERM
 
   # ---- A. 運用設定の収束（言語を問わず全リポジトリ） ----
   LBL=$(sync_labels "$NAME")

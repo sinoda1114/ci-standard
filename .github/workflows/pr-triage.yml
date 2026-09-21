@@ -45,6 +45,9 @@ permissions:
 
 jobs:
   triage:
+    # fork（別リポジトリ）からの PR では secrets が渡らず GITHUB_TOKEN も読み取り専用でコメントを投稿できないため、
+    # 待機に入る前にジョブごと飛ばす（pull_request_review も pull_request と同じ制約。公式ドキュメントで確認）
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -67,15 +70,9 @@ jobs:
           TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
-          # head.repo.fork は「head リポジトリ自体が fork か」なので、ベースが fork のリポジトリでは同一リポ内 PR でも true になる。
-          # 「別リポジトリからの PR か」を full_name の比較で判定する
-          IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
           MIN_THREADS: ${{ inputs.min-threads }}
         run: |
           set -euo pipefail
-          if [ "$IS_FORK" = "true" ]; then
-            echo "fork からの PR: トークンが読み取り専用でコメントを投稿できないため何もしない"; exit 0
-          fi
           S=ci-standard/scripts/pr-triage
           mkdir -p out
           "$S/fetch-threads.sh" "$REPO" "$PR" > out/threads.json   # 失敗すれば set -e でここで止まる
@@ -109,6 +106,11 @@ jobs:
             echo
             echo "<sub>ci-standard/pr-triage · 自動投稿。新しいレビューが付くと更新されます。</sub>"
           } > out/comment.md
+          # コメント本文は 65,536 字が上限（超えると 422 でジョブが落ちる）。表の途中で切って注記する
+          if [ "$(wc -m < out/comment.md)" -gt 60000 ]; then
+            head -c 58000 out/comment.md > out/comment.cut && printf '\n\n（長すぎるため以降を省略。全体は Actions のログ参照）\n' >> out/comment.cut && mv out/comment.cut out/comment.md
+            cat out/triage.md
+          fi
           # 既存の固定コメントがあれば更新、無ければ作成
           if [ -n "$cid" ]; then
             gh api -X PATCH "repos/$REPO/issues/comments/$cid" -F body=@out/comment.md > /dev/null

@@ -23,7 +23,10 @@ from pathlib import Path
 ROUTES = [("TYPESAFE_API_KEY", "https://api.typesafe.ai/v1/systemone", "jev-latest"),
           ("AI_GATEWAY_API_KEY", "https://ai-gateway.vercel.sh/typesafe/v1/systemone", "typesafe-ai/jev")]
 TIMEOUT = 20
-MAX_CALLS = int(os.environ.get("PR_TRIAGE_MAX_CALLS", "400") or 400)
+try:
+    MAX_CALLS = int(os.environ.get("PR_TRIAGE_MAX_CALLS", "400") or 400)
+except ValueError:
+    MAX_CALLS = 400
 CATEGORIES = {
     "security": "a security vulnerability or weakening of a security control (injection, auth bypass, secret exposure, unsafe file/process access, missing validation with security impact)",
     "bug": "incorrect behavior, crash, wrong result, missing error handling, race, or a logic defect that is not security-related",
@@ -227,7 +230,12 @@ def main():
                            "path": members[0].get("path"), "lines": sorted({m.get("line") for m in members if m.get("line")}),
                            "summary": summarize(members[0]["text"])})
     out_groups.sort(key=lambda g: (CAT_ORDER.index(g["category"]) if g["category"] in CAT_ORDER else 99, -len(g["members"])))
-    status = "ok" if (jev_ok and not errors) else ("partial" if (route[0] and calls > 0) else "unavailable")
+    if mock:
+        status = "ok"
+    elif calls == 0:
+        status = "unavailable"          # 1 回も呼んでいない（キー無し・全件が秘密情報該当）なら ok を名乗らない
+    else:
+        status = "ok" if (jev_ok and not errors) else "partial"
     result = {"jev": status, "errors": errors[:20], "calls": calls, "seconds": round(time.time() - t0, 1),
               "dropped": dropped, "threads": threads, "pairs": pairs, "groups": out_groups}
     Path(a.out).write_text(json.dumps(result, ensure_ascii=False, indent=1))
@@ -236,7 +244,7 @@ def main():
                  + (f"、除外: 人 {dropped['human']} / 解決済み {dropped['resolved']}" if any(dropped.values()) else "") + "）", "",
                  "| # | 種別 | 件数 | 指摘元 | 場所 | 要旨 | 判定 |", "|---|---|---|---|---|---|---|"]
         for k, g in enumerate(out_groups, 1):
-            loc = f"{(g['path'] or '').split('/')[-1]}:{','.join(str(x) for x in g['lines'][:3])}"
+            loc = f"{(g['path'] or '').split('/')[-1]}:{','.join(str(x) for x in g['lines'][:3])}".strip(":") or "(場所不明)"
             lines.append(f"| {k} | {g['category']} | {len(g['members'])} | {', '.join(g['authors'])} | {loc} | {g['summary'].replace('|','/')} | |")
         lines += ["", "「判定」列は人または Claude が埋める（本物 / 却下 / 対応済み）。JEV は仕分けだけを行い、正誤は判定しない。"]
         Path(a.md).write_text("\n".join(lines))
