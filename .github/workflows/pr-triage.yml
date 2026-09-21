@@ -90,7 +90,7 @@ jobs:
           # 自分（github-actions[bot]）が投稿したマーカー付きコメントだけを対象にする（人が表を引用したコメントを消さない）
           cids=$(gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100" \
                    --jq '.[] | select(.user.type == "Bot" and .user.login == "github-actions[bot]") | select(.body != null) | select(.body | startswith("<!-- pr-triage -->")) | .id') \
-                 || { echo "::warning::既存コメントの取得に失敗。新規投稿として続行"; cids=""; }
+                 || { echo "::warning::既存コメントの取得に失敗。二重投稿を避けるため今回は投稿せず、次のイベントで再試行する"; exit 0; }
           cid=$(printf '%s\n' "$cids" | awk 'NR==1{c=$0} END{print c}')
           # 過去に二重投稿されていたら 2 件目以降は消す（1 件だけ更新すると残りが古い表のまま残る）
           printf '%s\n' "$cids" | awk 'NR>1 && NF' | while IFS= read -r dup; do

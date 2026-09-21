@@ -304,7 +304,7 @@ sync_dependabot() { # sync_dependabot <repo> <branch> → DEP="既存" / "配布
     BODY=$(printf '%s' "$J" | jq -r '.content // empty' 2>/dev/null | base64 -d 2>/dev/null || true)
     # sweeper が配布したファイル（ヘッダーの印で判定）は言語別の内容へ収束させる。人が書いたものは触らない
     if [ "$BODY" = "$WANT" ] || ! printf '%s' "$BODY" | grep -q 'sweeper が配布'; then DEP="既存"; return; fi
-    $KIND_ERR && { DEP="既存"; return; }   # 言語判定が保留の日は更新しない
+    $KIND_ERR && { DEP="保留"; return; }   # 言語判定が保留の日は更新しない
     deliver_file "$R" "$B" ".github/dependabot.yml" "chore: Dependabot 設定を言語に合わせて更新 [sweeper]" "$WANT" "$SHA"
     DEP="$DELIVER"; [ "$DEP" = "配布" ] && DEP="更新"; return
   fi
@@ -398,8 +398,8 @@ while IFS=$'\t' read -r NAME BRANCH <&3; do   # 一覧は fd 3 から読む（�
   # 言語判定を先に行う（Contents API のみ、clone不要）。deliver_file が「sweeper 管理の保護か」の判断に KIND を使う。
   # 取得失敗（404 以外）が 1 つでもあれば判定を保留し、そのリポジトリの CI/保護は触らない
   # （障害日に playwright の有無を誤判定して e2e 必須を外す、といった事故を防ぐ）
-  KIND=""; CONTEXTS=""; UNPROTECTED_FOR_FIX=false; KIND_ERR=false
-  probe() { exists "$NAME" "$1"; local rc=$?; [ $rc -eq 2 ] && KIND_ERR=true; return $rc; }
+  KIND=""; CONTEXTS=""; UNPROTECTED_FOR_FIX=false; KIND_ERR=false; KIND_ERR_MSG=""
+  probe() { exists "$NAME" "$1"; local rc=$?; [ $rc -eq 2 ] && { KIND_ERR=true; KIND_ERR_MSG=$(tail -1 "$GH_STDERR"); }; return $rc; }   # 真因はその場で退避（GH_STDERR は後続が上書きする）
   if probe package.json; then
     KIND="node"
     # e2e必須はplaywright設定のあるリポジトリのみ（未導入リポジトリをマージ不能にしないため）
@@ -438,7 +438,7 @@ while IFS=$'\t' read -r NAME BRANCH <&3; do   # 一覧は fd 3 から読む（�
 
   # ---- B. CI/CD（Node/Python のみ） ----
   if $KIND_ERR; then
-    echo "| $NAME | $OPS / CI:言語判定の取得に失敗のためスキップ（$(tail -1 "$GH_STDERR" | cut -c1-80)） |"
+    echo "| $NAME | $OPS / CI:言語判定の取得に失敗のためスキップ（$(printf '%s' "$KIND_ERR_MSG" | cut -c1-80)） |"
     reprotect_pending; continue
   fi
   if [ -z "$KIND" ]; then

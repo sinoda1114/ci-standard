@@ -93,6 +93,14 @@ class TriageTests(unittest.TestCase):
         self.assertEqual(r["calls"], 1)                     # 最初の不正応答で遮断（2 件目は呼ばれない）
         self.assertIn("bad-response", r["errors"]); self.assertEqual(r["jev"], "partial")
 
+    def test_unknown_choice_does_not_trip_breaker(self):
+        answers = iter([({"category": {"choice": "Bug"}, "is_security": {"noul": 0.1}}, None),      # ラベル揺れ（形は正しい）
+                        ({"category": {"choice": "docs"}, "is_security": {"noul": 0.1}}, None)])
+        r = self._run_with_call(lambda *a: next(answers), [th(1, "a.py", 1), th(2, "b.py", 2)])
+        self.assertEqual(r["calls"], 2)                                  # 2 件目も分類される
+        self.assertEqual([t["category"] for t in r["threads"]], ["unknown", "docs"])
+        self.assertIn("unknown-choice", r["errors"]); self.assertEqual(r["jev"], "partial")
+
     def test_bool_is_not_a_probability(self):
         bad = ({"category": {"choice": "bug"}, "is_security": {"noul": True}}, None)
         r = self._run_with_call(lambda *a: bad, [th(1, "a.py", 1)])
@@ -123,8 +131,8 @@ class TriageTests(unittest.TestCase):
         self.assertIn("deadline", r["errors"]); self.assertLess(r["calls"], 36); self.assertEqual(r["jev"], "partial")
 
     def test_mock_mode_and_location_display(self):
-        r, md = run([th(1, "src/a/util.py", 10), th(2, None, None)], env={"PR_TRIAGE_MOCK": "1"})
-        self.assertEqual(r["jev"], "ok"); self.assertIn("a/util.py:10", md); self.assertIn("(場所不明)", md)
+        r, md = run([th(1, "src/a/util.py", 10), th(2, None, None), th(3, None, 7)], env={"PR_TRIAGE_MOCK": "1"})
+        self.assertEqual(r["jev"], "ok"); self.assertIn("a/util.py:10", md); self.assertIn("| (場所不明) |", md); self.assertIn("(場所不明):7", md)
 
     def test_rejects_non_array(self):
         with tempfile.TemporaryDirectory() as d:

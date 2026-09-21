@@ -201,11 +201,16 @@ def main():
             continue
         c = ans.get("category"); s_ = ans.get("is_security")
         sec = s_.get("noul") if isinstance(s_, dict) else None
-        if not (isinstance(c, dict) and c.get("choice") in CATEGORIES and is_number(sec)):
-            # HTTP は成功したが必須フィールドが欠落・型不正。ok を名乗らないよう記録し、以後は呼ばない
+        if not isinstance(c, dict) or not is_number(sec):
+            # HTTP は成功したが必須フィールドが欠落・型不正（伝送の異常）。ok を名乗らないよう記録し、以後は呼ばない
             errors.append("bad-response"); jev_ok = False
             continue
-        t["category"] = c["choice"]; t["category_conf"] = c.get("confidence"); t["is_security"] = sec
+        t["is_security"] = sec
+        if c.get("choice") not in CATEGORIES:
+            # 形は正しいがラベルが想定外（内容の不一致）。このスレッドだけ unknown にして続ける（遮断しない）
+            errors.append("unknown-choice"); t["category"] = "security" if sec >= 0.7 else "unknown"
+            continue
+        t["category"] = c["choice"]; t["category_conf"] = c.get("confidence")
         if sec >= 0.7:
             t["category"] = "security"
 
@@ -279,7 +284,8 @@ def main():
                  + (f"、除外: 人 {dropped['human']} / 解決済み {dropped['resolved']}" if any(dropped.values()) else "") + "）", "",
                  "| # | 種別 | 件数 | 指摘元 | 場所 | 要旨 | 判定 |", "|---|---|---|---|---|---|---|"]
         for k, g in enumerate(out_groups, 1):
-            loc = f"{'/'.join((g['path'] or '').split('/')[-2:])}:{','.join(str(x) for x in g['lines'][:3])}".strip(":") or "(場所不明)"
+            where = "/".join((g["path"] or "").split("/")[-2:]) or "(場所不明)"
+            loc = where + (":" + ",".join(str(x) for x in g["lines"][:3]) if g["lines"] else "")
             lines.append(f"| {k} | {g['category']} | {len(g['members'])} | {', '.join(g['authors'])} | {loc} | {g['summary'].replace('|','/')} | |")
         lines += ["", "「判定」列は人または Claude が埋める（本物 / 却下 / 対応済み）。JEV は仕分けだけを行い、正誤は判定しない。"]
         Path(a.md).write_text("\n".join(lines))
