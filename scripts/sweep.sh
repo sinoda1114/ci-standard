@@ -76,8 +76,11 @@ on_signal() { # TERM/INT: 復旧してから終了する（終了しないと ba
   exit 130
 }
 
-exists() { # exists <repo> <path> → 0/1
-  gh api "/repos/${OWNER}/$1/contents/$2" -q .sha >/dev/null 2>&1
+exists() { # exists <repo> <path> → 0 ある / 1 無い（404） / 2 取得失敗（障害・レート制限。呼び出し側は判定を保留する）
+  : > "$GH_STDERR"
+  if gh api "/repos/${OWNER}/$1/contents/$2" -q .sha >/dev/null 2>"$GH_STDERR"; then return 0; fi
+  grep -q 'HTTP 404' "$GH_STDERR" && return 1
+  return 2
 }
 
 put_file() { # put_file <repo> <branch> <path> <message> <content> [sha] → 0 成功 / 2 保護ブランチで拒否 / 1 その他
@@ -136,15 +139,21 @@ open_pr_with_file() { # open_pr_with_file <repo> <base> <path> <message> <conten
   REJECTED=$(gh pr list -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --state closed --json mergedAt,body \
                -q "[.[]|select(.mergedAt==null)|select((.body // \"\")|contains(\"${SUPERSEDED_MARK}\")|not)]|length" 2>>"$ERRLOG") || { DELIVER="PR状態の取得に失敗"; return 1; }
   if [ "${REJECTED:-0}" -gt 0 ]; then DELIVER="PR却下済み"; return 0; fi
+  local CREATED=false
   if ! gh api "/repos/${OWNER}/${R}/git/ref/heads/${SLUG}" >/dev/null 2>&1; then
     HEAD=$(gh api "/repos/${OWNER}/${R}/git/ref/heads/${B}" -q .object.sha 2>>"$ERRLOG") || { DELIVER="失敗"; return 1; }
     gh api -X POST "/repos/${OWNER}/${R}/git/refs" -f ref="refs/heads/${SLUG}" -f sha="$HEAD" >/dev/null 2>>"$ERRLOG" || { DELIVER="失敗"; return 1; }
+    CREATED=true
   fi
   BJ=$(gh api "/repos/${OWNER}/${R}/contents/${P}?ref=${SLUG}" 2>/dev/null || true)
   BS=$(printf '%s' "$BJ" | jq -r '.sha // empty' 2>/dev/null)
   BC=$(printf '%s' "$BJ" | jq -r '.content // empty' 2>/dev/null | base64 -d 2>/dev/null || true)
   if [ "$BC" != "$C" ]; then
-    put_file "$R" "$SLUG" "$P" "$M" "$C" "$BS" || { DELIVER="失敗"; return 1; }
+    if ! put_file "$R" "$SLUG" "$P" "$M" "$C" "$BS"; then
+      # この実行で作ったブランチなら消す（PR の無いブランチは掃除対象外なので、残すと孤児になる）
+      $CREATED && gh api -X DELETE "/repos/${OWNER}/${R}/git/refs/heads/${SLUG}" >/dev/null 2>&1
+      DELIVER="失敗"; return 1
+    fi
   fi
   local PRERR
   if PRERR=$(gh pr create -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --title "$M" \
@@ -287,12 +296,21 @@ dependabot_body() { # dependabot_body <kind> : node → npm + github-actions / p
 
 sync_dependabot() { # sync_dependabot <repo> <branch> → DEP="既存" / "配布" / "PR作成" / "PR済み" / "失敗" / "取得失敗"
   local R=$1 B=$2
+  local J SHA BODY WANT
+  WANT="$(dependabot_body "${KIND:-}")"
   : > "$GH_STDERR"
-  if gh api "/repos/${OWNER}/${R}/contents/.github/dependabot.yml?ref=${B}" -q .sha >/dev/null 2>"$GH_STDERR"; then
-    DEP="既存"; return
+  if J=$(gh api "/repos/${OWNER}/${R}/contents/.github/dependabot.yml?ref=${B}" 2>"$GH_STDERR"); then
+    SHA=$(printf '%s' "$J" | jq -r '.sha // empty' 2>/dev/null)
+    BODY=$(printf '%s' "$J" | jq -r '.content // empty' 2>/dev/null | base64 -d 2>/dev/null || true)
+    # sweeper が配布したファイル（ヘッダーの印で判定）は言語別の内容へ収束させる。人が書いたものは触らない
+    if [ "$BODY" = "$WANT" ] || ! printf '%s' "$BODY" | grep -q 'sweeper が配布'; then DEP="既存"; return; fi
+    $KIND_ERR && { DEP="既存"; return; }   # 言語判定が保留の日は更新しない
+    deliver_file "$R" "$B" ".github/dependabot.yml" "chore: Dependabot 設定を言語に合わせて更新 [sweeper]" "$WANT" "$SHA"
+    DEP="$DELIVER"; [ "$DEP" = "配布" ] && DEP="更新"; return
   fi
   grep -q 'HTTP 404' "$GH_STDERR" || { DEP="取得失敗"; return; }   # 障害日に sha 無し PUT で 422 を量産しない
-  deliver_file "$R" "$B" ".github/dependabot.yml" "chore: Dependabot 設定を配布 [sweeper]" "$(dependabot_body "${KIND:-}")"
+  $KIND_ERR && { DEP="保留"; return; }
+  deliver_file "$R" "$B" ".github/dependabot.yml" "chore: Dependabot 設定を配布 [sweeper]" "$WANT"
   DEP="$DELIVER"
 }
 
@@ -377,19 +395,23 @@ while IFS=$'\t' read -r NAME BRANCH <&3; do   # 一覧は fd 3 から読む（�
   case " $EXCLUDE " in *" $NAME "*) continue;; esac
   if [ -n "${ONLY:-}" ]; then case " $ONLY " in *" $NAME "*) ;; *) continue;; esac; fi
 
-  # 言語判定を先に行う（Contents API のみ、clone不要）。deliver_file が「sweeper 管理の保護か」の判断に KIND を使う
-  KIND=""; CONTEXTS=""; UNPROTECTED_FOR_FIX=false
-  if exists "$NAME" package.json; then
+  # 言語判定を先に行う（Contents API のみ、clone不要）。deliver_file が「sweeper 管理の保護か」の判断に KIND を使う。
+  # 取得失敗（404 以外）が 1 つでもあれば判定を保留し、そのリポジトリの CI/保護は触らない
+  # （障害日に playwright の有無を誤判定して e2e 必須を外す、といった事故を防ぐ）
+  KIND=""; CONTEXTS=""; UNPROTECTED_FOR_FIX=false; KIND_ERR=false
+  probe() { exists "$NAME" "$1"; local rc=$?; [ $rc -eq 2 ] && KIND_ERR=true; return $rc; }
+  if probe package.json; then
     KIND="node"
     # e2e必須はplaywright設定のあるリポジトリのみ（未導入リポジトリをマージ不能にしないため）
-    if exists "$NAME" playwright.config.ts || exists "$NAME" playwright.config.js || exists "$NAME" playwright.config.mjs; then
+    if probe playwright.config.ts || probe playwright.config.js || probe playwright.config.mjs; then
       CONTEXTS='["ci / build", "ci / e2e"]'
     else
       CONTEXTS='["ci / build"]'
     fi
-  elif exists "$NAME" pyproject.toml || exists "$NAME" requirements.txt; then
+  elif probe pyproject.toml || probe requirements.txt; then
     KIND="python"; CONTEXTS='["ci / build"]'
   fi
+  if $KIND_ERR; then KIND=""; fi   # 保留: deliver_file は PR 経路に回り、CI 節は下で飛ばす
 
   # 標準CIが既に入っているか（deliver_file が「保護を一時解除してよいか」の判断に使う。末尾の protect() が走る保証になる）
   CI_INSTALLED_NOW=false
@@ -415,6 +437,10 @@ while IFS=$'\t' read -r NAME BRANCH <&3; do   # 一覧は fd 3 から読む（�
   OPS="ラベル:${LBL} / scanning:${SS} / dependabot:${DEP} / pr-triage:${PRT}(secret:${PRS})"
 
   # ---- B. CI/CD（Node/Python のみ） ----
+  if $KIND_ERR; then
+    echo "| $NAME | $OPS / CI:言語判定の取得に失敗のためスキップ（$(tail -1 "$GH_STDERR" | cut -c1-80)） |"
+    reprotect_pending; continue
+  fi
   if [ -z "$KIND" ]; then
     # CI対象外の言語でも運用設定は収束済みなので結果を出す
     echo "| $NAME | $OPS / CI:対象外 |"
@@ -448,20 +474,28 @@ while IFS=$'\t' read -r NAME BRANCH <&3; do   # 一覧は fd 3 から読む（�
     fi
 
     # 既存の独自CIを退避（workflows/ 外へ: .ymlのままだとワークフローとして解釈されるため）
+    BAK_NOTE=""
     if [ -n "$CI_SHA" ]; then
       OLD_BAK_SHA=$(gh api "/repos/${OWNER}/${NAME}/contents/.github/ci.yml.bak?ref=${BRANCH}" -q .sha 2>/dev/null || true)
+      BAK_NOTE=""
       put_file "$NAME" "$BRANCH" ".github/ci.yml.bak" \
-        "ci: 標準CI導入に伴い旧ci.ymlを退避 [sweeper]" "$CI_BODY" "$OLD_BAK_SHA" || true
+        "ci: 標準CI導入に伴い旧ci.ymlを退避 [sweeper]" "$CI_BODY" "$OLD_BAK_SHA" || BAK_NOTE="（旧 ci.yml の退避に失敗。git 履歴から復元可）"
     fi
 
     put_file "$NAME" "$BRANCH" ".github/workflows/ci.yml" \
       "ci: 標準CI（${STANDARD_REPO}）を自動導入 [sweeper]" "$(standard_ci_body "$KIND" "$BRANCH")" "$CI_SHA"; CI_PUT_RC=$?
     if [ $CI_PUT_RC -eq 0 ]; then
       INSTALLED=true
-      STATUS="導入 ($KIND)"
+      STATUS="導入 ($KIND)${BAK_NOTE:-}"
     elif [ $CI_PUT_RC -eq 2 ]; then
-      # ruleset 等、sweeper が解除できない保護で拒否された（is_protected はクラシック保護しか見ない）。ERRLOG には残らない
+      # ruleset 等、sweeper が解除できない保護で拒否された（is_protected はクラシック保護しか見ない）。ERRLOG には残らない。
+      # CI が無いのに「ci / build 必須」で再保護すると push/マージ不能に詰むので、保険の対象からも外す
       STATUS="導入不可（ruleset 等の保護で直接 push 不可。ci.yml は手で PR すること）"
+      REPROTECT_REPO=""
+      if $UNPROTECTED_FOR_FIX; then
+        STATUS="$STATUS ※クラシック保護は解除したまま"
+        echo "::warning::${NAME}: 標準CIを置けなかったためクラシック保護を解除したまま。ci.yml を手で PR すれば翌日再保護される"
+      fi
     else
       STATUS="導入失敗（ログ参照）"
       # CI 無しで保護すると push/マージ不能に詰むため、保険（reprotect_pending）の対象からも外す

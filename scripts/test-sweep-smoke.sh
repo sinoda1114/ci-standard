@@ -41,7 +41,7 @@ case "$1" in
     case "\$A" in
       *"/user/repos"*)                       printf 'smoke\tmain\n'; exit 0;;
       *"contents/package.json"*)             exit 0;;                       # Node リポジトリ
-      *"contents/playwright.config"*)        exit 1;;
+      *"contents/playwright.config"*)        echo "gh: HTTP 404 Not Found" >&2; exit 1;;
       *"workflows/ci.yml"*" -q .content"*)   printf 'uses: sinoda1114/ci-standard/.github/workflows/node-ci.yml@main\n' | base64; exit 0;;  # 標準CI導入済み
       *"workflows/ci.yml"*)                  echo "gh: HTTP 500 Internal Server Error" >&2; exit 1;;   # CI 状態の取得だけ障害
       *"-X DELETE"*"/protection"*)           echo UNPROTECTED >> "\$STATE"; exit 0;;

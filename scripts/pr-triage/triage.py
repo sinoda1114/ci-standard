@@ -156,9 +156,9 @@ def main():
     if a.count_only:
         print(len(threads)); return 0
     for i, t in enumerate(threads):
-        t["idx"] = i; t["text"] = clean(t.get("body") or "")[:6000]
+        t["idx"] = i; full = clean(t.get("body") or ""); t["text"] = full[:6000]
         t["file"] = t.get("path") or ""          # フルパスで比較（basename だと別ディレクトリの同名ファイルが混ざる）
-        t["has_secret"] = bool(SECRET_RE.search(t["text"]))   # 1 回だけ判定（ペア毎に本文を再走査しない）
+        t["has_secret"] = bool(SECRET_RE.search(full))   # 本文全体で 1 回だけ判定（6000 字より後ろの秘密も拾う）
     mock = os.environ.get("PR_TRIAGE_MOCK") == "1"
     route = ("mock", "mock", "mock") if mock else load_route()
     jev_ok = bool(route[0]); errors = []
