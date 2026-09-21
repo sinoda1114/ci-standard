@@ -1,0 +1,30 @@
+# PR Bot コメント仕分けの呼び出し側（実体: https://github.com/sinoda1114/ci-standard）
+# このファイルを対象リポジトリの .github/workflows/pr-triage.yml に置く。
+# 必要な Secret: TYPESAFE_API_KEY（無くても動くが、JEV なしの粗い束ね方になる）
+#
+# 動き: AI レビューボットが PR にレビューを投稿するたびに起動し、3 分待って（Bot が出そろうのを待つ）
+#       スレッドを「同じ問題」で束ね種別順に並べた表を、PR の固定コメントとして投稿・更新する。
+#       正誤の判定はしない。人か Claude がグループ単位で判断する。
+
+name: PR triage
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+# 同じ PR で新しいレビューが来たら、待機中の旧ジョブを打ち切って最後の 1 回だけ集計する
+concurrency:
+  group: pr-triage-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  triage:
+    # Bot のレビューだけを対象にする（人のレビューでは起動しない）
+    if: endsWith(github.event.review.user.login, '[bot]') || contains(fromJSON('["cursor","devin-ai-integration","copilot-pull-request-reviewer","chatgpt-codex-connector","amazon-q-developer"]'), github.event.review.user.login)
+    uses: sinoda1114/ci-standard/.github/workflows/pr-triage.yml@main
+    secrets:
+      TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}

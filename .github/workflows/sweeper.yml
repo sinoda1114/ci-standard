@@ -37,4 +37,6 @@ jobs:
       - name: 全リポジトリを見回り
         env:
           GH_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+          # pr-triage（PR Bot コメント仕分け）が使う JEV キー。各リポジトリの Secrets に配布する
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
         run: bash scripts/sweep.sh | tee -a "$GITHUB_STEP_SUMMARY"

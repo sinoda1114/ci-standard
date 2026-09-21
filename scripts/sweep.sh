@@ -9,6 +9,7 @@
 #   2. origin/HEAD 相当（既定ブランチ）の確認 ※GitHub側は常に設定済みのため報告のみ
 #   3. Secret scanning / push protection の有効化（public は無料）
 #   4. Dependabot 設定ファイルの配布
+#   5. PR Bot コメント仕分け（pr-triage 呼び出しワークフロー）の配布と TYPESAFE_API_KEY の配布
 #
 # B. Node/Python リポジトリの CI/CD
 #   5. 標準CI呼び出し（ci.yml）が無ければ自動配置（既存の独自CIは .github/ci.yml.bak へ退避）
@@ -20,7 +21,7 @@
 # ローカルでも `GH_TOKEN=... bash scripts/sweep.sh` で実行可能。
 #
 # 必要権限（fine-grained PAT）: All repositories /
-#   Contents: RW / Administration: RW / Workflows: RW / Issues: RW（ラベル用）
+#   Contents: RW / Administration: RW / Workflows: RW / Issues: RW（ラベル用）/ Secrets: RW（TYPESAFE_API_KEY 配布用。無ければ配布はスキップ）
 set -uo pipefail
 
 OWNER="sinoda1114"
@@ -155,6 +156,40 @@ sync_dependabot() { # sync_dependabot <repo> <branch> → "配布" / "既存" / 
   fi
 }
 
+PR_TRIAGE_BODY="$(cat "$(dirname "$0")/../templates/pr-triage-caller.yml" 2>/dev/null || true)"
+
+sync_pr_triage() { # sync_pr_triage <repo> <branch> → "配布" / "既存" / "失敗" / "雛形なし"
+  local R=$1 B=$2
+  [ -n "$PR_TRIAGE_BODY" ] || { echo "雛形なし"; return; }
+  local BODY
+  BODY=$(gh api "/repos/${OWNER}/${R}/contents/.github/workflows/pr-triage.yml?ref=${B}" -q .content 2>/dev/null | base64 -d 2>/dev/null || true)
+  if printf '%s' "$BODY" | grep -q "$STANDARD_REPO"; then
+    echo "既存"; return
+  fi
+  if put_file "$R" "$B" ".github/workflows/pr-triage.yml" "ci: PR Bot コメント仕分け（${STANDARD_REPO}/pr-triage）を配布 [sweeper]" "$PR_TRIAGE_BODY"; then
+    echo "配布"
+  else
+    echo "失敗"
+  fi
+}
+
+sync_pr_triage_secret() { # sync_pr_triage_secret <repo> → "配布" / "既存" / "キー未設定" / "権限なし"
+  local R=$1
+  [ -n "${TYPESAFE_API_KEY:-}" ] || { echo "キー未設定"; return; }
+  local NAMES
+  if ! NAMES=$(gh secret list -R "${OWNER}/${R}" --json name -q '.[].name' 2>>"$ERRLOG"); then
+    echo "権限なし"; return
+  fi
+  if printf '%s\n' "$NAMES" | grep -qx TYPESAFE_API_KEY; then
+    echo "既存"; return
+  fi
+  if printf '%s' "$TYPESAFE_API_KEY" | gh secret set TYPESAFE_API_KEY -R "${OWNER}/${R}" 2>>"$ERRLOG"; then
+    echo "配布"
+  else
+    echo "権限なし"
+  fi
+}
+
 standard_ci_body() { # standard_ci_body <kind> <branch>
   cat <<EOF
 # 標準CI呼び出し（実体: https://github.com/${STANDARD_REPO}）
@@ -190,7 +225,9 @@ while IFS=$'\t' read -r NAME BRANCH; do
   LBL=$(sync_labels "$NAME")
   SS=$(sync_secret_scanning "$NAME")
   DEP=$(sync_dependabot "$NAME" "$BRANCH")
-  OPS="ラベル:${LBL} / scanning:${SS} / dependabot:${DEP}"
+  PRT=$(sync_pr_triage "$NAME" "$BRANCH")
+  PRS=$(sync_pr_triage_secret "$NAME")
+  OPS="ラベル:${LBL} / scanning:${SS} / dependabot:${DEP} / pr-triage:${PRT}(secret:${PRS})"
 
   # ---- B. CI/CD（Node/Python のみ） ----
   # 言語判定（Contents API のみ、clone不要）

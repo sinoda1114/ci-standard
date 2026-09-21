@@ -32,6 +32,7 @@ CIが緑でないと main にマージできない** 状態を作るための中
 | 運用設定 | `type:*` ラベル（7種・色/説明の是正含む） | 全リポジトリ |
 | 運用設定 | Secret scanning / push protection の有効化 | 全リポジトリ（public は無料） |
 | 運用設定 | Dependabot 設定の配布（npm / github-actions / weekly） | 全リポジトリ |
+| 運用設定 | PR Bot コメント仕分け（pr-triage 呼び出し + `TYPESAFE_API_KEY`）の配布 | 全リポジトリ（Bot のいる PR でのみ動く） |
 | CI/CD | 標準CI呼び出し（ci.yml）の配置 | Node / Python |
 | CI/CD | ブランチ保護（CI必須・会話解決必須・admin含む） | 標準CI導入済みのみ |
 | CI/CD | コード健全性ゲート（Fallow: 未使用コード/重複/複雑度） | Node（既定 report-only） |
@@ -94,6 +95,15 @@ scripts/sweep.sh                     # ローカルから全リポジトリ見�
 Actions とは別系統（GitHub App）。導入は各サービスの管理画面でリポジトリを追加する。
 指摘の裁定ポリシーは各リポジトリの CLAUDE.md を参照
 （鵜呑みにせず一次情報で裁定 / 見送り理由をスレッドに返信して resolve / ボットのチェックは必須化しない）。
+
+## PR Bot コメント仕分け（pr-triage）
+
+5 体の AI レビューボットが同じ問題を別々に書く PR で、`.github/workflows/pr-triage.yml`（実体は本リポの
+Reusable Workflow）が Bot のレビュー投稿をきっかけに起動し、3 分待ってスレッドを取得、JEV（TypeSafe AI の
+判断専用モデル）で「同じ問題」を束ねて種別順の表を PR の固定コメントに出す。**正誤は判定しない**（人か Claude が
+グループ単位で判断）。JEV キーが無いリポジトリではファイル+行の近さで束ねる粗い表になる。
+スクリプトは `scripts/pr-triage/`（正本は `~/.claude/skills/pr-triage/scripts/`）。測定根拠は PR #95/#102 で
+ペアリング一致 98.6% / 96.6%。費用は 1 PR あたり 1 円未満。
 
 ## 制約
 
