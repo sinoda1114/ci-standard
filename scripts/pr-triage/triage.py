@@ -151,6 +151,7 @@ def main():
     for i, t in enumerate(threads):
         t["idx"] = i; t["text"] = clean(t.get("body") or "")[:6000]
         t["file"] = t.get("path") or ""          # フルパスで比較（basename だと別ディレクトリの同名ファイルが混ざる）
+        t["has_secret"] = bool(SECRET_RE.search(t["text"]))   # 1 回だけ判定（ペア毎に本文を再走査しない）
     mock = os.environ.get("PR_TRIAGE_MOCK") == "1"
     route = ("mock", "mock", "mock") if mock else load_route()
     jev_ok = bool(route[0]); errors = []
@@ -181,7 +182,7 @@ def main():
     # 1. 分類
     for t in threads:
         t["category"], t["category_conf"], t["is_security"] = "unknown", None, None
-        if not jev_ok or SECRET_RE.search(t["text"]):
+        if not jev_ok or t["has_secret"]:
             continue
         if mock:
             t["category"] = "security" if re.search(r"secur|bypass|inject|secret", t["text"], re.I) else "bug"; t["category_conf"] = 0.9; continue
@@ -212,7 +213,7 @@ def main():
             if A["file"] != B["file"]:
                 continue
             same = None
-            if jev_ok and not SECRET_RE.search(A["text"]) and not SECRET_RE.search(B["text"]):
+            if jev_ok and not A["has_secret"] and not B["has_secret"]:
                 # 上限超過は jev() が記録するが、ここで手前に立つと記録されないので同じ扱いにする
                 if calls >= MAX_CALLS or time.time() - t0 > BUDGET_SECONDS:
                     key = "budget" if calls >= MAX_CALLS else "deadline"
@@ -226,8 +227,9 @@ def main():
                               {"same_issue": {"type": "noul", "instructions": SAME_Q}})
                     sa = ans.get("same_issue") if ans is not None else None
                     same = sa.get("noul") if isinstance(sa, dict) else None
-                    if not isinstance(same, (int, float)):
-                        same = None          # 辞書でない・数値以外が返ったら行近接フォールバックへ
+                    if ans is not None and not isinstance(same, (int, float)):
+                        # HTTP は成功したが形が不正。ok を名乗らないよう記録し、以後は呼ばず行近接フォールバックへ
+                        errors.append("bad-response"); jev_ok = False; same = None
             if same is None:
                 # フォールバック（キー無し・秘密情報・エラー・上限超過）: 行が近い（±5）なら同一とみなす
                 if near(A, B):

@@ -21,7 +21,7 @@ permissions:
 jobs:
   sweep:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45   # 85 リポジトリ × REST 約 20 回 + GraphQL（PR 一覧）。従来 5 分前後、pr-triage 配布と掃除で伸びる分の余裕
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -30,11 +30,13 @@ jobs:
           GH_TOKEN: ${{ secrets.ADMIN_TOKEN }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
-            echo "::error::Actions secret ADMIN_TOKEN が未設定です（fine-grained PAT: Contents RW + Administration RW）"
+            echo "::error::Actions secret ADMIN_TOKEN が未設定です（fine-grained PAT: Contents / Administration / Workflows / Issues / Pull requests / Secrets の RW）"
             exit 1
           fi
 
       - name: 全リポジトリを見回り
+        # 既定シェルは bash -e だけで pipefail が無く、| tee で sweep.sh の終了コードが消える。shell: bash で -eo pipefail を付ける
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.ADMIN_TOKEN }}
           # pr-triage（PR Bot コメント仕分け）が使う JEV キー。各リポジトリの Secrets に配布する

@@ -58,6 +58,7 @@ reprotect_pending() {
 on_signal() { # TERM/INT: 復旧してから終了する（終了しないと bash はループを再開し、次のリポジトリを解除しにいく）
   echo "::warning::シグナルで中断。保護を復旧して終了する"
   reprotect_pending
+  rm -f "$ERRLOG" "$REPROTECT_FAILED_FLAG"
   exit 130
 }
 
@@ -70,8 +71,8 @@ put_file() { # put_file <repo> <branch> <path> <message> <content> [sha] → 0 �
   local ARGS=(-X PUT "/repos/${OWNER}/${R}/contents/${P}" -f message="$M" -f branch="$B" -f content="$(printf '%s\n' "$C" | base64 | tr -d '\n')")
   [ -n "$S" ] && ARGS+=(-f sha="$S")
   if ! ERR=$(gh api "${ARGS[@]}" 2>&1 >/dev/null); then
-    # 保護による拒否は HTTP 409 で、本文に保護の種類が入る（必須チェック / PR 必須 / 保護ブランチ / ruleset の GH013）
-    if printf '%s' "$ERR" | grep -q 'HTTP 409' && printf '%s' "$ERR" | grep -Eqi 'status check|pull request|protected branch|repository rule|GH013'; then
+    # 保護による拒否は HTTP 409（クラシック保護）または 422（ruleset の GH013 系）で、本文に保護の種類が入る
+    if printf '%s' "$ERR" | grep -Eq 'HTTP (409|422)' && printf '%s' "$ERR" | grep -Eqi 'status check|pull request|protected branch|repository rule|GH013'; then
       return 2   # 想定内（deliver_file が別経路へ回す）。ERRLOG には残さない
     fi
     printf '%s\n' "$ERR" >>"$ERRLOG"
@@ -273,10 +274,12 @@ PR_TRIAGE_BODY="$(cat "$(dirname "$0")/../templates/pr-triage-caller.yml" 2>/dev
 
 sync_pr_triage() { # sync_pr_triage <repo> <branch> → PRT="既存" / "配布" / "更新" / "PR作成" / "PR済み" / "独自(未変更)" / "失敗" / "雛形なし"
   local R=$1 B=$2 J SHA BODY MSG
+  PRT_PRESENT=false   # 既定ブランチに標準の呼び出しが既にあるか（secret の同期可否に使う。配布結果とは別）
   [ -n "$PR_TRIAGE_BODY" ] || { PRT="雛形なし"; return; }
   J=$(gh api "/repos/${OWNER}/${R}/contents/.github/workflows/pr-triage.yml?ref=${B}" 2>/dev/null || true)
   SHA=$(printf '%s' "$J" | jq -r '.sha // empty' 2>/dev/null)
   BODY=$(printf '%s' "$J" | jq -r '.content // empty' 2>/dev/null | base64 -d 2>/dev/null || true)
+  printf '%s' "$BODY" | grep -q "$STANDARD_REPO" && PRT_PRESENT=true
   # 雛形と完全一致なら何もしない。雛形（trigger / 権限 / Bot 判定）を直したら翌日全リポジトリに届く
   if [ "$BODY" = "$PR_TRIAGE_BODY" ]; then PRT="既存"; return; fi
   # 標準を参照しない独自ファイルは上書きしない
@@ -327,7 +330,10 @@ EOF
 echo "| repo | 結果 |"
 echo "|---|---|"
 
-gh api --paginate '/user/repos?per_page=100' -q '.[] | select(.archived==false and .fork==false) | "\(.name)\t\(.default_branch)"' |
+# affiliation=owner と owner.login の二重で自分のリポジトリに絞る（既定は collaborator / organization_member も含み、
+# 他オーナーのリポジトリを sinoda1114/<name> として叩いて 404 を量産する）
+gh api --paginate "/user/repos?per_page=100&affiliation=owner" \
+  -q ".[] | select(.archived==false and .fork==false and .owner.login==\"$OWNER\") | \"\\(.name)\\t\\(.default_branch)\"" |
 while IFS=$'\t' read -r NAME BRANCH; do
   case " $EXCLUDE " in *" $NAME "*) continue;; esac
   if [ -n "${ONLY:-}" ]; then case " $ONLY " in *" $NAME "*) ;; *) continue;; esac; fi
@@ -360,10 +366,14 @@ while IFS=$'\t' read -r NAME BRANCH; do
   SS=$(sync_secret_scanning "$NAME")
   sync_dependabot "$NAME" "$BRANCH"        # → DEP（サブシェルにしない: UNPROTECTED_FOR_FIX を親へ伝えるため）
   sync_pr_triage "$NAME" "$BRANCH"         # → PRT
-  case "$PRT" in
-    既存|配布|"配布(保護を一時解除)"|更新|PR作成|PR済み) sync_pr_triage_secret "$NAME";;   # → PRS。呼び出しが届いた/届く見込みのリポジトリだけ
-    *) PRS="対象外";;   # 独自 / 失敗 / 雛形なし / PR却下済み / PR作成不可 / 取得失敗: 標準の呼び出しが無い（届かない）リポジトリに鍵だけ置かない
-  esac
+  # 鍵は「標準の呼び出しが既定ブランチにある」か「今回届いた/届く見込み」のリポジトリだけに同期する
+  # （古い標準 caller が残っていて更新 PR が却下された場合もローテーションは追従させる）
+  if $PRT_PRESENT; then sync_pr_triage_secret "$NAME"; else
+    case "$PRT" in
+      配布|"配布(保護を一時解除)"|更新|PR作成|PR済み) sync_pr_triage_secret "$NAME";;   # → PRS
+      *) PRS="対象外";;   # 独自 / 失敗 / 雛形なし / 却下済み / 作成不可 / 取得失敗: 標準の呼び出しが無いリポジトリに鍵だけ置かない
+    esac
+  fi
   cleanup_sweeper_branches "$NAME"         # 閉じた/マージ済み sweeper PR のブランチを掃除（却下の記録は閉じた PR 自体に残る）
   OPS="ラベル:${LBL} / scanning:${SS} / dependabot:${DEP} / pr-triage:${PRT}(secret:${PRS})"
 

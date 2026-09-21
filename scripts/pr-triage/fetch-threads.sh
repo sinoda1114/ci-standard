@@ -18,7 +18,7 @@ query($owner:String!,$name:String!,$num:Int!,$page:Int!,$endCursor:String){
         pageInfo{ hasNextPage endCursor }
         nodes{
           id isResolved isOutdated path line
-          comments(first:10){ totalCount nodes{ url author{login __typename} body } }
+          comments(first:1){ totalCount nodes{ url author{login __typename} body } }
         }
       }
     }

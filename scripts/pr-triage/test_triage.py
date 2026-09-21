@@ -54,31 +54,16 @@ class TriageTests(unittest.TestCase):
         saved = triage.ROUTES, triage.TIMEOUT
         try:
             triage.ROUTES = [("TYPESAFE_API_KEY", "http://127.0.0.1:9/systemone", "jev-latest")]; triage.TIMEOUT = 1
-            os.environ["TYPESAFE_API_KEY"] = "dummy"; os.environ["HOME"] = "/nonexistent"
-            with tempfile.TemporaryDirectory() as d:
-                src = Path(d, "t.json"); out = Path(d, "o.json")
-                src.write_text(json.dumps([th(i, "a.py", i) for i in range(6)]))
-                sys.argv = ["triage.py", "--threads", str(src), "--out", str(out)]; triage.main()
-                r = json.loads(out.read_text())
+            r = self._run_with_call(triage.call, [th(i, "a.py", i) for i in range(6)])   # 本物の call（接続拒否）
             self.assertEqual(r["calls"], 1); self.assertEqual(r["jev"], "partial")
         finally:
             triage.ROUTES, triage.TIMEOUT = saved
 
     def test_budget_recorded_in_pairing_phase(self):
-        saved = triage.call, triage.MAX_CALLS
-        try:
-            triage.call = lambda route, state, q: ({"category": {"choice": "bug", "confidence": 0.9}, "is_security": {"noul": 0.1},
-                                                    "same_issue": {"noul": 0.2}}, None)
-            triage.MAX_CALLS = 8
-            os.environ["TYPESAFE_API_KEY"] = "dummy"; os.environ["HOME"] = "/nonexistent"
-            with tempfile.TemporaryDirectory() as d:
-                src = Path(d, "t.json"); out = Path(d, "o.json")
-                src.write_text(json.dumps([th(i, "a.py", i) for i in range(6)]))   # 6 分類 + 15 ペア > 8
-                sys.argv = ["triage.py", "--threads", str(src), "--out", str(out)]; triage.main()
-                r = json.loads(out.read_text())
-            self.assertEqual(r["calls"], 8); self.assertEqual(r["jev"], "partial"); self.assertIn("budget", r["errors"])
-        finally:
-            triage.call, triage.MAX_CALLS = saved
+        ok = lambda route, state, q: ({"category": {"choice": "bug", "confidence": 0.9}, "is_security": {"noul": 0.1},
+                                       "same_issue": {"noul": 0.2}}, None)
+        r = self._run_with_call(ok, [th(i, "a.py", i) for i in range(6)], MAX_CALLS=8)   # 6 分類 + 15 ペア > 8
+        self.assertEqual(r["calls"], 8); self.assertEqual(r["jev"], "partial"); self.assertIn("budget", r["errors"])
 
     def _run_with_call(self, fake_call, threads, **over):
         saved = triage.call, triage.MAX_CALLS, triage.BUDGET_SECONDS
@@ -111,7 +96,8 @@ class TriageTests(unittest.TestCase):
         ok = ({"category": {"choice": "bug", "confidence": 0.9}, "is_security": {"noul": 0.1}}, None)
         answers = iter([ok, ok, ok, ({"same_issue": 0.9}, None), ({"same_issue": None}, None), ({"same_issue": "yes"}, None)])
         r = self._run_with_call(lambda *a: next(answers), [th(1, "a.py", 10), th(2, "a.py", 12), th(3, "a.py", 40)])
-        self.assertEqual(r["calls"], 6)
+        self.assertEqual(r["calls"], 4)                     # 最初の不正応答で遮断
+        self.assertIn("bad-response", r["errors"]); self.assertEqual(r["jev"], "partial")
         self.assertEqual(sorted(sorted(g["members"]) for g in r["groups"]), [[0, 1], [2]])
         self.assertTrue(all(p["by"] == "line" for p in r["pairs"]))
 
