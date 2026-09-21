@@ -7,7 +7,8 @@
 #   正誤の判定はしない（表の「判定」列は空。人か Claude が根拠を読んで埋める）。
 #
 # いつ動くか（呼び出し側 templates/pr-triage-caller.yml）:
-#   pull_request_review: submitted のたびに起動し、同じ PR の進行中ジョブは打ち切り（concurrency）。
+#   pull_request_review: submitted（Bot のレビュー）と pull_request_review_thread: resolved / unresolved（人の解決操作）の
+#   たびに起動し、同じ PR の進行中ジョブは打ち切り（concurrency）。
 #   Bot は数分ずらして届くので、ジョブ冒頭で debounce 秒だけ待ってから最後の 1 回だけ集計する。
 #
 # 前提:
@@ -83,9 +84,13 @@ jobs:
           echo "threads=$n（Bot 起票・未解決のみ）"
           # 既存の固定コメント（全ページを見る。1 ページだけだと長い PR で二重投稿になる）。
           # `| head -1` は gh を SIGPIPE(141) で落とし set -e で止まるので、全部読む awk で先頭だけ取る
-          cid=$(gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100" \
-                  --jq '.[] | select(.body | startswith("<!-- pr-triage -->")) | .id' \
-                | awk 'NR==1{c=$0} END{print c}')
+          cids=$(gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100" \
+                   --jq '.[] | select(.body | startswith("<!-- pr-triage -->")) | .id')
+          cid=$(printf '%s\n' "$cids" | awk 'NR==1{c=$0} END{print c}')
+          # 過去に二重投稿されていたら 2 件目以降は消す（1 件だけ更新すると残りが古い表のまま残る）
+          printf '%s\n' "$cids" | awk 'NR>1 && NF' | while IFS= read -r dup; do
+            gh api -X DELETE "repos/$REPO/issues/comments/$dup" > /dev/null && echo "deleted duplicate comment $dup"
+          done
           if [ "$n" -lt "$MIN_THREADS" ]; then
             echo "スレッド $n 件（< $MIN_THREADS）。表は投稿しない"
             if [ -n "$cid" ]; then
