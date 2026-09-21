@@ -82,6 +82,7 @@ class TriageTests(unittest.TestCase):
 
     def _run_with_call(self, fake_call, threads, **over):
         saved = triage.call, triage.MAX_CALLS, triage.BUDGET_SECONDS
+        saved_env = {k: os.environ.get(k) for k in ("TYPESAFE_API_KEY", "HOME")}
         try:
             triage.call = fake_call
             for k, v in over.items(): setattr(triage, k, v)
@@ -93,6 +94,9 @@ class TriageTests(unittest.TestCase):
                 return json.loads(out.read_text())
         finally:
             triage.call, triage.MAX_CALLS, triage.BUDGET_SECONDS = saved
+            for k, v in saved_env.items():
+                if v is None: os.environ.pop(k, None)
+                else: os.environ[k] = v
 
     def test_non_numeric_and_malformed_answers_do_not_crash(self):
         answers = iter([({"category": {"choice": "bug"}, "is_security": {"noul": "high"}}, None),   # 数値以外
@@ -101,6 +105,15 @@ class TriageTests(unittest.TestCase):
         r = self._run_with_call(lambda *a: next(answers), [th(1, "a.py", 1), th(2, "b.py", 2)])
         self.assertIsNone(r["threads"][0]["is_security"]); self.assertEqual(r["threads"][0]["category"], "bug")
         self.assertIn("bad-response", r["errors"]); self.assertEqual(r["jev"], "partial")
+
+    def test_malformed_pairing_answers_fall_back_to_line_proximity(self):
+        # 同一ファイル 3 件 → 分類 3 回のあとペア 3 回。same_issue が数値・null・辞書でない形で返っても落ちず、行近接（±5）で束ねる
+        ok = ({"category": {"choice": "bug", "confidence": 0.9}, "is_security": {"noul": 0.1}}, None)
+        answers = iter([ok, ok, ok, ({"same_issue": 0.9}, None), ({"same_issue": None}, None), ({"same_issue": "yes"}, None)])
+        r = self._run_with_call(lambda *a: next(answers), [th(1, "a.py", 10), th(2, "a.py", 12), th(3, "a.py", 40)])
+        self.assertEqual(r["calls"], 6)
+        self.assertEqual(sorted(sorted(g["members"]) for g in r["groups"]), [[0, 1], [2]])
+        self.assertTrue(all(p["by"] == "line" for p in r["pairs"]))
 
     def test_deadline_stops_calls(self):
         import time as _t

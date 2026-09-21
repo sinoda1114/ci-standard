@@ -111,10 +111,11 @@ open_pr_with_file() { # open_pr_with_file <repo> <base> <path> <message> <conten
   # ブランチ名に内容ハッシュを含める: 人が閉じた PR は「その内容」の却下として翌日作り直さないが、
   # 雛形を直して内容が変われば別ブランチで新しい PR が出る
   SLUG="sweeper/$(basename "$P" | sed 's/\.[^.]*$//')-$(printf '%s\n' "$C" | shasum | cut -c1-8)"
-  # 先に PR の状態を見る（ブランチを作ってから却下に気づくと、毎日「作成→削除」を往復し配布先の on: push CI を起動してしまう）
-  OPEN=$(gh pr list -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --state open --json number -q 'length' 2>/dev/null || echo 0)
+  # 先に PR の状態を見る（ブランチを作ってから却下に気づくと、毎日「作成→削除」を往復し配布先の on: push CI を起動してしまう）。
+  # 取得に失敗した日は配布を見送る（0 件と区別しないと、却下済み PR を作り直してしまう）
+  OPEN=$(gh pr list -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --state open --json number -q 'length' 2>>"$ERRLOG") || { DELIVER="PR状態の取得に失敗"; return 1; }
   if [ "${OPEN:-0}" -gt 0 ]; then DELIVER="PR済み"; return 0; fi
-  REJECTED=$(gh pr list -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --state closed --json mergedAt -q '[.[]|select(.mergedAt==null)]|length' 2>/dev/null || echo 0)
+  REJECTED=$(gh pr list -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --state closed --json mergedAt -q '[.[]|select(.mergedAt==null)]|length' 2>>"$ERRLOG") || { DELIVER="PR状態の取得に失敗"; return 1; }
   if [ "${REJECTED:-0}" -gt 0 ]; then DELIVER="PR却下済み"; return 0; fi
   if ! gh api "/repos/${OWNER}/${R}/git/ref/heads/${SLUG}" >/dev/null 2>&1; then
     HEAD=$(gh api "/repos/${OWNER}/${R}/git/ref/heads/${B}" -q .object.sha 2>>"$ERRLOG") || { DELIVER="失敗"; return 1; }
@@ -360,8 +361,8 @@ while IFS=$'\t' read -r NAME BRANCH; do
   sync_dependabot "$NAME" "$BRANCH"        # → DEP（サブシェルにしない: UNPROTECTED_FOR_FIX を親へ伝えるため）
   sync_pr_triage "$NAME" "$BRANCH"         # → PRT
   case "$PRT" in
-    "独自(未変更)"|失敗|雛形なし) PRS="対象外";;   # 標準の呼び出しが無い/届かないリポジトリに鍵だけ置かない
-    *) sync_pr_triage_secret "$NAME";;              # → PRS
+    既存|配布|"配布(保護を一時解除)"|更新|PR作成|PR済み) sync_pr_triage_secret "$NAME";;   # → PRS。呼び出しが届いた/届く見込みのリポジトリだけ
+    *) PRS="対象外";;   # 独自 / 失敗 / 雛形なし / PR却下済み / PR作成不可 / 取得失敗: 標準の呼び出しが無い（届かない）リポジトリに鍵だけ置かない
   esac
   cleanup_sweeper_branches "$NAME"         # 閉じた/マージ済み sweeper PR のブランチを掃除（却下の記録は閉じた PR 自体に残る）
   OPS="ラベル:${LBL} / scanning:${SS} / dependabot:${DEP} / pr-triage:${PRT}(secret:${PRS})"

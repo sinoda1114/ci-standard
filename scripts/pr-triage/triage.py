@@ -224,9 +224,10 @@ def main():
                     ans = jev(f"Thread A ({A.get('path')}:{A.get('line')}, by {A.get('author')}):\n{A['text'][:3000]}\n\n"
                               f"Thread B ({B.get('path')}:{B.get('line')}, by {B.get('author')}):\n{B['text'][:3000]}",
                               {"same_issue": {"type": "noul", "instructions": SAME_Q}})
-                    same = ans.get("same_issue", {}).get("noul") if ans is not None else None
+                    sa = ans.get("same_issue") if ans is not None else None
+                    same = sa.get("noul") if isinstance(sa, dict) else None
                     if not isinstance(same, (int, float)):
-                        same = None          # 数値以外が返ったら行近接フォールバックへ
+                        same = None          # 辞書でない・数値以外が返ったら行近接フォールバックへ
             if same is None:
                 # フォールバック（キー無し・秘密情報・エラー・上限超過）: 行が近い（±5）なら同一とみなす
                 if near(A, B):
