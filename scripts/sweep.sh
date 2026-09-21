@@ -29,7 +29,9 @@
 # ローカルでも `GH_TOKEN=... bash scripts/sweep.sh` で実行可能。
 #
 # 必要権限（fine-grained PAT）: All repositories /
-#   Contents: RW / Administration: RW / Workflows: RW / Issues: RW（ラベル用）/ Secrets: RW（TYPESAFE_API_KEY 配布用。無ければ配布はスキップ）
+#   Contents: RW / Administration: RW / Workflows: RW / Issues: RW（ラベル用）/
+#   Pull requests: RW（保護ブランチへの配布を PR で届けるため。無いと「PR作成不可」と報告）/
+#   Secrets: RW（TYPESAFE_API_KEY 配布用。無ければ「権限なし」と報告）
 set -uo pipefail
 
 OWNER="sinoda1114"
@@ -64,8 +66,9 @@ put_file() { # put_file <repo> <branch> <path> <message> <content> [sha] → 0 �
   local ARGS=(-X PUT "/repos/${OWNER}/${R}/contents/${P}" -f message="$M" -f branch="$B" -f content="$(printf '%s\n' "$C" | base64 | tr -d '\n')")
   [ -n "$S" ] && ARGS+=(-f sha="$S")
   if ! ERR=$(gh api "${ARGS[@]}" 2>&1 >/dev/null); then
-    if printf '%s' "$ERR" | grep -Eqi 'status check|pull request|protected branch|rule'; then
-      return 2   # 保護による拒否は想定内（deliver_file が別経路へ回す）。ERRLOG には残さない
+    # 保護による拒否は HTTP 409 で、本文に保護の種類が入る（必須チェック / PR 必須 / 保護ブランチ / ruleset の GH013）
+    if printf '%s' "$ERR" | grep -q 'HTTP 409' && printf '%s' "$ERR" | grep -Eqi 'status check|pull request|protected branch|repository rule|GH013'; then
+      return 2   # 想定内（deliver_file が別経路へ回す）。ERRLOG には残さない
     fi
     printf '%s\n' "$ERR" >>"$ERRLOG"
     echo "::warning::put_file 失敗 ${R}/${P}: $(printf '%s' "$ERR" | tail -1)"
@@ -120,12 +123,27 @@ open_pr_with_file() { # open_pr_with_file <repo> <base> <path> <message> <conten
   local REJECTED
   REJECTED=$(gh pr list -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --state closed --json mergedAt -q '[.[]|select(.mergedAt==null)]|length' 2>/dev/null || echo 0)
   if [ "${REJECTED:-0}" -gt 0 ]; then DELIVER="PR却下済み"; return 0; fi
-  if gh pr create -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --title "$M" \
+  local PRERR
+  if PRERR=$(gh pr create -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --title "$M" \
        --body "sweeper（${STANDARD_REPO}）が配布する標準設定です。既定ブランチが保護されているため PR で届けます。CI が緑なら squash マージしてください。" \
-       >/dev/null 2>>"$ERRLOG"; then
+       2>&1 >/dev/null); then
     DELIVER="PR作成"; return 0
   fi
+  printf '%s\n' "$PRERR" >>"$ERRLOG"
+  if printf '%s' "$PRERR" | grep -Eqi 'HTTP 403|Resource not accessible|not permitted'; then
+    DELIVER="PR作成不可(PAT に Pull requests: RW が必要)"; return 1   # ブランチには置いてあるので、権限を足せば翌日 PR が出る
+  fi
   DELIVER="失敗"; return 1
+}
+
+cleanup_sweeper_branches() { # cleanup_sweeper_branches <repo>: PR が開いていない sweeper/* ブランチを消す（雛形更新のたびに増えるため）
+  local R=$1 BR OPEN
+  gh api "/repos/${OWNER}/${R}/branches?per_page=100" -q '.[].name | select(startswith("sweeper/"))' 2>/dev/null |
+  while IFS= read -r BR; do
+    OPEN=$(gh pr list -R "${OWNER}/${R}" --head "$BR" --state open --json number -q length 2>/dev/null || echo 1)
+    [ "${OPEN:-1}" = 0 ] && gh api -X DELETE "/repos/${OWNER}/${R}/git/refs/heads/${BR}" >/dev/null 2>&1
+  done
+  return 0
 }
 
 is_protected() { # is_protected <repo> <branch>
@@ -329,6 +347,7 @@ while IFS=$'\t' read -r NAME BRANCH; do
   sync_dependabot "$NAME" "$BRANCH"        # → DEP（サブシェルにしない: UNPROTECTED_FOR_FIX を親へ伝えるため）
   sync_pr_triage "$NAME" "$BRANCH"         # → PRT
   sync_pr_triage_secret "$NAME"            # → PRS
+  cleanup_sweeper_branches "$NAME"         # 閉じた/マージ済み sweeper PR のブランチを掃除（却下の記録は閉じた PR 自体に残る）
   OPS="ラベル:${LBL} / scanning:${SS} / dependabot:${DEP} / pr-triage:${PRT}(secret:${PRS})"
 
   # ---- B. CI/CD（Node/Python のみ） ----
@@ -368,6 +387,8 @@ while IFS=$'\t' read -r NAME BRANCH; do
       STATUS="導入 ($KIND)"
     else
       STATUS="導入失敗（ログ参照）"
+      # CI 無しで保護すると push/マージ不能に詰むため、保険（reprotect_pending）の対象からも外す
+      REPROTECT_REPO=""
       $UNPROTECTED_FOR_FIX && STATUS="$STATUS ※保護は解除したまま（CI無しで保護すると詰むため）"
     fi
   fi
@@ -382,6 +403,7 @@ while IFS=$'\t' read -r NAME BRANCH; do
   fi
   echo "| $NAME | $OPS / CI:$STATUS |"
 done
+LOOP_RC=${PIPESTATUS[1]}   # ループはパイプのサブシェル。シグナル中断（130）を親の終了コードにも反映する
 echo ""
 echo "sweep 完了: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # 失敗の詳細（「ログ参照」の参照先）。Actions ならジョブサマリーにも出す
@@ -389,3 +411,5 @@ if [ -s "$ERRLOG" ]; then
   echo ""; echo "<details><summary>エラー詳細（$(wc -l < "$ERRLOG" | tr -d ' ') 行）</summary>"; echo ""; echo '```'; cat "$ERRLOG"; echo '```'; echo "</details>"
 fi
 rm -f "$ERRLOG"
+[ "${LOOP_RC:-0}" = 130 ] && { echo "::error::シグナルで中断された（保護は復旧済み）"; exit 130; }
+exit 0

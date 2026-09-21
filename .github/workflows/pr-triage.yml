@@ -13,7 +13,7 @@
 # 前提:
 #   - secrets.TYPESAFE_API_KEY（無ければ JEV を使わず、ファイル+行の近さで束ねた表を出す）
 #   - permissions: pull-requests: write（固定コメントの投稿・更新）、contents: read
-#   - fork からの PR は secrets が渡らず GITHUB_TOKEN も読み取り専用（コメント投稿不可）のため、何もせず終了する
+#   - fork からの PR は secrets が渡らず GITHUB_TOKEN も読み取り専用（コメント投稿不可）のため、ジョブを起動しない
 #   - 対象は Bot が起票した未解決スレッドだけ（人のレビュー・解決済みは triage.py が除外）
 #
 # 根拠・測定: ~/.claude/skills/ai-review/DESIGN-v2.md §10（PR #95/#102 でペアリング一致 98.6% / 96.6%）
@@ -46,7 +46,9 @@ permissions:
 jobs:
   triage:
     # fork（別リポジトリ）からの PR では secrets が渡らず GITHUB_TOKEN も読み取り専用でコメントを投稿できないため、
-    # 待機に入る前にジョブごと飛ばす（pull_request_review も pull_request と同じ制約。公式ドキュメントで確認）
+    # 待機に入る前にジョブごと飛ばす。pull_request_review も pull_request と同じ制約:
+    # https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request_review
+    # （"The GITHUB_TOKEN has read-only permissions in pull requests from forked repositories."）
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -106,11 +108,14 @@ jobs:
             echo
             echo "<sub>ci-standard/pr-triage · 自動投稿。新しいレビューが付くと更新されます。</sub>"
           } > out/comment.md
-          # コメント本文は 65,536 字が上限（超えると 422 でジョブが落ちる）。表の途中で切って注記する
-          if [ "$(wc -m < out/comment.md)" -gt 60000 ]; then
-            head -c 58000 out/comment.md > out/comment.cut && printf '\n\n（長すぎるため以降を省略。全体は Actions のログ参照）\n' >> out/comment.cut && mv out/comment.cut out/comment.md
-            cat out/triage.md
-          fi
+          # コメント本文は 65,536 字が上限（超えると 422 でジョブが落ちる）。文字単位で切って注記する（バイト単位だと UTF-8 を割る）
+          python3 - <<'PYEOF'
+          import pathlib
+          p = pathlib.Path("out/comment.md"); t = p.read_text()
+          if len(t) > 60000:
+              p.write_text(t[:58000] + "\n\n（長すぎるため以降を省略。全体は Actions のログ参照）\n")
+              print(pathlib.Path("out/triage.md").read_text())
+          PYEOF
           # 既存の固定コメントがあれば更新、無ければ作成
           if [ -n "$cid" ]; then
             gh api -X PATCH "repos/$REPO/issues/comments/$cid" -F body=@out/comment.md > /dev/null

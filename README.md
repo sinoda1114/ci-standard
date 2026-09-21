@@ -58,7 +58,8 @@ CIが緑でないと main にマージできない** 状態を作るための中
 
 1. fine-grained PAT を作成: Settings → Developer settings → Fine-grained tokens →
    Repository access: **All repositories** / Permissions: **Contents: RW**,
-   **Administration: RW**, **Workflows: RW**, **Issues: RW**（ラベル操作に必要）
+   **Administration: RW**, **Workflows: RW**, **Issues: RW**（ラベル操作に必要）,
+   **Pull requests: RW**（保護ブランチへの配布を PR で届ける）, **Secrets: RW**（`TYPESAFE_API_KEY` の配布）
 2. このリポジトリの Settings → Secrets and variables → Actions に `ADMIN_TOKEN` として登録
 3. Actions タブ → sweeper → Run workflow で初回実行（以後は毎日自動）
 

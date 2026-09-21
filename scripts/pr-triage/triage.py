@@ -47,7 +47,7 @@ SECRET_RE = re.compile(
     r"|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}"  # GitHub classic / fine-grained
     r"|xox[abprs]-[A-Za-z0-9\-]{10,}"                     # Slack
     r"|apikey_[A-Za-z0-9_]{30,}"                          # TypeSafe
-    r"|(?i:(password|passwd|secret|api[_-]?key|token)\s*[:=]\s*['\"]?[A-Za-z0-9_\-/+=]{16,}['\"]?)"  # 代入（引用符あり/なし）
+    r"|(?i:(password|passwd|secret|api[_-]?key|token)\s*[:=]\s*(['\"][^'\"]{8,}['\"]|[A-Za-z0-9_\-/+=]{16,}))"  # 代入（引用符あり: 8 字以上何でも / なし: 16 字以上の英数記号）
     r")")
 # 既知の Bot ログイン（GraphQL の authorType が無い古い threads.json 向けの補助）
 BOT_LOGINS = {"chatgpt-codex-connector", "copilot-pull-request-reviewer", "devin-ai-integration", "amazon-q-developer", "cursor"}
@@ -244,7 +244,7 @@ def main():
                  + (f"、除外: 人 {dropped['human']} / 解決済み {dropped['resolved']}" if any(dropped.values()) else "") + "）", "",
                  "| # | 種別 | 件数 | 指摘元 | 場所 | 要旨 | 判定 |", "|---|---|---|---|---|---|---|"]
         for k, g in enumerate(out_groups, 1):
-            loc = f"{(g['path'] or '').split('/')[-1]}:{','.join(str(x) for x in g['lines'][:3])}".strip(":") or "(場所不明)"
+            loc = f"{'/'.join((g['path'] or '').split('/')[-2:])}:{','.join(str(x) for x in g['lines'][:3])}".strip(":") or "(場所不明)"
             lines.append(f"| {k} | {g['category']} | {len(g['members'])} | {', '.join(g['authors'])} | {loc} | {g['summary'].replace('|','/')} | |")
         lines += ["", "「判定」列は人または Claude が埋める（本物 / 却下 / 対応済み）。JEV は仕分けだけを行い、正誤は判定しない。"]
         Path(a.md).write_text("\n".join(lines))

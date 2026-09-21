@@ -5,8 +5,8 @@
 # どのAIエージェント経由か）に関係なく、翌日には標準が強制される。
 #
 # 必要セットアップ（1回だけ）:
-#   fine-grained PAT（All repositories / Contents: RW / Administration: RW）を
-#   このリポジトリの Actions secret `ADMIN_TOKEN` に登録する。
+#   fine-grained PAT（All repositories / Contents: RW / Administration: RW / Workflows: RW /
+#   Issues: RW / Pull requests: RW / Secrets: RW）をこのリポジトリの Actions secret `ADMIN_TOKEN` に登録する。
 #   GITHUB_TOKEN では他リポジトリへ書き込めないため PAT が必須。
 name: sweeper
 
