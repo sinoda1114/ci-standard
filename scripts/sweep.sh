@@ -50,15 +50,20 @@ GH_STDERR=$(mktemp)               # gh の stderr を JSON と混ぜないため
 # deliver_file / CI 導入で unprotect したら REPROTECT_* に積み、末尾か終了シグナルで protect() を掛け直す
 REPROTECT_REPO=""; REPROTECT_BRANCH=""; REPROTECT_CONTEXTS=""
 reprotect_pending() {
+  local TRY
   if [ -n "$REPROTECT_REPO" ]; then
-    if protect "$REPROTECT_REPO" "$REPROTECT_BRANCH" "$REPROTECT_CONTEXTS"; then
-      echo "::notice::${REPROTECT_REPO}: 保護を再適用（末尾の protect が走らなかった経路）"
-    else
-      echo "::error::${REPROTECT_REPO}: 保護の再適用に失敗。手で確認すること"
-      echo "$REPROTECT_REPO" >>"$REPROTECT_FAILED_FLAG"     # 末尾で非ゼロ終了させる（緑のまま未保護で残さない）
-    fi
+    for TRY in 1 2 3; do   # 一時的な API 失敗に備えて 3 回まで（その場で粘る。次のリポジトリの解除で上書きされる前に決着させる）
+      if protect "$REPROTECT_REPO" "$REPROTECT_BRANCH" "$REPROTECT_CONTEXTS"; then
+        echo "::notice::${REPROTECT_REPO}: 保護を再適用（末尾の protect が走らなかった経路）"
+        REPROTECT_REPO=""; return 0
+      fi
+      sleep $((TRY * 2))
+    done
+    echo "::error::${REPROTECT_REPO}: 保護の再適用に 3 回失敗。手で確認すること"
+    echo "$REPROTECT_REPO" >>"$REPROTECT_FAILED_FLAG"     # 末尾で非ゼロ終了させる（緑のまま未保護で残さない）
     REPROTECT_REPO=""
   fi
+  return 0
 }
 on_signal() { # TERM/INT: 復旧してから終了する（終了しないと bash はループを再開し、次のリポジトリを解除しにいく）
   echo "::warning::シグナルで中断。保護を復旧して終了する"
@@ -104,13 +109,16 @@ deliver_file() {
   # sweeper 自身が掛けた保護で、かつ標準CIが導入済み（= ループ末尾の protect() が必ず走る）ときだけ一時解除する。
   # それ以外で解除すると再保護の保証がないので PR 経路に回す
   if [ -n "${KIND:-}" ] && [ "${CI_INSTALLED_NOW:-false}" = true ] && sweeper_managed_protection "$R" "$B"; then
+    # 復旧情報は解除の「前」に積む（解除 API が通った直後にキャンセルされてもシグナルハンドラが戻せるように）。失敗したら下ろす
+    REPROTECT_REPO="$R"; REPROTECT_BRANCH="$B"; REPROTECT_CONTEXTS="$CONTEXTS"
     if unprotect "$R" "$B"; then
       UNPROTECTED_FOR_FIX=true
-      REPROTECT_REPO="$R"; REPROTECT_BRANCH="$B"; REPROTECT_CONTEXTS="$CONTEXTS"
       put_file "$R" "$B" "$P" "$M" "$C" "$S"; rc=$?
       if [ $rc -eq 0 ]; then DELIVER="配布(保護を一時解除)"; return 0; fi
       # 2 回目も保護で拒否 = ruleset 等の別の保護が併用されている → PR 経路へ
       [ $rc -ne 2 ] && { DELIVER="失敗"; return 1; }
+    else
+      REPROTECT_REPO=""   # 解除できていないので戻す必要はない
     fi
   fi
   open_pr_with_file "$R" "$B" "$P" "$M" "$C"
@@ -431,9 +439,11 @@ while IFS=$'\t' read -r NAME BRANCH; do
   else
     # 「保護あり・標準CI無し」の矛盾状態なら保護を一時解除して復旧する（deliver_file が既に解除済みならそのまま）
     if ! $UNPROTECTED_FOR_FIX && is_protected "$NAME" "$BRANCH"; then
+      REPROTECT_REPO="$NAME"; REPROTECT_BRANCH="$BRANCH"; REPROTECT_CONTEXTS="$CONTEXTS"   # 解除の前に積む
       if unprotect "$NAME" "$BRANCH"; then
         UNPROTECTED_FOR_FIX=true
-        REPROTECT_REPO="$NAME"; REPROTECT_BRANCH="$BRANCH"; REPROTECT_CONTEXTS="$CONTEXTS"
+      else
+        REPROTECT_REPO=""
       fi
     fi
 
