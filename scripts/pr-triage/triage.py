@@ -23,10 +23,17 @@ from pathlib import Path
 ROUTES = [("TYPESAFE_API_KEY", "https://api.typesafe.ai/v1/systemone", "jev-latest"),
           ("AI_GATEWAY_API_KEY", "https://ai-gateway.vercel.sh/typesafe/v1/systemone", "typesafe-ai/jev")]
 TIMEOUT = 20
-try:
-    MAX_CALLS = int(os.environ.get("PR_TRIAGE_MAX_CALLS", "400") or 400)
-except ValueError:
-    MAX_CALLS = 400
+
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+MAX_CALLS = _env_int("PR_TRIAGE_MAX_CALLS", 400)          # 呼び出し回数の上限
+BUDGET_SECONDS = _env_int("PR_TRIAGE_BUDGET_SECONDS", 480)  # 時間の上限（CI は 15 分、冒頭 3 分待つので 8 分で打ち切る）
 CATEGORIES = {
     "security": "a security vulnerability or weakening of a security control (injection, auth bypass, secret exposure, unsafe file/process access, missing validation with security impact)",
     "bug": "incorrect behavior, crash, wrong result, missing error handling, race, or a logic defect that is not security-related",
@@ -158,9 +165,16 @@ def main():
             if "budget" not in errors:
                 errors.append("budget")
             return None
+        if time.time() - t0 > BUDGET_SECONDS:      # 遅いが成功する API でもジョブの制限時間内に表を出す
+            if "deadline" not in errors:
+                errors.append("deadline")
+            return None
         ans, err = call(route, state, questions); calls += 1
         if err:
             errors.append(err); jev_ok = False      # 以後は呼ばない（タイムアウト連発で CI の制限時間を食い潰さない）
+            return None
+        if not isinstance(ans, dict):
+            errors.append("bad-response"); jev_ok = False
             return None
         return ans
 
@@ -177,8 +191,10 @@ def main():
         })
         if ans is None:
             continue
-        c = ans.get("category", {}); t["category"] = c.get("choice", "unknown"); t["category_conf"] = c.get("confidence")
-        t["is_security"] = ans.get("is_security", {}).get("noul")
+        c = ans.get("category") if isinstance(ans.get("category"), dict) else {}
+        t["category"] = c.get("choice", "unknown") if c.get("choice") in CATEGORIES else "unknown"; t["category_conf"] = c.get("confidence")
+        sec = (ans.get("is_security") or {}).get("noul") if isinstance(ans.get("is_security"), dict) else None
+        t["is_security"] = sec if isinstance(sec, (int, float)) else None   # 数値以外が返っても落とさない
         if t["is_security"] is not None and t["is_security"] >= 0.7:
             t["category"] = "security"
 
@@ -198,9 +214,10 @@ def main():
             same = None
             if jev_ok and not SECRET_RE.search(A["text"]) and not SECRET_RE.search(B["text"]):
                 # 上限超過は jev() が記録するが、ここで手前に立つと記録されないので同じ扱いにする
-                if calls >= MAX_CALLS:
-                    if "budget" not in errors:
-                        errors.append("budget")
+                if calls >= MAX_CALLS or time.time() - t0 > BUDGET_SECONDS:
+                    key = "budget" if calls >= MAX_CALLS else "deadline"
+                    if key not in errors:
+                        errors.append(key)
                 elif mock:
                     same = 0.9 if A.get("line") == B.get("line") else 0.1
                 else:

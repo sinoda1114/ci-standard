@@ -80,6 +80,35 @@ class TriageTests(unittest.TestCase):
         finally:
             triage.call, triage.MAX_CALLS = saved
 
+    def _run_with_call(self, fake_call, threads, **over):
+        saved = triage.call, triage.MAX_CALLS, triage.BUDGET_SECONDS
+        try:
+            triage.call = fake_call
+            for k, v in over.items(): setattr(triage, k, v)
+            os.environ["TYPESAFE_API_KEY"] = "dummy"; os.environ["HOME"] = "/nonexistent"
+            with tempfile.TemporaryDirectory() as d:
+                src = Path(d, "t.json"); out = Path(d, "o.json"); md = Path(d, "o.md")
+                src.write_text(json.dumps(threads))
+                sys.argv = ["triage.py", "--threads", str(src), "--out", str(out), "--md", str(md)]; triage.main()
+                return json.loads(out.read_text())
+        finally:
+            triage.call, triage.MAX_CALLS, triage.BUDGET_SECONDS = saved
+
+    def test_non_numeric_and_malformed_answers_do_not_crash(self):
+        answers = iter([({"category": {"choice": "bug"}, "is_security": {"noul": "high"}}, None),   # 数値以外
+                        ([{"category": "bug"}], None),                                             # dict でない
+                        ])
+        r = self._run_with_call(lambda *a: next(answers), [th(1, "a.py", 1), th(2, "b.py", 2)])
+        self.assertIsNone(r["threads"][0]["is_security"]); self.assertEqual(r["threads"][0]["category"], "bug")
+        self.assertIn("bad-response", r["errors"]); self.assertEqual(r["jev"], "partial")
+
+    def test_deadline_stops_calls(self):
+        import time as _t
+        def slow(*a):
+            _t.sleep(0.05); return ({"category": {"choice": "bug", "confidence": 0.9}, "is_security": {"noul": 0.1}, "same_issue": {"noul": 0.2}}, None)
+        r = self._run_with_call(slow, [th(i, "a.py", i) for i in range(8)], BUDGET_SECONDS=0.12)   # 8 分類 + 28 ペア
+        self.assertIn("deadline", r["errors"]); self.assertLess(r["calls"], 36); self.assertEqual(r["jev"], "partial")
+
     def test_mock_mode_and_location_display(self):
         r, md = run([th(1, "src/a/util.py", 10), th(2, None, None)], env={"PR_TRIAGE_MOCK": "1"})
         self.assertEqual(r["jev"], "ok"); self.assertIn("a/util.py:10", md); self.assertIn("(場所不明)", md)

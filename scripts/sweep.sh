@@ -427,7 +427,9 @@ while IFS=$'\t' read -r NAME BRANCH; do
   fi
   echo "| $NAME | $OPS / CI:$STATUS |"
 done
-LIST_RC=${PIPESTATUS[0]}; LOOP_RC=${PIPESTATUS[1]}   # ループはパイプのサブシェル。一覧取得の失敗とシグナル中断（130）を親の終了コードに反映する
+# ループはパイプのサブシェル。一覧取得の失敗とシグナル中断（130）を親の終了コードに反映する。
+# 2 つの代入は必ず 1 コマンドで行う（1 つ目の代入自体が PIPESTATUS を上書きし、2 つ目が set -u で落ちる）
+LIST_RC=${PIPESTATUS[0]} LOOP_RC=${PIPESTATUS[1]}
 echo ""
 echo "sweep 完了: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # 失敗の詳細（「ログ参照」の参照先）。Actions ならジョブサマリーにも出す
