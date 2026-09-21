@@ -25,6 +25,8 @@ jobs:
   triage:
     # Bot のレビューだけを対象にする（人のレビューでは起動しない）
     if: endsWith(github.event.review.user.login, '[bot]') || contains(fromJSON('["cursor","devin-ai-integration","copilot-pull-request-reviewer","chatgpt-codex-connector","amazon-q-developer"]'), github.event.review.user.login)
+    # @main 参照は意図的（標準CIと同じ）。ci-standard は同一オーナーの保護ブランチで、SHA 固定にすると
+    # sweeper が毎日全リポジトリを書き換えることになる。ci-standard 側で第三者 Action は SHA 固定している
     uses: sinoda1114/ci-standard/.github/workflows/pr-triage.yml@main
     secrets:
       TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}

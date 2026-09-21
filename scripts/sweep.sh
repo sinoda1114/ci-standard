@@ -11,6 +11,14 @@
 #   4. Dependabot 設定ファイルの配布
 #   5. PR Bot コメント仕分け（pr-triage 呼び出しワークフロー）の配布と TYPESAFE_API_KEY の配布
 #
+# ファイル配布と保護ブランチ（deliver_file）:
+#   既定ブランチへの直接 PUT が保護で拒否（HTTP 409）されたら、
+#   - sweeper 自身が掛けた保護（必須チェック "ci / build"）なら一時解除して PUT し、末尾の protect() で再保護する
+#   - それ以外（手動の保護・ルールセット）なら sweeper/<name> ブランチに置いて PR を作る（冪等。PR があれば再利用）
+#   （2026-09-20 までの sweeper は dependabot.yml の配布が保護リポジトリ全てで 409 のまま放置されていた）
+#
+# 試験: ONLY="repo1 repo2" bash scripts/sweep.sh で対象を絞れる。
+#
 # B. Node/Python リポジトリの CI/CD
 #   5. 標準CI呼び出し（ci.yml）が無ければ自動配置（既存の独自CIは .github/ci.yml.bak へ退避）
 #   6. 標準CI導入「済み」を検証できたリポジトリだけにブランチ保護を適用
@@ -34,14 +42,62 @@ exists() { # exists <repo> <path> → 0/1
   gh api "/repos/${OWNER}/$1/contents/$2" -q .sha >/dev/null 2>&1
 }
 
-put_file() { # put_file <repo> <branch> <path> <message> <content> [sha]
-  local R=$1 B=$2 P=$3 M=$4 C=$5 S=${6:-}
-  local ARGS=(-X PUT "/repos/${OWNER}/${R}/contents/${P}" -f message="$M" -f branch="$B" -f content="$(printf '%s' "$C" | base64 | tr -d '\n')")
+put_file() { # put_file <repo> <branch> <path> <message> <content> [sha] → 0 成功 / 2 保護ブランチで拒否 / 1 その他
+  local R=$1 B=$2 P=$3 M=$4 C=$5 S=${6:-} ERR
+  local ARGS=(-X PUT "/repos/${OWNER}/${R}/contents/${P}" -f message="$M" -f branch="$B" -f content="$(printf '%s\n' "$C" | base64 | tr -d '\n')")
   [ -n "$S" ] && ARGS+=(-f sha="$S")
-  if ! gh api "${ARGS[@]}" >/dev/null 2>>"$ERRLOG"; then
-    echo "::warning::put_file 失敗 ${R}/${P}: $(tail -1 "$ERRLOG")"
+  if ! ERR=$(gh api "${ARGS[@]}" 2>&1 >/dev/null); then
+    printf '%s\n' "$ERR" >>"$ERRLOG"
+    if printf '%s' "$ERR" | grep -Eqi 'status check|pull request|protected branch|rule'; then
+      return 2
+    fi
+    echo "::warning::put_file 失敗 ${R}/${P}: $(printf '%s' "$ERR" | tail -1)"
     return 1
   fi
+}
+
+sweeper_managed_protection() { # sweeper_managed_protection <repo> <branch> → 0 なら sweeper が掛けた保護（必須チェック "ci / build"）
+  gh api "/repos/${OWNER}/$1/branches/$2/protection" -q '.required_status_checks.contexts[]?' 2>/dev/null | grep -qx 'ci / build'
+}
+
+# deliver_file <repo> <branch> <path> <message> <content> [sha] → DELIVER に結果文字列。0 成功 / 1 失敗
+#   直接 PUT → 保護で拒否なら（sweeper 管理の保護）一時解除して PUT / （それ以外）PR を作る
+deliver_file() {
+  local R=$1 B=$2 P=$3 M=$4 C=$5 S=${6:-} rc
+  put_file "$R" "$B" "$P" "$M" "$C" "$S"; rc=$?
+  if [ $rc -eq 0 ]; then DELIVER="配布"; return 0; fi
+  if [ $rc -ne 2 ]; then DELIVER="失敗"; return 1; fi
+  if [ -n "${KIND:-}" ] && sweeper_managed_protection "$R" "$B"; then
+    if unprotect "$R" "$B"; then
+      UNPROTECTED_FOR_FIX=true
+      if put_file "$R" "$B" "$P" "$M" "$C" "$S"; then DELIVER="配布(保護を一時解除)"; return 0; fi
+    fi
+    DELIVER="失敗"; return 1
+  fi
+  open_pr_with_file "$R" "$B" "$P" "$M" "$C"
+}
+
+open_pr_with_file() { # open_pr_with_file <repo> <base> <path> <message> <content> → DELIVER="PR作成" / "PR済み" / "失敗"
+  local R=$1 B=$2 P=$3 M=$4 C=$5 SLUG HEAD BJ BS BC OPEN
+  SLUG="sweeper/$(basename "$P" | sed 's/\.[^.]*$//')"
+  if ! gh api "/repos/${OWNER}/${R}/git/ref/heads/${SLUG}" >/dev/null 2>&1; then
+    HEAD=$(gh api "/repos/${OWNER}/${R}/git/ref/heads/${B}" -q .object.sha 2>>"$ERRLOG") || { DELIVER="失敗"; return 1; }
+    gh api -X POST "/repos/${OWNER}/${R}/git/refs" -f ref="refs/heads/${SLUG}" -f sha="$HEAD" >/dev/null 2>>"$ERRLOG" || { DELIVER="失敗"; return 1; }
+  fi
+  BJ=$(gh api "/repos/${OWNER}/${R}/contents/${P}?ref=${SLUG}" 2>/dev/null || true)
+  BS=$(printf '%s' "$BJ" | jq -r '.sha // empty' 2>/dev/null)
+  BC=$(printf '%s' "$BJ" | jq -r '.content // empty' 2>/dev/null | base64 -d 2>/dev/null || true)
+  if [ "$BC" != "$C" ]; then
+    put_file "$R" "$SLUG" "$P" "$M" "$C" "$BS" || { DELIVER="失敗"; return 1; }
+  fi
+  OPEN=$(gh pr list -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --state open --json number -q 'length' 2>/dev/null || echo 0)
+  if [ "${OPEN:-0}" -gt 0 ]; then DELIVER="PR済み"; return 0; fi
+  if gh pr create -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --title "$M" \
+       --body "sweeper（${STANDARD_REPO}）が配布する標準設定です。既定ブランチが保護されているため PR で届けます。CI が緑なら squash マージしてください。" \
+       >/dev/null 2>>"$ERRLOG"; then
+    DELIVER="PR作成"; return 0
+  fi
+  DELIVER="失敗"; return 1
 }
 
 is_protected() { # is_protected <repo> <branch>
@@ -144,49 +200,43 @@ updates:
       interval: "weekly"
 '
 
-sync_dependabot() { # sync_dependabot <repo> <branch> → "配布" / "既存" / "失敗"
+sync_dependabot() { # sync_dependabot <repo> <branch> → DEP="既存" / "配布" / "PR作成" / "PR済み" / "失敗"
   local R=$1 B=$2
   if gh api "/repos/${OWNER}/${R}/contents/.github/dependabot.yml?ref=${B}" -q .sha >/dev/null 2>&1; then
-    echo "既存"; return
+    DEP="既存"; return
   fi
-  if put_file "$R" "$B" ".github/dependabot.yml" "chore: Dependabot 設定を配布 [sweeper]" "$DEPENDABOT_BODY"; then
-    echo "配布"
-  else
-    echo "失敗"
-  fi
+  deliver_file "$R" "$B" ".github/dependabot.yml" "chore: Dependabot 設定を配布 [sweeper]" "$DEPENDABOT_BODY"
+  DEP="$DELIVER"
 }
 
 PR_TRIAGE_BODY="$(cat "$(dirname "$0")/../templates/pr-triage-caller.yml" 2>/dev/null || true)"
 
-sync_pr_triage() { # sync_pr_triage <repo> <branch> → "配布" / "既存" / "失敗" / "雛形なし"
-  local R=$1 B=$2
-  [ -n "$PR_TRIAGE_BODY" ] || { echo "雛形なし"; return; }
-  local BODY
-  BODY=$(gh api "/repos/${OWNER}/${R}/contents/.github/workflows/pr-triage.yml?ref=${B}" -q .content 2>/dev/null | base64 -d 2>/dev/null || true)
-  if printf '%s' "$BODY" | grep -q "$STANDARD_REPO"; then
-    echo "既存"; return
-  fi
-  if put_file "$R" "$B" ".github/workflows/pr-triage.yml" "ci: PR Bot コメント仕分け（${STANDARD_REPO}/pr-triage）を配布 [sweeper]" "$PR_TRIAGE_BODY"; then
-    echo "配布"
-  else
-    echo "失敗"
-  fi
+sync_pr_triage() { # sync_pr_triage <repo> <branch> → PRT="既存" / "配布" / "更新" / "PR作成" / "PR済み" / "独自(未変更)" / "失敗" / "雛形なし"
+  local R=$1 B=$2 J SHA BODY MSG
+  [ -n "$PR_TRIAGE_BODY" ] || { PRT="雛形なし"; return; }
+  J=$(gh api "/repos/${OWNER}/${R}/contents/.github/workflows/pr-triage.yml?ref=${B}" 2>/dev/null || true)
+  SHA=$(printf '%s' "$J" | jq -r '.sha // empty' 2>/dev/null)
+  BODY=$(printf '%s' "$J" | jq -r '.content // empty' 2>/dev/null | base64 -d 2>/dev/null || true)
+  # 雛形と完全一致なら何もしない。雛形（trigger / 権限 / Bot 判定）を直したら翌日全リポジトリに届く
+  if [ "$BODY" = "$PR_TRIAGE_BODY" ]; then PRT="既存"; return; fi
+  # 標準を参照しない独自ファイルは上書きしない
+  if [ -n "$BODY" ] && ! printf '%s' "$BODY" | grep -q "$STANDARD_REPO"; then PRT="独自(未変更)"; return; fi
+  if [ -n "$SHA" ]; then MSG="ci: PR Bot コメント仕分け（${STANDARD_REPO}/pr-triage）の呼び出しを更新 [sweeper]"
+  else MSG="ci: PR Bot コメント仕分け（${STANDARD_REPO}/pr-triage）を配布 [sweeper]"; fi
+  deliver_file "$R" "$B" ".github/workflows/pr-triage.yml" "$MSG" "$PR_TRIAGE_BODY" "$SHA"
+  PRT="$DELIVER"
+  [ -n "$SHA" ] && [ "$PRT" = "配布" ] && PRT="更新"
+  return 0
 }
 
-sync_pr_triage_secret() { # sync_pr_triage_secret <repo> → "配布" / "既存" / "キー未設定" / "権限なし"
+sync_pr_triage_secret() { # sync_pr_triage_secret <repo> → PRS="同期" / "キー未設定" / "権限なし"
+  # 名前の有無では飛ばさない（GitHub は値を返さないので、中央の鍵をローテーションしても古い値が残り続ける）。毎回 set する（冪等）
   local R=$1
-  [ -n "${TYPESAFE_API_KEY:-}" ] || { echo "キー未設定"; return; }
-  local NAMES
-  if ! NAMES=$(gh secret list -R "${OWNER}/${R}" --json name -q '.[].name' 2>>"$ERRLOG"); then
-    echo "権限なし"; return
-  fi
-  if printf '%s\n' "$NAMES" | grep -qx TYPESAFE_API_KEY; then
-    echo "既存"; return
-  fi
+  [ -n "${TYPESAFE_API_KEY:-}" ] || { PRS="キー未設定"; return; }
   if printf '%s' "$TYPESAFE_API_KEY" | gh secret set TYPESAFE_API_KEY -R "${OWNER}/${R}" 2>>"$ERRLOG"; then
-    echo "配布"
+    PRS="同期"
   else
-    echo "権限なし"
+    PRS="権限なし"
   fi
 }
 
@@ -220,17 +270,10 @@ echo "|---|---|"
 gh api '/user/repos?per_page=100' -q '.[] | select(.archived==false and .fork==false) | "\(.name)\t\(.default_branch)"' |
 while IFS=$'\t' read -r NAME BRANCH; do
   case " $EXCLUDE " in *" $NAME "*) continue;; esac
+  if [ -n "${ONLY:-}" ]; then case " $ONLY " in *" $NAME "*) ;; *) continue;; esac; fi
 
-  # ---- A. 運用設定の収束（言語を問わず全リポジトリ） ----
-  LBL=$(sync_labels "$NAME")
-  SS=$(sync_secret_scanning "$NAME")
-  DEP=$(sync_dependabot "$NAME" "$BRANCH")
-  PRT=$(sync_pr_triage "$NAME" "$BRANCH")
-  PRS=$(sync_pr_triage_secret "$NAME")
-  OPS="ラベル:${LBL} / scanning:${SS} / dependabot:${DEP} / pr-triage:${PRT}(secret:${PRS})"
-
-  # ---- B. CI/CD（Node/Python のみ） ----
-  # 言語判定（Contents API のみ、clone不要）
+  # 言語判定を先に行う（Contents API のみ、clone不要）。deliver_file が「sweeper 管理の保護か」の判断に KIND を使う
+  KIND=""; CONTEXTS=""; UNPROTECTED_FOR_FIX=false
   if exists "$NAME" package.json; then
     KIND="node"
     # e2e必須はplaywright設定のあるリポジトリのみ（未導入リポジトリをマージ不能にしないため）
@@ -241,7 +284,18 @@ while IFS=$'\t' read -r NAME BRANCH; do
     fi
   elif exists "$NAME" pyproject.toml || exists "$NAME" requirements.txt; then
     KIND="python"; CONTEXTS='["ci / build"]'
-  else
+  fi
+
+  # ---- A. 運用設定の収束（言語を問わず全リポジトリ） ----
+  LBL=$(sync_labels "$NAME")
+  SS=$(sync_secret_scanning "$NAME")
+  sync_dependabot "$NAME" "$BRANCH"        # → DEP（サブシェルにしない: UNPROTECTED_FOR_FIX を親へ伝えるため）
+  sync_pr_triage "$NAME" "$BRANCH"         # → PRT
+  sync_pr_triage_secret "$NAME"            # → PRS
+  OPS="ラベル:${LBL} / scanning:${SS} / dependabot:${DEP} / pr-triage:${PRT}(secret:${PRS})"
+
+  # ---- B. CI/CD（Node/Python のみ） ----
+  if [ -z "$KIND" ]; then
     # CI対象外の言語でも運用設定は収束済みなので結果を出す
     echo "| $NAME | $OPS / CI:対象外 |"
     continue
@@ -256,9 +310,8 @@ while IFS=$'\t' read -r NAME BRANCH; do
     INSTALLED=true
     STATUS="導入済み"
   else
-    # 「保護あり・標準CI無し」の矛盾状態なら保護を一時解除して復旧する
-    UNPROTECTED_FOR_FIX=false
-    if is_protected "$NAME" "$BRANCH"; then
+    # 「保護あり・標準CI無し」の矛盾状態なら保護を一時解除して復旧する（deliver_file が既に解除済みならそのまま）
+    if ! $UNPROTECTED_FOR_FIX && is_protected "$NAME" "$BRANCH"; then
       if unprotect "$NAME" "$BRANCH"; then
         UNPROTECTED_FOR_FIX=true
       fi
