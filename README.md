@@ -32,6 +32,7 @@ CIが緑でないと main にマージできない** 状態を作るための中
 | 運用設定 | `type:*` ラベル（7種・色/説明の是正含む） | 全リポジトリ |
 | 運用設定 | Secret scanning / push protection の有効化 | 全リポジトリ（public は無料） |
 | 運用設定 | Dependabot 設定の配布（npm / github-actions / weekly） | 全リポジトリ |
+| 運用設定 | PR Bot コメント仕分け（pr-triage 呼び出し + `TYPESAFE_API_KEY`）の配布 | 全リポジトリ（Bot のいる PR でのみ動く） |
 | CI/CD | 標準CI呼び出し（ci.yml）の配置 | Node / Python |
 | CI/CD | ブランチ保護（CI必須・会話解決必須・admin含む） | 標準CI導入済みのみ |
 | CI/CD | コード健全性ゲート（Fallow: 未使用コード/重複/複雑度） | Node（既定 report-only） |
@@ -73,7 +74,7 @@ scripts/sweep.sh                     # ローカルから全リポジトリ見�
 1. **自動判定・グレースフルデグレード**: リポジトリに存在する構成（lint script、playwright.config、tests/ 等）だけ実行。無いステップは黙って skip。PoC リポジトリに入れてもCIは壊れない
 2. **必須チェック名は固定**: `ci / build`（Node は加えて `ci / e2e`）。e2e はジョブごと skip されても必須チェックを満たす（GitHub の仕様）
 3. **カバレッジ閾値は各リポジトリ側**: vitest.config.ts の `coverage.thresholds` に置く（ラチェット方式: 実測の少し下に設定し退行だけ止める。向上したら引き上げる）
-4. **CI用の非シークレット環境変数は `.github/ci.env`**: KEY=VALUE 形式でリポジトリにコミットする（例: Better Auth のCI専用ダミー値）。シークレットは GitHub Secrets + `secrets: inherit`
+4. **CI用の非シークレット環境変数は `.github/ci.env`**: KEY=VALUE 形式でリポジトリにコミットする（例: Better Auth のCI専用ダミー値）。シークレットが要るリポだけ `secrets:` で明示マップ（optional。未設定なら空）
 5. **参照は `@main`**: ソロ運用のため即時反映を優先。**その裏返しとして、このリポジトリの
    main への変更は全リポジトリのCIに即時波及する**（壊れる変更も同様）。したがって
    **ワークフローの変更は main 直 push ではなく必ずPR経由**にし、マージ前に実リポジトリで
@@ -95,6 +96,15 @@ Actions とは別系統（GitHub App）。導入は各サービスの管理画�
 指摘の裁定ポリシーは各リポジトリの CLAUDE.md を参照
 （鵜呑みにせず一次情報で裁定 / 見送り理由をスレッドに返信して resolve / ボットのチェックは必須化しない）。
 
+## PR Bot コメント仕分け（pr-triage）
+
+5 体の AI レビューボットが同じ問題を別々に書く PR で、`.github/workflows/pr-triage.yml`（実体は本リポの
+Reusable Workflow）が Bot のレビュー投稿をきっかけに起動し、3 分待ってスレッドを取得、JEV（TypeSafe AI の
+判断専用モデル）で「同じ問題」を束ねて種別順の表を PR の固定コメントに出す。**正誤は判定しない**（人か Claude が
+グループ単位で判断）。JEV キーが無いリポジトリではファイル+行の近さで束ねる粗い表になる。
+スクリプトは `scripts/pr-triage/`（正本は `~/.claude/skills/pr-triage/scripts/`）。測定根拠は PR #95/#102 で
+ペアリング一致 98.6% / 96.6%。費用は 1 PR あたり 1 円未満。
+
 ## 制約
 
 - **private リポジトリのブランチ保護は GitHub Free では設定不可**（403）。CI 自体は動くため、
@@ -105,6 +115,7 @@ Actions とは別系統（GitHub App）。導入は各サービスの管理画�
 ## 既知のドリフト
 
 - 2026-08-08 以前に sweeper が配布した ci.yml には `secrets: inherit` が付いている
-  （36リポジトリ）。標準は最小権限化により inherit 無しへ変更済み。呼び出し先の
-  標準CIはシークレットを一切参照しないため実害はなく、保護ブランチへは直接push
-  できないため一括更新はしない。**各リポジトリを触る機会に PR で除去して収束させる**。
+  （36リポジトリ）。標準は最小権限化により inherit 無しへ変更済み。呼び出し先は
+  `workflow_call` で宣言した optional secrets だけ読む。inherit でも未宣言のキーは
+  入らない。マップしないリポは空のままなので実害はない。保護ブランチへは直接
+  push できないため一括更新はしない。**各リポジトリを触る機会に PR で除去して収束させる**。

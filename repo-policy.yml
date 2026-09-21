@@ -45,6 +45,12 @@ settings:
   # Dependabot（npm / weekly / ルート）設定ファイルを配布
   dependabot: true
 
+  # PR Bot コメント仕分け（.github/workflows/pr-triage.yml の呼び出しワークフロー）を配布し、
+  # JEV キー TYPESAFE_API_KEY を各リポジトリの Secrets に配る。
+  # AI レビューボットが付く PR で、同じ問題の指摘を束ねて種別順の表を固定コメントとして出す。正誤は判定しない。
+  # Bot のいないリポジトリでは起動条件（Bot のレビュー）を満たさないので何も起きない。
+  pr_triage: true
+
 
 # 型から意図的に除外するもの（理由を明記して、再検討時の判断材料にする）
 excluded:

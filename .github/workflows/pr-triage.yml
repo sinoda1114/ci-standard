@@ -1,0 +1,102 @@
+# PR Bot コメント仕分け（Reusable Workflow）
+#
+# 何をするか:
+#   PR に付いた AI レビューボット（Copilot / Devin / Codex / Cursor / Amazon Q 等）のスレッドを取得し、
+#   JEV（TypeSafe AI の判断専用モデル）で「同じ問題」を束ね、種別（security / bug / design / docs / style /
+#   question / meta）に仕分けた表を PR に 1 件の固定コメントとして投稿・更新する。
+#   正誤の判定はしない（表の「判定」列は空。人か Claude が根拠を読んで埋める）。
+#
+# いつ動くか（呼び出し側 templates/pr-triage-caller.yml）:
+#   pull_request_review: submitted のたびに起動し、同じ PR の進行中ジョブは打ち切り（concurrency）。
+#   Bot は数分ずらして届くので、ジョブ冒頭で debounce 秒だけ待ってから最後の 1 回だけ集計する。
+#
+# 前提:
+#   - secrets.TYPESAFE_API_KEY（無ければ JEV を使わず、ファイル+行の近さで束ねた表を出す）
+#   - permissions: pull-requests: write（固定コメントの投稿・更新）、contents: read
+#   - fork からの PR は secrets が渡らないため JEV なしの表になる（仕様）
+#
+# 根拠・測定: ~/.claude/skills/ai-review/DESIGN-v2.md §10（PR #95/#102 でペアリング一致 98.6% / 96.6%）
+# スクリプト実体: scripts/pr-triage/（正本は ~/.claude/skills/pr-triage/scripts/。変更時は両方を更新）
+
+name: PR triage (standard)
+
+on:
+  workflow_call:
+    inputs:
+      debounce-seconds:
+        description: "Bot のレビューが出そろうのを待つ秒数"
+        type: number
+        required: false
+        default: 180
+      min-threads:
+        description: "この件数未満なら表を投稿しない（少数なら人が直接読む方が早い）"
+        type: number
+        required: false
+        default: 4
+    secrets:
+      TYPESAFE_API_KEY:
+        description: "TypeSafe AI（JEV）の API キー。無ければ JEV なしで動く"
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Bot のレビューが出そろうのを待つ
+        env:
+          DEBOUNCE: ${{ inputs.debounce-seconds }}
+        run: sleep "$DEBOUNCE"
+
+      - name: ci-standard の仕分けスクリプトを取得
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: sinoda1114/ci-standard
+          ref: main
+          path: ci-standard
+          persist-credentials: false
+
+      - name: スレッド取得 → 仕分け → 固定コメント投稿
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          MIN_THREADS: ${{ inputs.min-threads }}
+        run: |
+          set -uo pipefail
+          S=ci-standard/scripts/pr-triage
+          mkdir -p out
+          "$S/fetch-threads.sh" "$REPO" "$PR" > out/threads.json
+          n=$(python3 -c 'import json,sys;print(len(json.load(open("out/threads.json"))))')
+          echo "threads=$n"
+          if [ "$n" -lt "$MIN_THREADS" ]; then
+            echo "スレッド $n 件（< $MIN_THREADS）。表は投稿しない"; exit 0
+          fi
+          python3 "$S/triage.py" --threads out/threads.json --out out/triage.json --md out/triage.md > /dev/null
+          jev=$(python3 -c 'import json;print(json.load(open("out/triage.json"))["jev"])')
+          {
+            echo '<!-- pr-triage -->'
+            echo "## Bot レビューの仕分け"
+            echo
+            echo "AI レビューボットのスレッド **${n} 件**を「同じ問題」で束ね、種別順に並べました（JEV: ${jev}）。"
+            echo "**正誤は判定していません。** グループ単位で根拠を読んで判断してください。重複分は 1 回で済みます。"
+            echo
+            tail -n +2 out/triage.md
+            echo
+            echo "<sub>ci-standard/pr-triage · 自動投稿。新しいレビューが付くと更新されます。</sub>"
+          } > out/comment.md
+          # 既存の固定コメントがあれば更新、無ければ作成
+          cid=$(gh api "repos/$REPO/issues/$PR/comments?per_page=100" \
+                  --jq '[.[] | select(.body | startswith("<!-- pr-triage -->"))][0].id // empty')
+          if [ -n "$cid" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$cid" -F body=@out/comment.md > /dev/null
+            echo "updated comment $cid"
+          else
+            gh api -X POST "repos/$REPO/issues/$PR/comments" -F body=@out/comment.md > /dev/null
+            echo "created comment"
+          fi

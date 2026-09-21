@@ -17,7 +17,6 @@ permissions:
 
 jobs:
   ci:
-    # `secrets: inherit` は付けない（最小権限）。標準CIはシークレットを一切参照せず、
-    # CI用の値は非シークレットの .github/ci.env から供給される。将来シークレットが
-    # 必要になったら inherit ではなく `secrets:` マップで必要なものだけ明示的に渡すこと。
+    # `secrets: inherit` は付けない（最小権限）。Clerk 等が要るリポだけ呼び出し側で
+    # `secrets:` 明示マップ。未設定なら空。非シークレットは .github/ci.env。
     uses: sinoda1114/ci-standard/.github/workflows/node-ci.yml@main
