@@ -7,13 +7,15 @@
 #   正誤の判定はしない（表の「判定」列は空。人か Claude が根拠を読んで埋める）。
 #
 # いつ動くか（呼び出し側 templates/pr-triage-caller.yml）:
-#   pull_request_review: submitted のたびに起動し、同じ PR の進行中ジョブは打ち切り（concurrency）。
+#   pull_request_review: submitted（Bot のレビュー）と pull_request_review_thread: resolved / unresolved（人の解決操作）の
+#   たびに起動し、同じ PR の進行中ジョブは打ち切り（concurrency）。
 #   Bot は数分ずらして届くので、ジョブ冒頭で debounce 秒だけ待ってから最後の 1 回だけ集計する。
 #
 # 前提:
 #   - secrets.TYPESAFE_API_KEY（無ければ JEV を使わず、ファイル+行の近さで束ねた表を出す）
 #   - permissions: pull-requests: write（固定コメントの投稿・更新）、contents: read
-#   - fork からの PR は secrets が渡らないため JEV なしの表になる（仕様）
+#   - fork からの PR は secrets が渡らず GITHUB_TOKEN も読み取り専用（コメント投稿不可）のため、ジョブを起動しない
+#   - 対象は Bot が起票した未解決スレッドだけ（人のレビュー・解決済みは triage.py が除外）
 #
 # 根拠・測定: ~/.claude/skills/ai-review/DESIGN-v2.md §10（PR #95/#102 でペアリング一致 98.6% / 96.6%）
 # スクリプト実体: scripts/pr-triage/（正本は ~/.claude/skills/pr-triage/scripts/。変更時は両方を更新）
@@ -44,6 +46,11 @@ permissions:
 
 jobs:
   triage:
+    # fork（別リポジトリ）からの PR では secrets が渡らず GITHUB_TOKEN も読み取り専用でコメントを投稿できないため、
+    # 待機に入る前にジョブごと飛ばす。pull_request_review も pull_request と同じ制約:
+    # https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request_review
+    # （"The GITHUB_TOKEN has read-only permissions in pull requests from forked repositories."）
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -68,16 +75,39 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           MIN_THREADS: ${{ inputs.min-threads }}
         run: |
-          set -uo pipefail
+          set -euo pipefail
           S=ci-standard/scripts/pr-triage
           mkdir -p out
-          "$S/fetch-threads.sh" "$REPO" "$PR" > out/threads.json
-          n=$(python3 -c 'import json,sys;print(len(json.load(open("out/threads.json"))))')
-          echo "threads=$n"
-          if [ "$n" -lt "$MIN_THREADS" ]; then
-            echo "スレッド $n 件（< $MIN_THREADS）。表は投稿しない"; exit 0
+          "$S/fetch-threads.sh" "$REPO" "$PR" > out/threads.json   # 失敗すれば set -e でここで止まる
+          # 対象件数（Bot 起票・未解決）だけ先に数える。閾値未満なら JEV を呼ばずに終わる（有料呼び出しを無駄にしない）
+          n=$(python3 "$S/triage.py" --threads out/threads.json --out /dev/null --count-only)
+          echo "threads=$n（Bot 起票・未解決のみ）"
+          if [ "$n" -ge "$MIN_THREADS" ]; then
+            python3 "$S/triage.py" --threads out/threads.json --out out/triage.json --md out/triage.md > /dev/null
           fi
-          python3 "$S/triage.py" --threads out/threads.json --out out/triage.json --md out/triage.md > /dev/null
+          # 既存の固定コメント（全ページを見る。1 ページだけだと長い PR で二重投稿になる）。
+          # `| head -1` は gh を SIGPIPE(141) で落とし set -e で止まるので、全部読む awk で先頭だけ取る
+          # 自分（github-actions[bot]）が投稿したマーカー付きコメントだけを対象にする（人が表を引用したコメントを消さない）
+          cids=$(gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100" \
+                   --jq '.[] | select(.user.type == "Bot" and .user.login == "github-actions[bot]") | select(.body != null) | select(.body | startswith("<!-- pr-triage -->")) | .id') \
+                 || { echo "::warning::既存コメントの取得に失敗。二重投稿を避けるため今回は投稿せず、次のイベントで再試行する"; exit 0; }
+          cid=$(printf '%s\n' "$cids" | awk 'NR==1{c=$0} END{print c}')
+          # 過去に二重投稿されていたら 2 件目以降は消す（1 件だけ更新すると残りが古い表のまま残る）
+          printf '%s\n' "$cids" | awk 'NR>1 && NF' | while IFS= read -r dup; do
+            # 掃除の失敗で表の更新まで止めない（while の終了コードは最後のコマンドのもの）
+            gh api -X DELETE "repos/$REPO/issues/comments/$dup" > /dev/null && echo "deleted duplicate comment $dup" \
+              || echo "::warning::重複コメント $dup を削除できなかった"
+          done
+          if [ "$n" -lt "$MIN_THREADS" ]; then
+            echo "スレッド $n 件（< $MIN_THREADS）。表は投稿しない"
+            if [ -n "$cid" ]; then
+              # 以前に投稿した表が古いまま残らないよう、閾値未満になった旨へ書き換える
+              printf '<!-- pr-triage -->\n## Bot レビューの仕分け\n\n未解決の Bot スレッドが **%s 件**（%s 件未満）になったため、表は省略します。\n\n<sub>ci-standard/pr-triage · 自動投稿。新しいレビューが付くと更新されます。</sub>\n' "$n" "$MIN_THREADS" > out/comment.md
+              gh api -X PATCH "repos/$REPO/issues/comments/$cid" -F body=@out/comment.md > /dev/null
+              echo "updated comment $cid (below threshold)"
+            fi
+            exit 0
+          fi
           jev=$(python3 -c 'import json;print(json.load(open("out/triage.json"))["jev"])')
           {
             echo '<!-- pr-triage -->'
@@ -90,9 +120,15 @@ jobs:
             echo
             echo "<sub>ci-standard/pr-triage · 自動投稿。新しいレビューが付くと更新されます。</sub>"
           } > out/comment.md
+          # コメント本文は 65,536 字が上限（超えると 422 でジョブが落ちる）。文字単位で切って注記する（バイト単位だと UTF-8 を割る）
+          python3 - <<'PYEOF'
+          import pathlib
+          p = pathlib.Path("out/comment.md"); t = p.read_text()
+          if len(t) > 60000:
+              p.write_text(t[:58000] + "\n\n（長すぎるため以降を省略。全体は Actions のログ参照）\n")
+              print(pathlib.Path("out/triage.md").read_text())
+          PYEOF
           # 既存の固定コメントがあれば更新、無ければ作成
-          cid=$(gh api "repos/$REPO/issues/$PR/comments?per_page=100" \
-                  --jq '[.[] | select(.body | startswith("<!-- pr-triage -->"))][0].id // empty')
           if [ -n "$cid" ]; then
             gh api -X PATCH "repos/$REPO/issues/comments/$cid" -F body=@out/comment.md > /dev/null
             echo "updated comment $cid"

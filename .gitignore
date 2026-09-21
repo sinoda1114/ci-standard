@@ -1,3 +1,5 @@
 
 # work-summary skill output (local-only, not pushed)
 work-summary/
+__pycache__/
+*.pyc

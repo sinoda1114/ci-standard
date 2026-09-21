@@ -58,8 +58,8 @@ permissions:
 
 jobs:
   ci:
+    # secrets: inherit は付けない（最小権限。必要なリポだけ呼び出し側で secrets 明示マップ）
     uses: ${STANDARD_REPO}/.github/workflows/${KIND}-ci.yml@main
-    secrets: inherit
 EOF
   git add .github/workflows
   git -c user.name="Yukihiro Shinoda" -c user.email="52367401+sinoda1114@users.noreply.github.com" \

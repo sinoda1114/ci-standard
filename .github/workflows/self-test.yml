@@ -1,0 +1,29 @@
+# ci-standard 自身の検査（PR ごと）: シェル構文・YAML・pr-triage の単体テスト
+name: self-test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: シェル構文
+        run: for f in scripts/*.sh scripts/pr-triage/*.sh; do bash -n "$f"; done
+      - name: YAML 構文
+        run: |
+          python3 -c 'import yaml' 2>/dev/null || python3 -m pip install --quiet --break-system-packages 'pyyaml==6.0.2'
+          python3 -c 'import glob,yaml; [yaml.safe_load(open(f)) for f in glob.glob(".github/workflows/*.yml")+glob.glob("templates/*.yml")]'
+      - name: pr-triage 単体テスト
+        run: python3 -m unittest discover -s scripts/pr-triage -v
+      - name: sweep.sh スモーク（gh スタブ。bash -n では未定義変数などの実行時エラーを検出できない）
+        run: bash scripts/test-sweep-smoke.sh

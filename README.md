@@ -31,7 +31,7 @@ CIが緑でないと main にマージできない** 状態を作るための中
 |---|---|---|
 | 運用設定 | `type:*` ラベル（7種・色/説明の是正含む） | 全リポジトリ |
 | 運用設定 | Secret scanning / push protection の有効化 | 全リポジトリ（public は無料） |
-| 運用設定 | Dependabot 設定の配布（npm / github-actions / weekly） | 全リポジトリ |
+| 運用設定 | Dependabot 設定の配布（weekly。node: npm + github-actions / python: pip + github-actions / それ以外: github-actions のみ。sweeper 配布分は言語変更に追従） | 全リポジトリ |
 | 運用設定 | PR Bot コメント仕分け（pr-triage 呼び出し + `TYPESAFE_API_KEY`）の配布 | 全リポジトリ（Bot のいる PR でのみ動く） |
 | CI/CD | 標準CI呼び出し（ci.yml）の配置 | Node / Python |
 | CI/CD | ブランチ保護（CI必須・会話解決必須・admin含む） | 標準CI導入済みのみ |
@@ -58,7 +58,8 @@ CIが緑でないと main にマージできない** 状態を作るための中
 
 1. fine-grained PAT を作成: Settings → Developer settings → Fine-grained tokens →
    Repository access: **All repositories** / Permissions: **Contents: RW**,
-   **Administration: RW**, **Workflows: RW**, **Issues: RW**（ラベル操作に必要）
+   **Administration: RW**, **Workflows: RW**, **Issues: RW**（ラベル操作に必要）,
+   **Pull requests: RW**（保護ブランチへの配布を PR で届ける）, **Secrets: RW**（`TYPESAFE_API_KEY` の配布）
 2. このリポジトリの Settings → Secrets and variables → Actions に `ADMIN_TOKEN` として登録
 3. Actions タブ → sweeper → Run workflow で初回実行（以後は毎日自動）
 
@@ -115,7 +116,9 @@ Reusable Workflow）が Bot のレビュー投稿をきっかけに起動し、3
 ## 既知のドリフト
 
 - 2026-08-08 以前に sweeper が配布した ci.yml には `secrets: inherit` が付いている
-  （36リポジトリ）。標準は最小権限化により inherit 無しへ変更済み。呼び出し先は
-  `workflow_call` で宣言した optional secrets だけ読む。inherit でも未宣言のキーは
-  入らない。マップしないリポは空のままなので実害はない。保護ブランチへは直接
-  push できないため一括更新はしない。**各リポジトリを触る機会に PR で除去して収束させる**。
+  （36リポジトリ）。標準は最小権限化により inherit 無しへ変更済み。
+  注意: `secrets: inherit` は呼び出し側の**全** secrets を呼び出し先へ渡す（`workflow_call`
+  で宣言した名前に限られない）。呼び出し先（このリポジトリの標準CI）は宣言した名前しか
+  参照しないコードになっているが、保証はコード側にあり GitHub 側にはない。
+  **各リポジトリを触る機会に PR で除去して収束させる**（`setup-ci.sh` / `rollout-all.sh`
+  も inherit を出さないよう修正済み）。

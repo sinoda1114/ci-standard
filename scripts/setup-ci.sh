@@ -57,8 +57,8 @@ on:
 
 jobs:
   ci:
+    # secrets: inherit は付けない（最小権限。必要なリポだけ呼び出し側で secrets 明示マップ）
     uses: ${STANDARD_REPO}/.github/workflows/${LANG_KIND}-ci.yml@main
-    secrets: inherit
 EOF
 echo "   .github/workflows/ci.yml 配置完了（コミットは手動で）"
 

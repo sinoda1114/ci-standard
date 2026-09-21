@@ -42,7 +42,7 @@ settings:
   secret_scanning: true
   secret_scanning_push_protection: true
 
-  # Dependabot（npm / weekly / ルート）設定ファイルを配布
+  # Dependabot 設定ファイルを配布（weekly / ルート。node: npm + github-actions / python: pip + github-actions / それ以外: github-actions のみ）
   dependabot: true
 
   # PR Bot コメント仕分け（.github/workflows/pr-triage.yml の呼び出しワークフロー）を配布し、
