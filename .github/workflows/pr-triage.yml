@@ -67,7 +67,9 @@ jobs:
           TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
-          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+          # head.repo.fork は「head リポジトリ自体が fork か」なので、ベースが fork のリポジトリでは同一リポ内 PR でも true になる。
+          # 「別リポジトリからの PR か」を full_name の比較で判定する
+          IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
           MIN_THREADS: ${{ inputs.min-threads }}
         run: |
           set -euo pipefail
@@ -80,8 +82,20 @@ jobs:
           python3 "$S/triage.py" --threads out/threads.json --out out/triage.json --md out/triage.md > /dev/null
           n=$(python3 -c 'import json;print(len(json.load(open("out/triage.json"))["threads"]))')
           echo "threads=$n（Bot 起票・未解決のみ）"
+          # 既存の固定コメント（全ページを見る。1 ページだけだと長い PR で二重投稿になる）。
+          # `| head -1` は gh を SIGPIPE(141) で落とし set -e で止まるので、全部読む awk で先頭だけ取る
+          cid=$(gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100" \
+                  --jq '.[] | select(.body | startswith("<!-- pr-triage -->")) | .id' \
+                | awk 'NR==1{c=$0} END{print c}')
           if [ "$n" -lt "$MIN_THREADS" ]; then
-            echo "スレッド $n 件（< $MIN_THREADS）。表は投稿しない"; exit 0
+            echo "スレッド $n 件（< $MIN_THREADS）。表は投稿しない"
+            if [ -n "$cid" ]; then
+              # 以前に投稿した表が古いまま残らないよう、閾値未満になった旨へ書き換える
+              printf '<!-- pr-triage -->\n## Bot レビューの仕分け\n\n未解決の Bot スレッドが **%s 件**（%s 件未満）になったため、表は省略します。\n\n<sub>ci-standard/pr-triage · 自動投稿。新しいレビューが付くと更新されます。</sub>\n' "$n" "$MIN_THREADS" > out/comment.md
+              gh api -X PATCH "repos/$REPO/issues/comments/$cid" -F body=@out/comment.md > /dev/null
+              echo "updated comment $cid (below threshold)"
+            fi
+            exit 0
           fi
           jev=$(python3 -c 'import json;print(json.load(open("out/triage.json"))["jev"])')
           {
@@ -95,9 +109,7 @@ jobs:
             echo
             echo "<sub>ci-standard/pr-triage · 自動投稿。新しいレビューが付くと更新されます。</sub>"
           } > out/comment.md
-          # 既存の固定コメントがあれば更新、無ければ作成（全ページを見る。1 ページだけだと長い PR で二重投稿になる）
-          cid=$(gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100" \
-                  --jq '.[] | select(.body | startswith("<!-- pr-triage -->")) | .id' | head -1)
+          # 既存の固定コメントがあれば更新、無ければ作成
           if [ -n "$cid" ]; then
             gh api -X PATCH "repos/$REPO/issues/comments/$cid" -F body=@out/comment.md > /dev/null
             echo "updated comment $cid"

@@ -38,6 +38,18 @@ STANDARD_REPO="${OWNER}/ci-standard"
 EXCLUDE="ci-standard teamdev-2023-apr-team1 desktop-tutorial flue-test2"
 ERRLOG=$(mktemp)
 
+# 保護を一時解除したまま中断（キャンセル・タイムアウト）しないための保険。
+# deliver_file / CI 導入で unprotect したら REPROTECT_* に積み、末尾か終了シグナルで protect() を掛け直す
+REPROTECT_REPO=""; REPROTECT_BRANCH=""; REPROTECT_CONTEXTS=""
+reprotect_pending() {
+  if [ -n "$REPROTECT_REPO" ]; then
+    protect "$REPROTECT_REPO" "$REPROTECT_BRANCH" "$REPROTECT_CONTEXTS" \
+      && echo "::notice::${REPROTECT_REPO}: 中断時に保護を再適用" \
+      || echo "::error::${REPROTECT_REPO}: 保護の再適用に失敗。手で確認すること"
+    REPROTECT_REPO=""
+  fi
+}
+
 exists() { # exists <repo> <path> → 0/1
   gh api "/repos/${OWNER}/$1/contents/$2" -q .sha >/dev/null 2>&1
 }
@@ -67,12 +79,17 @@ deliver_file() {
   put_file "$R" "$B" "$P" "$M" "$C" "$S"; rc=$?
   if [ $rc -eq 0 ]; then DELIVER="配布"; return 0; fi
   if [ $rc -ne 2 ]; then DELIVER="失敗"; return 1; fi
-  if [ -n "${KIND:-}" ] && sweeper_managed_protection "$R" "$B"; then
+  # sweeper 自身が掛けた保護で、かつ標準CIが導入済み（= ループ末尾の protect() が必ず走る）ときだけ一時解除する。
+  # それ以外で解除すると再保護の保証がないので PR 経路に回す
+  if [ -n "${KIND:-}" ] && [ "${CI_INSTALLED_NOW:-false}" = true ] && sweeper_managed_protection "$R" "$B"; then
     if unprotect "$R" "$B"; then
       UNPROTECTED_FOR_FIX=true
-      if put_file "$R" "$B" "$P" "$M" "$C" "$S"; then DELIVER="配布(保護を一時解除)"; return 0; fi
+      REPROTECT_REPO="$R"; REPROTECT_BRANCH="$B"; REPROTECT_CONTEXTS="$CONTEXTS"
+      put_file "$R" "$B" "$P" "$M" "$C" "$S"; rc=$?
+      if [ $rc -eq 0 ]; then DELIVER="配布(保護を一時解除)"; return 0; fi
+      # 2 回目も保護で拒否 = ruleset 等の別の保護が併用されている → PR 経路へ
+      [ $rc -ne 2 ] && { DELIVER="失敗"; return 1; }
     fi
-    DELIVER="失敗"; return 1
   fi
   open_pr_with_file "$R" "$B" "$P" "$M" "$C"
 }
@@ -92,6 +109,10 @@ open_pr_with_file() { # open_pr_with_file <repo> <base> <path> <message> <conten
   fi
   OPEN=$(gh pr list -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --state open --json number -q 'length' 2>/dev/null || echo 0)
   if [ "${OPEN:-0}" -gt 0 ]; then DELIVER="PR済み"; return 0; fi
+  # 人がマージせずに閉じた PR があれば、意思表示とみなして翌日また作らない
+  local REJECTED
+  REJECTED=$(gh pr list -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --state closed --json mergedAt -q '[.[]|select(.mergedAt==null)]|length' 2>/dev/null || echo 0)
+  if [ "${REJECTED:-0}" -gt 0 ]; then DELIVER="PR却下済み"; return 0; fi
   if gh pr create -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --title "$M" \
        --body "sweeper（${STANDARD_REPO}）が配布する標準設定です。既定ブランチが保護されているため PR で届けます。CI が緑なら squash マージしてください。" \
        >/dev/null 2>>"$ERRLOG"; then
@@ -286,6 +307,14 @@ while IFS=$'\t' read -r NAME BRANCH; do
     KIND="python"; CONTEXTS='["ci / build"]'
   fi
 
+  # 標準CIが既に入っているか（deliver_file が「保護を一時解除してよいか」の判断に使う。末尾の protect() が走る保証になる）
+  CI_INSTALLED_NOW=false
+  if [ -n "$KIND" ] && gh api "/repos/${OWNER}/${NAME}/contents/.github/workflows/ci.yml?ref=${BRANCH}" -q .content 2>/dev/null | base64 -d 2>/dev/null | grep -q "$STANDARD_REPO"; then
+    CI_INSTALLED_NOW=true
+  fi
+  REPROTECT_REPO=""
+  trap reprotect_pending EXIT TERM INT
+
   # ---- A. 運用設定の収束（言語を問わず全リポジトリ） ----
   LBL=$(sync_labels "$NAME")
   SS=$(sync_secret_scanning "$NAME")
@@ -314,6 +343,7 @@ while IFS=$'\t' read -r NAME BRANCH; do
     if ! $UNPROTECTED_FOR_FIX && is_protected "$NAME" "$BRANCH"; then
       if unprotect "$NAME" "$BRANCH"; then
         UNPROTECTED_FOR_FIX=true
+        REPROTECT_REPO="$NAME"; REPROTECT_BRANCH="$BRANCH"; REPROTECT_CONTEXTS="$CONTEXTS"
       fi
     fi
 
@@ -337,7 +367,7 @@ while IFS=$'\t' read -r NAME BRANCH; do
   # 保護は「標準CIが存在する」ことを検証できた場合のみ適用する
   if $INSTALLED; then
     if protect "$NAME" "$BRANCH" "$CONTEXTS"; then
-      STATUS="$STATUS / 保護OK"
+      STATUS="$STATUS / 保護OK"; REPROTECT_REPO=""
     else
       STATUS="$STATUS / 保護不可(private+Free?)"
     fi
@@ -346,3 +376,8 @@ while IFS=$'\t' read -r NAME BRANCH; do
 done
 echo ""
 echo "sweep 完了: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# 失敗の詳細（「ログ参照」の参照先）。Actions ならジョブサマリーにも出す
+if [ -s "$ERRLOG" ]; then
+  echo ""; echo "<details><summary>エラー詳細（$(wc -l < "$ERRLOG" | tr -d ' ') 行）</summary>"; echo ""; echo '```'; cat "$ERRLOG"; echo '```'; echo "</details>"
+fi
+rm -f "$ERRLOG"

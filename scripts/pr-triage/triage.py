@@ -105,8 +105,10 @@ def clean(body):
 
 
 def summarize(text):
-    """表の要旨: 先頭行から絵文字・ショートコード・装飾を落として 120 字"""
+    """表の要旨: 先頭行から絵文字・ショートコード・装飾を落として 120 字。秘密情報らしき値を含む行は伏せる"""
     first = next((ln for ln in text.splitlines() if ln.strip()), "") if text else ""
+    if SECRET_RE.search(first):
+        return "（秘密情報らしき値を含むため要旨を省略）"
     first = re.sub(r":[a-z0-9_+\-]+:", "", first)                 # :stop_sign: 等
     first = re.sub(r"[*_`#]+", " ", first)
     first = re.sub(r"[\U0001F300-\U0001FAFF☀-➿️]", "", first)  # 絵文字
@@ -191,8 +193,12 @@ def main():
             if A["file"] != B["file"]:
                 continue
             same = None
-            if jev_ok and calls < MAX_CALLS and not SECRET_RE.search(A["text"]) and not SECRET_RE.search(B["text"]):
-                if mock:
+            if jev_ok and not SECRET_RE.search(A["text"]) and not SECRET_RE.search(B["text"]):
+                # 上限超過は jev() が記録するが、ここで手前に立つと記録されないので同じ扱いにする
+                if calls >= MAX_CALLS:
+                    if "budget" not in errors:
+                        errors.append("budget")
+                elif mock:
                     same = 0.9 if A.get("line") == B.get("line") else 0.1
                 else:
                     ans = jev(f"Thread A ({A.get('path')}:{A.get('line')}, by {A.get('author')}):\n{A['text'][:3000]}\n\n"
