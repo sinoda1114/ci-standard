@@ -15,11 +15,17 @@ import glob, sys, yaml
 VALID = {
     "branch_protection_rule", "check_run", "check_suite", "create", "delete",
     "deployment", "deployment_status", "discussion", "discussion_comment", "fork",
-    "gollum", "issue_comment", "issues", "label", "merge_group", "milestone",
-    "page_build", "public", "pull_request", "pull_request_comment",
+    "gollum", "image_version", "issue_comment", "issues", "label", "merge_group",
+    "milestone", "page_build", "public", "pull_request",
     "pull_request_review", "pull_request_review_comment", "pull_request_target",
     "push", "registry_package", "release", "repository_dispatch", "schedule",
     "status", "watch", "workflow_call", "workflow_dispatch", "workflow_run",
+}
+
+# よくある取り違え。存在しない名前を書いた理由が分かるよう、正しい名前を添えて落とす。
+ALIASES = {
+    "pull_request_comment": "issue_comment",
+    "pull_request_review_thread": None,  # 代替なし
 }
 
 
@@ -37,7 +43,9 @@ def events(doc):
 
 def main():
     bad = []
-    files = sorted(glob.glob(".github/workflows/*.yml") + glob.glob("templates/*.yml"))
+    # GitHub は .yaml も読む。.yml だけを見ていると見逃す。
+    patterns = [f"{d}/*.{e}" for d in (".github/workflows", "templates") for e in ("yml", "yaml")]
+    files = sorted({f for pat in patterns for f in glob.glob(pat)})
     for f in files:
         try:
             with open(f, encoding="utf-8") as fh:
@@ -48,7 +56,11 @@ def main():
             continue
         for ev in events(doc):
             if ev not in VALID:
-                print(f"NG {f}: '{ev}' は GitHub Actions のイベントとして存在しない")
+                hint = ""
+                if ev in ALIASES:
+                    correct = ALIASES[ev]
+                    hint = f"（{correct} を使う）" if correct else "（代替となるイベントは無い）"
+                print(f"NG {f}: '{ev}' は GitHub Actions のイベントとして存在しない{hint}")
                 bad.append(f)
     if bad:
         print(f"\n{len(bad)} 件の不正なトリガーがあります。配布すると全リポジトリのワークフローが壊れます。")
