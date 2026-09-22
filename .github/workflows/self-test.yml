@@ -28,6 +28,11 @@ jobs:
         # 2026-09-21 に pull_request_review_thread を配布して全リポジトリを止めた再発防止。
         run: python3 scripts/validate-triggers.py
 
+      - name: トリガー検証の単体テスト
+        # ゲート自身が壊れて常に成功を返しても気付けないため、
+        # 「壊れた入力を確実に落とす」ことをテストで担保する。
+        run: python3 -m unittest discover -s scripts -p 'test_validate_triggers.py' -v
+
       - name: pr-triage 単体テスト
         run: python3 -m unittest discover -s scripts/pr-triage -v
       - name: sweep.sh スモーク（gh スタブ。bash -n では未定義変数などの実行時エラーを検出できない）
