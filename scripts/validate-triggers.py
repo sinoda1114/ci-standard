@@ -40,7 +40,8 @@ def main():
     files = sorted(glob.glob(".github/workflows/*.yml") + glob.glob("templates/*.yml"))
     for f in files:
         try:
-            doc = yaml.safe_load(open(f))
+            with open(f, encoding="utf-8") as fh:
+                doc = yaml.safe_load(fh)
         except Exception as e:
             print(f"NG {f}: YAML として読めない: {e}")
             bad.append(f)
