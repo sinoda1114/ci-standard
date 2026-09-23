@@ -33,6 +33,7 @@ case "$1" in
       *"-X PATCH"*|*"-X POST"*)              exit 0;;
       "pr list"*"--head "*"--state open"*)    # そのブランチの open PR 数（pr create で記録した head 名を数える）
         H=\$(printf '%s' "\$A" | sed -E 's/.*--head ([^ ]+).*/\\1/'); n=\$(grep -cx "PR \$H" "\$STATE" 2>/dev/null); echo "\${n:-0}"; exit 0;;
+      "pr list"*"--state closed"*"--limit"*) [ -f "$STUB/rejected" ] && echo 1 || echo 0; exit 0;;   # 新規導入時: 同じファイルの過去の却下
       "pr list"*)                            echo 0; exit 0;;
       "pr create"*)                          H=\$(printf '%s' "\$A" | sed -E 's/.*--head ([^ ]+).*/\\1/'); echo "PR \$H" >> "\$STATE"; exit 0;;
       *)                                     exit 0;;
@@ -70,8 +71,13 @@ mk_stub fail;  PATH="$STUB:$PATH" bash scripts/sweep.sh > "$STUB/out" 2>&1; chec
 mk_stub one;   PATH="$STUB:$PATH" bash scripts/sweep.sh > "$STUB/out" 2>&1; check "1 件処理して正常終了" 0 $? "| smoke-repo |"
 mk_stub reprotect; PATH="$STUB:$PATH" TYPESAFE_API_KEY=dummy bash scripts/sweep.sh > "$STUB/out" 2>&1; rc=$?
 check "解除して配布し CI 取得失敗でも正常終了" 0 $rc "配布(保護を一時解除)"
+check "骨格ファイルも配布される" 0 $rc "骨格:AGENTS:配布 CLAUDE:配布 issue:配布"
 if [ "$(tail -1 "$STUB/state")" = PROTECTED ] && grep -q "保護を再適用" "$STUB/out"; then echo "ok   CI 状態取得失敗の後に保護が戻る"; else echo "FAIL 保護が戻らない: state=$(tr '\n' ' ' < "$STUB/state")"; sed -n '1,30p' "$STUB/out"; fail=1; fi
 mk_stub prpath; PATH="$STUB:$PATH" bash scripts/sweep.sh > "$STUB/out" 2>&1; check "手動保護では PR を作る" 0 $? "dependabot:PR作成 / pr-triage:PR作成"
 PATH="$STUB:$PATH" bash scripts/sweep.sh > "$STUB/out" 2>&1; check "2 回目は PR済み（作り直さない）" 0 $? "dependabot:PR済み / pr-triage:PR済み"
+check "手動保護では骨格は PR にせず見送る" 0 0 "骨格:AGENTS:保護のため見送り CLAUDE:保護のため見送り issue:保護のため見送り"
 if [ "$(grep -c '^PR ' "$STUB/state")" = 2 ]; then echo "ok   PR は 2 本（dependabot / pr-triage）だけ作られた"; else echo "FAIL PR 作成回数=$(grep -c '^PR ' "$STUB/state")"; cat "$STUB/state"; fail=1; fi
+mk_stub prpath; touch "$STUB/rejected"; PATH="$STUB:$PATH" bash scripts/sweep.sh > "$STUB/out" 2>&1
+check "人が断った新規導入は内容が変わっても再提案しない" 0 $? "dependabot:PR却下済み / pr-triage:PR却下済み"
+rm -f "$STUB/rejected"
 exit $fail

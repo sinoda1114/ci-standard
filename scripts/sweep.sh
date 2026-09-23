@@ -10,6 +10,8 @@
 #   3. Secret scanning / push protection の有効化（public は無料）
 #   4. Dependabot 設定ファイルの配布
 #   5. PR Bot コメント仕分け（pr-triage 呼び出しワークフロー）の配布と TYPESAFE_API_KEY の配布
+#   6. 骨格ファイル（AGENTS.md / CLAUDE.md / Issue テンプレ）が無ければ置く（templates/skeleton/）。
+#      印の行が残っている間だけ雛形に収束させ、印を消せば以後触らない。保護で直接置けないリポジトリには PR を作らず見送る
 #
 # 保護の復旧（reprotect_pending）: 一時解除したら REPROTECT_* に積み、各リポジトリの末尾・次のリポジトリの先頭・
 #   スクリプトの EXIT / シグナルで protect() を掛け直す。戻せなければ末尾で非ゼロ終了する
@@ -123,7 +125,11 @@ deliver_file() {
     fi
     # unprotect が非ゼロでも予約は残す（DELETE がサーバー側で通った後に応答が落ちることがある。protect は冪等なので掛け直して害はない）
   fi
-  open_pr_with_file "$R" "$B" "$P" "$M" "$C"
+  # NO_PR=true の呼び出し（骨格ファイル）は PR を作らない。価値の低いファイルのために人の手を煩わせない
+  if [ "${NO_PR:-false}" = true ]; then DELIVER="保護のため見送り"; return 0; fi
+  # sha が無い = 既定ブランチにまだ無いファイル（新規導入）。却下判定の範囲を変える
+  local IS_NEW=false; [ -z "$S" ] && IS_NEW=true
+  IS_NEW=$IS_NEW open_pr_with_file "$R" "$B" "$P" "$M" "$C"
 }
 
 open_pr_with_file() { # open_pr_with_file <repo> <base> <path> <message> <content> → DELIVER="PR作成" / "PR済み" / "失敗"
@@ -135,9 +141,19 @@ open_pr_with_file() { # open_pr_with_file <repo> <base> <path> <message> <conten
   # 取得に失敗した日は配布を見送る（0 件と区別しないと、却下済み PR を作り直してしまう）
   OPEN=$(gh pr list -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --state open --json number -q 'length' 2>>"$ERRLOG") || { DELIVER="PR状態の取得に失敗"; return 1; }
   if [ "${OPEN:-0}" -gt 0 ]; then supersede_old_prs "$R" "$B" "$P" "$SLUG"; DELIVER="PR済み"; return 0; fi   # 前回閉じ損ねた旧 PR があれば再試行
-  # 却下 = 人がマージせずに閉じた PR。sweeper 自身が置き換えで閉じたもの（本文に SUPERSEDED_MARK）は数えない
-  REJECTED=$(gh pr list -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --state closed --json mergedAt,body \
-               -q "[.[]|select(.mergedAt==null)|select((.body // \"\")|contains(\"${SUPERSEDED_MARK}\")|not)]|length" 2>>"$ERRLOG") || { DELIVER="PR状態の取得に失敗"; return 1; }
+  # 却下 = 人がマージせずに閉じた PR。sweeper 自身が置き換えで閉じたもの（本文に SUPERSEDED_MARK）は数えない。
+  # 範囲: まだ既定ブランチに無いファイル（新規導入）なら、中身に関係なくそのファイルの sweeper PR 全部を見る
+  #   （人が「このリポジトリには要らない」と断った機能を、雛形が変わるたびに再提案しない）。
+  #   既にあるファイルの更新なら、その内容の PR だけを見る（雛形の改善は届け続ける）
+  local PREFIX_ALL
+  PREFIX_ALL="sweeper/$(basename "$P" | sed 's/\.[^.]*$//')-"
+  if [ "${IS_NEW:-false}" = true ]; then
+    REJECTED=$(gh pr list -R "${OWNER}/${R}" --base "$B" --state closed --limit 100 --json headRefName,mergedAt,body \
+                 -q "[.[]|select(.headRefName|startswith(\"${PREFIX_ALL}\"))|select(.mergedAt==null)|select((.body // \"\")|contains(\"${SUPERSEDED_MARK}\")|not)]|length" 2>>"$ERRLOG") || { DELIVER="PR状態の取得に失敗"; return 1; }
+  else
+    REJECTED=$(gh pr list -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --state closed --json mergedAt,body \
+                 -q "[.[]|select(.mergedAt==null)|select((.body // \"\")|contains(\"${SUPERSEDED_MARK}\")|not)]|length" 2>>"$ERRLOG") || { DELIVER="PR状態の取得に失敗"; return 1; }
+  fi
   if [ "${REJECTED:-0}" -gt 0 ]; then DELIVER="PR却下済み"; return 0; fi
   local CREATED=false
   if ! gh api "/repos/${OWNER}/${R}/git/ref/heads/${SLUG}" >/dev/null 2>&1; then
@@ -351,6 +367,35 @@ sync_pr_triage_secret() { # sync_pr_triage_secret <repo> → PRS="同期" / "キ
   fi
 }
 
+SKEL_DIR="$(dirname "$0")/../templates/skeleton"
+SKEL_MARK="sweeper が配布した骨格"
+
+sync_skeleton() { # sync_skeleton <repo> <branch> <path> <雛形ファイル> → SKEL_RES="既存" / "配布" / "更新" / "保護のため見送り" / "取得失敗" / "失敗" / "雛形なし"
+  # 無ければ置く。あれば、印の行が残っている（= 人が手を入れていない）ときだけ雛形に収束させる
+  local R=$1 B=$2 P=$3 T=$4 WANT J SHA BODY
+  WANT="$(cat "$T" 2>/dev/null || true)"
+  [ -n "$WANT" ] || { SKEL_RES="雛形なし"; return 0; }
+  : > "$GH_STDERR"
+  if J=$(gh api "/repos/${OWNER}/${R}/contents/${P}?ref=${B}" 2>"$GH_STDERR"); then
+    SHA=$(printf '%s' "$J" | jq -r '.sha // empty' 2>/dev/null)
+    BODY=$(printf '%s' "$J" | jq -r '.content // empty' 2>/dev/null | base64 -d 2>/dev/null || true)
+    if [ "$BODY" = "$WANT" ] || ! printf '%s' "$BODY" | grep -q "$SKEL_MARK"; then SKEL_RES="既存"; return 0; fi
+    NO_PR=true deliver_file "$R" "$B" "$P" "chore: ${P} の骨格を更新 [sweeper]" "$WANT" "$SHA"
+    SKEL_RES="$DELIVER"; [ "$SKEL_RES" = "配布" ] && SKEL_RES="更新"; return 0
+  fi
+  grep -q 'HTTP 404' "$GH_STDERR" || { SKEL_RES="取得失敗"; return 0; }
+  NO_PR=true deliver_file "$R" "$B" "$P" "chore: ${P} の骨格を配布 [sweeper]" "$WANT"
+  SKEL_RES="$DELIVER"; return 0
+}
+
+sync_skeletons() { # sync_skeletons <repo> <branch> → SKL="AGENTS:配布 CLAUDE:既存 issue:配布" の形
+  local R=$1 B=$2
+  sync_skeleton "$R" "$B" "AGENTS.md" "$SKEL_DIR/AGENTS.md"; local A="$SKEL_RES"
+  sync_skeleton "$R" "$B" "CLAUDE.md" "$SKEL_DIR/CLAUDE.md"; local C="$SKEL_RES"
+  sync_skeleton "$R" "$B" ".github/ISSUE_TEMPLATE/task.yml" "$SKEL_DIR/task.yml"; local I="$SKEL_RES"
+  SKL="AGENTS:${A} CLAUDE:${C} issue:${I}"
+}
+
 standard_ci_body() { # standard_ci_body <kind> <branch>
   cat <<EOF
 # 標準CI呼び出し（実体: https://github.com/${STANDARD_REPO}）
@@ -434,7 +479,8 @@ while IFS=$'\t' read -r NAME BRANCH <&3; do   # 一覧は fd 3 から読む（�
     esac
   fi
   cleanup_sweeper_branches "$NAME"         # 閉じた/マージ済み sweeper PR のブランチを掃除（却下の記録は閉じた PR 自体に残る）
-  OPS="ラベル:${LBL} / scanning:${SS} / dependabot:${DEP} / pr-triage:${PRT}(secret:${PRS})"
+  sync_skeletons "$NAME" "$BRANCH"         # → SKL
+  OPS="ラベル:${LBL} / scanning:${SS} / dependabot:${DEP} / pr-triage:${PRT}(secret:${PRS}) / 骨格:${SKL}"
 
   # ---- B. CI/CD（Node/Python のみ） ----
   if $KIND_ERR; then

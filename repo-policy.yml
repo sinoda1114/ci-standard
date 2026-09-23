@@ -51,6 +51,13 @@ settings:
   # Bot のいないリポジトリでは起動条件（Bot のレビュー）を満たさないので何も起きない。
   pr_triage: true
 
+  # 骨格ファイル（templates/skeleton/: AGENTS.md / CLAUDE.md / .github/ISSUE_TEMPLATE/task.yml）が無ければ置く。
+  # どのツール（Claude Code / Codex / Cursor / 手作業）で作ったリポジトリにも、翌朝には運用ルールの入口が入る。
+  # 先頭の印の行が残っている間だけ雛形に収束させ、固有値を埋めて印を消せば以後触らない。
+  # 保護で直接置けないリポジトリには PR を作らず見送る（価値の低いファイルで人の手を煩わせない）。
+  # .npmrc（ignore-scripts=true）は配らない: 既存リポジトリのネイティブビルドを壊しうるため。新規は claude-project-starter で入る
+  skeleton: true
+
 
 # 型から意図的に除外するもの（理由を明記して、再検討時の判断材料にする）
 excluded:
