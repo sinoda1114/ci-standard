@@ -135,7 +135,7 @@ jobs:
           # lockfile はコミット対象という方針のため、無い場合は警告で是正を促す。
           ignored_builds_help() {
             echo "::error::pnpm の install に失敗しました。ERR_PNPM_IGNORED_BUILDS なら、リポジトリの pnpm-workspace.yaml に allowBuilds を書いてください。"
-            echo "::notice::例）allowBuilds:\n  sharp: false\n  unrs-resolver: false  # prebuilt があるのでソースビルドは不要"
+            echo "::notice::例）allowBuilds:%0A  sharp: false%0A  unrs-resolver: false  # prebuilt があるのでソースビルドは不要"
             echo "::notice::ビルドが本当に必要なパッケージだけ true にしてください。.npmrc の ignore-scripts=true は外さないこと（postinstall 経由の供給網攻撃を防ぐ要）。"
           }
           case "$PM" in
@@ -256,7 +256,7 @@ jobs:
           # lockfile はコミット対象という方針のため、無い場合は警告で是正を促す。
           ignored_builds_help() {
             echo "::error::pnpm の install に失敗しました。ERR_PNPM_IGNORED_BUILDS なら、リポジトリの pnpm-workspace.yaml に allowBuilds を書いてください。"
-            echo "::notice::例）allowBuilds:\n  sharp: false\n  unrs-resolver: false  # prebuilt があるのでソースビルドは不要"
+            echo "::notice::例）allowBuilds:%0A  sharp: false%0A  unrs-resolver: false  # prebuilt があるのでソースビルドは不要"
             echo "::notice::ビルドが本当に必要なパッケージだけ true にしてください。.npmrc の ignore-scripts=true は外さないこと（postinstall 経由の供給網攻撃を防ぐ要）。"
           }
           case "$PM" in

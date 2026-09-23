@@ -37,3 +37,5 @@ jobs:
         run: python3 -m unittest discover -s scripts/pr-triage -v
       - name: sweep.sh スモーク（gh スタブ。bash -n では未定義変数などの実行時エラーを検出できない）
         run: bash scripts/test-sweep-smoke.sh
+      - name: health-watch.sh スモーク（gh スタブ。確認できなかったものを OK と報告しないことを見る）
+        run: bash scripts/test-health-smoke.sh

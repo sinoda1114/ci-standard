@@ -9,8 +9,9 @@
 # 毎朝、全リポジトリの既定ブランチの最新 CI 結論と未解決の脆弱性アラートを集め、
 # 問題があれば ci-standard に Issue を 1 本立てる（同一タイトルのオープン Issue があれば更新）。
 #
-# 必要セットアップ: sweeper と同じ ADMIN_TOKEN（fine-grained PAT）。
-# Security events: RO があれば脆弱性アラートも読める（無ければ CI 結論だけを見る）。
+# 必要セットアップ: sweeper と同じ ADMIN_TOKEN（fine-grained PAT）に、次の読み取り権限を足す。
+#   Actions: read（CI の結論）/ Dependabot alerts: read（脆弱性アラート）
+# 権限が足りないと「確認できなかった」として Issue に載る（黙って OK にはしない）。
 
 name: health
 
@@ -22,6 +23,11 @@ on:
 permissions:
   contents: read
   issues: write
+
+# schedule と手動実行が重なると、両方が「既存 Issue なし」を見て Issue を二重に立てる
+concurrency:
+  group: health
+  cancel-in-progress: false
 
 jobs:
   watch:
