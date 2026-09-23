@@ -106,6 +106,20 @@ Reusable Workflow）が Bot のレビュー投稿をきっかけに起動し、3
 スクリプトは `scripts/pr-triage/`（正本は `~/.claude/skills/pr-triage/scripts/`）。測定根拠は PR #95/#102 で
 ペアリング一致 98.6% / 96.6%。費用は 1 PR あたり 1 円未満。
 
+## CI 健全性の見回り（health）
+
+`.github/workflows/health.yml` が毎朝 07:30 JST に全リポジトリを読み、
+**既定ブランチの最新 CI が赤のまま**のものと **critical / high の未解決アラート**を
+1 本の Issue にまとめる（全部緑になれば自動クローズ）。何も変更しない（読むだけ）。
+
+作った理由: CI は push が無いと走らない。休眠リポジトリでは依存だけが古くなり、
+たまに sweeper の配布 push で CI が走って赤くなっても、誰も見ないまま残る。
+2026-09-22 の棚卸しで **14 リポジトリ中 8 つが赤のまま放置**され、うち 4 つは
+`npm audit` が critical/high を検出して落ちていた（Next.js の未認証 RCE を含む）。
+ゲートは正しく働いていたが、気付く経路が無かった。
+
+動作確認は `ONLY="repo-a repo-b" bash scripts/health-watch.sh` でリポジトリを絞れる。
+
 ## 制約
 
 - **private リポジトリのブランチ保護は GitHub Free では設定不可**（403）。CI 自体は動くため、
