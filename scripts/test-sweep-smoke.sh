@@ -82,12 +82,13 @@ check "手動保護では骨格は PR にせず見送る" 0 $rc "骨格:AGENTS:�
 if [ "$(grep -c '^PR ' "$STUB/state")" = 2 ]; then echo "ok   PR は 2 本（dependabot / pr-triage）だけ作られた"; else echo "FAIL PR 作成回数=$(grep -c '^PR ' "$STUB/state")"; cat "$STUB/state"; fail=1; fi
 closed_pr() { # closed_pr <head> <closed_at> <本文> <ラベル名 or 空>
   local lab=""; [ -n "$4" ] && lab="{\"name\":\"$4\"}"
-  printf '{"head":{"ref":"%s"},"merged_at":null,"closed_at":"%s","body":"%s","labels":[%s]}' "$1" "$2" "$3" "$lab"
+  printf '{"head":{"ref":"%s","repo":{"full_name":"%s"}},"merged_at":null,"closed_at":"%s","body":"%s","labels":[%s]}' "$1" "${5:-sinoda1114/manual}" "$2" "$3" "$lab"
 }
 # 人が断った（印無し・印導入後に閉じた）旧内容の PR
 printf '[%s,%s]' "$(closed_pr sweeper/pr-triage-00000000 2026-09-22T00:00:00Z '' '')" "$(closed_pr sweeper/dependabot-00000000 2026-09-22T00:00:00Z '' '')" > "$STUB/closed.json"
 mk_stub prpath; PATH="$STUB:$PATH" bash scripts/sweep.sh < /dev/null > "$STUB/out" 2>&1
 check "人が断った新規導入は内容が変わっても再提案しない" 0 $? "dependabot:PR却下済み / pr-triage:PR却下済み"
+printf '[%s,%s]' "$(closed_pr sweeper/pr-triage-00000000 2026-09-22T00:00:00Z '' '' sinoda1114/smoke)" "$(closed_pr sweeper/dependabot-00000000 2026-09-22T00:00:00Z '' '' sinoda1114/smoke)" > "$STUB/closed.json"
 mk_stub reprotect; PATH="$STUB:$PATH" TYPESAFE_API_KEY=dummy bash scripts/sweep.sh < /dev/null > "$STUB/out" 2>&1
 check "保護を外せるリポジトリでも、断られた新規導入は直接置かない" 0 $? "dependabot:PR却下済み / pr-triage:PR却下済み"
 # sweeper 自身が閉じた PR（印の導入前・印無し / ラベル付き / 本文に印）は却下として数えない
@@ -96,6 +97,10 @@ printf '[%s,%s,%s]' "$(closed_pr sweeper/pr-triage-00000000 2026-09-21T07:41:00Z
   "$(closed_pr sweeper/dependabot-11111111 2026-09-22T00:00:00Z '[sweeper-superseded] 置き換え' '')" > "$STUB/closed.json"
 mk_stub prpath; PATH="$STUB:$PATH" bash scripts/sweep.sh < /dev/null > "$STUB/out" 2>&1
 check "sweeper 自身の置き換え（印の導入前・ラベル・本文の印）は却下と数えない" 0 $? "dependabot:PR作成 / pr-triage:PR作成"
+# フォークからの同名 PR（第三者が開いて閉じた）は却下として数えない
+printf '[%s,%s]' "$(closed_pr sweeper/pr-triage-00000000 2026-09-22T00:00:00Z '' '' someone/manual)" "$(closed_pr sweeper/dependabot-00000000 2026-09-22T00:00:00Z '' '' someone/manual)" > "$STUB/closed.json"
+mk_stub prpath; PATH="$STUB:$PATH" bash scripts/sweep.sh < /dev/null > "$STUB/out" 2>&1
+check "フォークからの同名 PR は却下と数えない" 0 $? "dependabot:PR作成 / pr-triage:PR作成"
 rm -f "$STUB/closed.json"
 mk_stub reprotect; touch "$STUB/has-agents"; PATH="$STUB:$PATH" TYPESAFE_API_KEY=dummy bash scripts/sweep.sh < /dev/null > "$STUB/out" 2>&1
 check "既にある AGENTS.md は中身に関係なく触らない" 0 $? "骨格:AGENTS:既存 CLAUDE:"

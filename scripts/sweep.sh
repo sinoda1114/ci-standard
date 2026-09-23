@@ -120,8 +120,9 @@ rejected_count() { # rejected_count <repo> <base> <prefix> [<slug>] → 件数�
   # slug を渡せばその内容の PR だけ、渡さなければ prefix（= そのファイル）の PR 全部を見る。全ページを見る
   local R=$1 B=$2 PFX=$3 SLUG=${4:-} J
   J=$(gh api --paginate "/repos/${OWNER}/${R}/pulls?state=closed&base=${B}&per_page=100" 2>>"$ERRLOG") || return 1
-  printf '%s' "$J" | jq -s --arg pfx "$PFX" --arg slug "$SLUG" --arg mark "$SUPERSEDED_MARK" --arg label "$SUPERSEDED_LABEL" --arg since "$REJECT_SINCE" '
+  printf '%s' "$J" | jq -s --arg pfx "$PFX" --arg slug "$SLUG" --arg mark "$SUPERSEDED_MARK" --arg label "$SUPERSEDED_LABEL" --arg since "$REJECT_SINCE" --arg repo "${OWNER}/${R}" '
     [ .[][]
+      | select(.head.repo.full_name? == $repo)   # sweeper が作るのは同じリポジトリのブランチだけ。フォークからの同名 PR は数えない（第三者が配布を止められないように）
       | select(if $slug != "" then .head.ref == $slug else (.head.ref | startswith($pfx)) end)
       | select(.merged_at == null)
       | select((.closed_at // "") >= $since)

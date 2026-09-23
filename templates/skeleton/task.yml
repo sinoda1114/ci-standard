@@ -39,7 +39,7 @@ body:
       value: |
         - [ ] 期待する表示/挙動になっている
         - [ ] 対象外画面へ波及していない
-        - [ ] tsc / lint / 関連テストが通る
+        - [ ] 型検査・lint・関連テストが通る
         - [ ] PR を作成して Issue と紐付ける（Refs/Closes #N）
         - [ ] Production 反映後に確認する
     validations:
