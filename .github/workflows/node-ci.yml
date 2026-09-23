@@ -133,10 +133,21 @@ jobs:
         run: |
           # lockfile があれば厳格（再現性優先）、無ければ警告して通常インストール（CIを詰まらせない）。
           # lockfile はコミット対象という方針のため、無い場合は警告で是正を促す。
+          ignored_builds_help() {
+            echo "::error::pnpm の install に失敗しました。ERR_PNPM_IGNORED_BUILDS なら、リポジトリの pnpm-workspace.yaml に allowBuilds を書いてください。"
+            echo "::notice::例）allowBuilds:%0A  sharp: false%0A  unrs-resolver: false  # prebuilt があるのでソースビルドは不要"
+            echo "::notice::ビルドが本当に必要なパッケージだけ true にしてください。.npmrc の ignore-scripts=true は外さないこと（postinstall 経由の供給網攻撃を防ぐ要）。"
+          }
           case "$PM" in
             pnpm)
-              if [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile --config.strict-dep-builds=false
-              else echo "::warning::pnpm-lock.yaml が無いためロック無しインストール（lockfile のコミットを推奨）"; pnpm install --config.strict-dep-builds=false; fi ;;
+              # pnpm 10 以降、ビルドスクリプトを持つ依存は「許可するか」を明示しないと
+              # ERR_PNPM_IGNORED_BUILDS で install ごと落ちる（.npmrc の ignore-scripts=true と組み合わさるため）。
+              # 旧 --config.strict-dep-builds=false は pnpm 12 で効かない（2026-09-22 に 12.5.1 で実測）。
+              # 回避策は CLI・環境変数・package.json のいずれにも無く、リポジトリ側の
+              # pnpm-workspace.yaml に allowBuilds で各パッケージの可否を書くしかない。
+              # 落ちたときに何をすればよいかをログに出す（原因が分からないまま赤くしない）。
+              if [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile || { ignored_builds_help; exit 1; }
+              else echo "::warning::pnpm-lock.yaml が無いためロック無しインストール（lockfile のコミットを推奨）"; pnpm install || { ignored_builds_help; exit 1; }; fi ;;
             yarn)
               if [ -f yarn.lock ]; then corepack yarn install --immutable || yarn install --frozen-lockfile
               else echo "::warning::yarn.lock が無いためロック無しインストール（lockfile のコミットを推奨）"; yarn install; fi ;;
@@ -243,10 +254,21 @@ jobs:
         run: |
           # lockfile があれば厳格（再現性優先）、無ければ警告して通常インストール（CIを詰まらせない）。
           # lockfile はコミット対象という方針のため、無い場合は警告で是正を促す。
+          ignored_builds_help() {
+            echo "::error::pnpm の install に失敗しました。ERR_PNPM_IGNORED_BUILDS なら、リポジトリの pnpm-workspace.yaml に allowBuilds を書いてください。"
+            echo "::notice::例）allowBuilds:%0A  sharp: false%0A  unrs-resolver: false  # prebuilt があるのでソースビルドは不要"
+            echo "::notice::ビルドが本当に必要なパッケージだけ true にしてください。.npmrc の ignore-scripts=true は外さないこと（postinstall 経由の供給網攻撃を防ぐ要）。"
+          }
           case "$PM" in
             pnpm)
-              if [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile --config.strict-dep-builds=false
-              else echo "::warning::pnpm-lock.yaml が無いためロック無しインストール（lockfile のコミットを推奨）"; pnpm install --config.strict-dep-builds=false; fi ;;
+              # pnpm 10 以降、ビルドスクリプトを持つ依存は「許可するか」を明示しないと
+              # ERR_PNPM_IGNORED_BUILDS で install ごと落ちる（.npmrc の ignore-scripts=true と組み合わさるため）。
+              # 旧 --config.strict-dep-builds=false は pnpm 12 で効かない（2026-09-22 に 12.5.1 で実測）。
+              # 回避策は CLI・環境変数・package.json のいずれにも無く、リポジトリ側の
+              # pnpm-workspace.yaml に allowBuilds で各パッケージの可否を書くしかない。
+              # 落ちたときに何をすればよいかをログに出す（原因が分からないまま赤くしない）。
+              if [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile || { ignored_builds_help; exit 1; }
+              else echo "::warning::pnpm-lock.yaml が無いためロック無しインストール（lockfile のコミットを推奨）"; pnpm install || { ignored_builds_help; exit 1; }; fi ;;
             yarn)
               if [ -f yarn.lock ]; then corepack yarn install --immutable || yarn install --frozen-lockfile
               else echo "::warning::yarn.lock が無いためロック無しインストール（lockfile のコミットを推奨）"; yarn install; fi ;;

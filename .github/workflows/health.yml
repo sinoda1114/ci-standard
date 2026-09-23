@@ -1,0 +1,73 @@
+# CI 健全性の見回り（日次）
+#
+# 「CI が赤でも誰も気付かない」を潰すための仕組み。
+# 休眠リポジトリでは push が無いので CI も走らず、依存だけが古くなる。
+# たまに sweeper の配布 push で CI が走って赤くなるが、誰も見ないまま放置される。
+# 2026-09-22 の棚卸しで、14 リポジトリ中 8 つが赤のまま放置され、
+# うち 4 つは npm audit が critical/high を検出して落ちていた（Next.js の未認証 RCE を含む）。
+#
+# 毎朝、全リポジトリの既定ブランチの最新 CI 結論と未解決の脆弱性アラートを集め、
+# 問題があれば ci-standard に Issue を 1 本立てる（同一タイトルのオープン Issue があれば更新）。
+#
+# 必要セットアップ: sweeper と同じ ADMIN_TOKEN（fine-grained PAT）に、次の読み取り権限を足す。
+#   Actions: read（CI の結論）/ Dependabot alerts: read（脆弱性アラート）
+# 権限が足りないと「確認できなかった」として Issue に載る（黙って OK にはしない）。
+
+name: health
+
+on:
+  schedule:
+    - cron: "30 22 * * *"   # 毎日 07:30 JST（sweeper の 06:00 JST より後）
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+# schedule と手動実行が重なると、両方が「既存 Issue なし」を見て Issue を二重に立てる
+concurrency:
+  group: health
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 全リポジトリの CI 結論と脆弱性を集計
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+        run: bash scripts/health-watch.sh > report.md
+
+      - name: 問題があれば Issue を起票・更新
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TITLE="[health] CI が赤のまま放置されているリポジトリがあります"
+          # report.md の 1 行目が "OK" なら問題なし。既存 Issue があればクローズする
+          # 検索（--search）は索引への反映が遅れ、作成直後の再実行で「既存なし」と誤判定して二重に立てる。
+          # 一覧を取ってタイトルを完全一致で比べる
+          NUM=$(TITLE="$TITLE" gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 500 --json number,title \
+                  -q '[.[] | select(.title == env.TITLE)][0].number // empty')
+          if head -1 report.md | grep -q '^OK'; then
+            if [ -n "$NUM" ]; then
+              gh issue close "$NUM" --repo "$GITHUB_REPOSITORY" --comment "全リポジトリの CI が緑になったため自動クローズします。"
+              echo "closed #$NUM"
+            fi
+            echo "問題なし"
+            exit 0
+          fi
+          if [ -n "$NUM" ]; then
+            gh issue edit "$NUM" --repo "$GITHUB_REPOSITORY" --body-file report.md
+            echo "updated #$NUM"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body-file report.md
+            echo "created"
+          fi

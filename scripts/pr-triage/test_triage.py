@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """triage.py の回帰テスト（unittest、外部依存なし）。実行: python3 -m unittest discover -s scripts/pr-triage"""
-import json, os, subprocess, sys, tempfile, unittest
+import json, os, subprocess, sys, tempfile, unittest, urllib.error
+from unittest import mock
 from pathlib import Path
 
 HERE = Path(__file__).parent
@@ -101,6 +102,15 @@ class TriageTests(unittest.TestCase):
         self.assertEqual([t["category"] for t in r["threads"]], ["unknown", "docs"])
         self.assertIn("unknown-choice", r["errors"]); self.assertEqual(r["jev"], "partial")
 
+    def test_repeated_unknown_choice_does_not_push_out_http_error(self):
+        def fake(route, state, questions):
+            if "category" in questions:
+                return {"category": {"choice": "Bug"}, "is_security": {"noul": 0.1}}, None
+            return None, "HTTP 403: error code: 1010"
+        r = self._run_with_call(fake, [th(i, "a.py", i) for i in range(25)])
+        self.assertEqual(r["errors"].count("unknown-choice"), 1)
+        self.assertIn("HTTP 403: error code: 1010", r["errors"])
+
     def test_bool_is_not_a_probability(self):
         bad = ({"category": {"choice": "bug"}, "is_security": {"noul": True}}, None)
         r = self._run_with_call(lambda *a: bad, [th(1, "a.py", 1)])
@@ -140,6 +150,68 @@ class TriageTests(unittest.TestCase):
             p = subprocess.run([sys.executable, str(HERE / "triage.py"), "--threads", str(src), "--out", str(Path(d, "o.json"))],
                                capture_output=True)
             self.assertEqual(p.returncode, 2)
+
+
+class CallHttpTests(unittest.TestCase):
+    KEY = "apikey_" + "A" * 40
+    ROUTE = (KEY, "https://jev.invalid/v1/systemone", "jev-latest")
+
+    def http_error(self, read, code=403):
+        fp = mock.Mock(); fp.read.side_effect = read
+        return urllib.error.HTTPError(self.ROUTE[1], code, "Forbidden", {}, fp)
+
+    def call_with_body(self, body, code=403):
+        with mock.patch("urllib.request.urlopen", side_effect=self.http_error(lambda *a: body, code)):
+            return triage.call(self.ROUTE, "s", {})
+
+    def test_sends_explicit_user_agent(self):
+        resp = mock.MagicMock(); resp.__enter__.return_value.read.return_value = b'{"answers": {}}'
+        with mock.patch("urllib.request.urlopen", return_value=resp) as urlopen:
+            self.assertEqual(triage.call(self.ROUTE, "s", {}), ({}, None))
+        ua = urlopen.call_args.args[0].get_header("User-agent")
+        self.assertEqual(ua, triage.USER_AGENT)
+        self.assertFalse(ua.startswith("Python-urllib"))
+
+    def test_cloudflare_error_code_is_kept(self):
+        self.assertEqual(self.call_with_body(b"error code: 1010\n"), (None, "HTTP 403: error code: 1010"))
+
+    def test_json_error_type_is_kept(self):
+        body = b'{"detail":{"error_type":"authentication_error","message":"Cannot authenticate. key=apikey_XYZ"}}'
+        self.assertEqual(self.call_with_body(body, 401), (None, "HTTP 401: authentication_error"))
+        body = b'{"error":{"message":"add a card","type":"customer_verification_required"}}'
+        self.assertEqual(self.call_with_body(body), (None, "HTTP 403: customer_verification_required"))
+
+    def test_arbitrary_body_never_reaches_the_error(self):
+        # 公開ログに出るので、許可した診断コード以外は何も出さない（伏せ字の漏れを原理的に起こさない）
+        for body in [b"echo " + self.KEY.encode(),
+                     b"-----BEGIN RSA " + b"PRIVATE KEY-----\nMIIE" + b"x" * 40 + b"\n-----END RSA " + b"PRIVATE KEY-----",
+                     b"token ghp_" + b"B" * 36 + b" vck_" + b"C" * 56,
+                     b"a\x1b[31mred\x1b[0m b\x00c",
+                     b" " * 5000 + b"vck_" + b"D" * 56]:
+            self.assertEqual(self.call_with_body(body), (None, "HTTP 403"), body[:40])
+
+    def test_unknown_error_type_value_is_dropped(self):
+        # 形が識別子らしくても、明示した値以外は公開ログに出さない
+        self.assertEqual(self.call_with_body(b'{"type":"internal_database_password"}'), (None, "HTTP 403"))
+
+    def test_close_failure_does_not_escape(self):
+        fp = mock.Mock(); fp.read.return_value = b"error code: 1010"; fp.close.side_effect = OSError("close failed")
+        with mock.patch("urllib.request.urlopen", side_effect=urllib.error.HTTPError(self.ROUTE[1], 403, "F", {}, fp)):
+            self.assertEqual(triage.call(self.ROUTE, "s", {}), (None, "HTTP 403: error code: 1010"))
+
+    def test_unreadable_error_body_falls_back_to_status(self):
+        def stalled(*a):
+            raise TimeoutError("timed out")
+        with mock.patch("urllib.request.urlopen", side_effect=self.http_error(stalled)):
+            self.assertEqual(triage.call(self.ROUTE, "s", {}), (None, "HTTP 403"))
+
+    def test_error_body_read_is_bounded(self):
+        fp = mock.Mock(); fp.read.return_value = b"x"
+        with mock.patch("urllib.request.urlopen", side_effect=urllib.error.HTTPError(self.ROUTE[1], 500, "E", {}, fp)):
+            triage.call(self.ROUTE, "s", {})
+        (limit,), _ = fp.read.call_args
+        self.assertTrue(0 < limit <= 65536)
+        fp.close.assert_called()
 
 
 if __name__ == "__main__":

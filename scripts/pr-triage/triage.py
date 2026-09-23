@@ -23,6 +23,8 @@ from pathlib import Path
 ROUTES = [("TYPESAFE_API_KEY", "https://api.typesafe.ai/v1/systemone", "jev-latest"),
           ("AI_GATEWAY_API_KEY", "https://ai-gateway.vercel.sh/typesafe/v1/systemone", "typesafe-ai/jev")]
 TIMEOUT = 20
+# Cloudflare が urllib 既定の UA（Python-urllib/3.x）を error code 1010 で遮断する（2026-09-23 実測）。
+USER_AGENT = "pr-triage/1 (+https://github.com/sinoda1114/ci-standard)"
 
 
 def _env_int(name, default):
@@ -75,12 +77,37 @@ def load_route():
     return "", "", ""
 
 
+# 公開の Actions ログに出るので、本文そのものは出さず既知の診断コードだけを拾う（許可リスト）。
+# Cloudflare の "error code: NNNN" と、JSON の "type" / "error_type" のうち ERROR_TYPES に含まれる値だけ。
+ERROR_TYPES = {"authentication_error", "permission_error", "invalid_request_error", "not_found_error",
+               "rate_limit_error", "overloaded_error", "api_error", "customer_verification_required"}
+DIAGNOSTIC_RE = re.compile(r'error code: \d{3,5}|"(?:error_)?type"\s*:\s*"([a-z_]{3,40})"')
+
+
+def http_error_detail(e):
+    """HTTPError の応答本文から診断コードを 1 つ返す。無ければ・読めなければ空文字。例外は外へ出さない。"""
+    try:
+        raw = e.read(4096).decode(errors="replace")
+    except Exception:
+        raw = ""
+    try:
+        e.close()
+    except Exception:
+        pass
+    for m in DIAGNOSTIC_RE.finditer(raw):
+        if m.group(1) is None:
+            return m.group(0)
+        if m.group(1) in ERROR_TYPES:
+            return m.group(1)
+    return ""
+
+
 def call(route, state, questions):
-    """JEV を 1 回呼ぶ。(answers, None) か (None, 短いエラー名)。鍵や本文はエラーに含めない。"""
+    """JEV を 1 回呼ぶ。(answers, None) か (None, 短いエラー)。HTTP エラーには本文中の診断コードだけを付ける。"""
     key, ep, model = route
     body = json.dumps({"model": model, "state": state, "questions": questions}).encode()
     req = urllib.request.Request(ep, data=body, method="POST",
-                                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+                                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json", "User-Agent": USER_AGENT})
     for attempt in range(3):
         try:
             with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
@@ -88,7 +115,8 @@ def call(route, state, questions):
         except urllib.error.HTTPError as e:
             if e.code in (429, 529) and attempt < 2:
                 time.sleep(2 ** attempt); continue
-            return None, f"HTTP {e.code}"
+            detail = http_error_detail(e)
+            return None, f"HTTP {e.code}: {detail}" if detail else f"HTTP {e.code}"
         except Exception as e:
             if attempt < 2:
                 time.sleep(2 ** attempt); continue
@@ -208,7 +236,10 @@ def main():
         t["is_security"] = sec
         if c.get("choice") not in CATEGORIES:
             # 形は正しいがラベルが想定外（内容の不一致）。このスレッドだけ unknown にして続ける（遮断しない）
-            errors.append("unknown-choice"); t["category"] = "security" if sec >= 0.7 else "unknown"
+            # 件数分積むと errors[:20] の切り捨てで後続の HTTP エラーを押し出すので 1 回だけ記録する
+            if "unknown-choice" not in errors:
+                errors.append("unknown-choice")
+            t["category"] = "security" if sec >= 0.7 else "unknown"
             continue
         t["category"] = c["choice"]; t["category_conf"] = c.get("confidence")
         if sec >= 0.7:
