@@ -15,6 +15,13 @@ on:
     - cron: "0 21 * * *" # 毎日 06:00 JST
   workflow_dispatch: {}
 
+# 2 本を同時に走らせない（手動起動と定期実行の重なり、手動の二重起動）。
+# 走行中の run はキャンセルしない。ブランチ保護を一時解除した直後に止めると戻らない経路があるため、
+# 後続を待たせて直列にする。待機できるのは 1 本までで、さらに来ると待機中の古い方が置き換わる（未開始なので害はない）。
+concurrency:
+  group: sweeper
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
