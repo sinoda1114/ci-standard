@@ -22,7 +22,7 @@ jobs:
       - name: YAML 構文
         run: |
           python3 -c 'import yaml' 2>/dev/null || python3 -m pip install --quiet --break-system-packages 'pyyaml==6.0.2'
-          python3 -c 'import glob,yaml; [yaml.safe_load(open(f)) for f in glob.glob(".github/workflows/*.yml")+glob.glob("templates/*.yml")]'
+          python3 -c 'import glob,yaml; [yaml.safe_load(open(f)) for f in glob.glob(".github/workflows/*.yml")+glob.glob("templates/*.yml")+glob.glob("templates/skeleton/*.yml")]'
       - name: ワークフローのトリガー名検証
         # YAML として妥当でも、存在しないイベント名は GitHub が構文エラーにする。
         # 2026-09-21 に pull_request_review_thread を配布して全リポジトリを止めた再発防止。

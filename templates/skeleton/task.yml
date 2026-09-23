@@ -1,4 +1,4 @@
-# sweeper が配布した骨格（sinoda1114/ci-standard）。編集したらこの行を消す。消すと sweeper は以後このファイルを触らない
+# sweeper（sinoda1114/ci-standard）が配布した骨格。自由に編集してよい（sweeper は無いときに置くだけで、以後は触らない）
 name: タスク (T-N)
 description: 実装・修正・調査タスク（Issue 正本）
 title: "T-XXX: "

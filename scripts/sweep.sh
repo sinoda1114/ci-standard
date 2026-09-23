@@ -11,7 +11,8 @@
 #   4. Dependabot 設定ファイルの配布
 #   5. PR Bot コメント仕分け（pr-triage 呼び出しワークフロー）の配布と TYPESAFE_API_KEY の配布
 #   6. 骨格ファイル（AGENTS.md / CLAUDE.md / Issue テンプレ）が無ければ置く（templates/skeleton/）。
-#      印の行が残っている間だけ雛形に収束させ、印を消せば以後触らない。保護で直接置けないリポジトリには PR を作らず見送る
+#      置いたら以後触らない（人が埋めた内容を雛形で上書きしないため、収束させない）。
+#      手動保護・ruleset で直接置けないリポジトリには PR を作らず見送る（sweeper 管理の保護は他の配布と同じく一時解除して置く）
 #
 # 保護の復旧（reprotect_pending）: 一時解除したら REPROTECT_* に積み、各リポジトリの末尾・次のリポジトリの先頭・
 #   スクリプトの EXIT / シグナルで protect() を掛け直す。戻せなければ末尾で非ゼロ終了する
@@ -148,8 +149,9 @@ open_pr_with_file() { # open_pr_with_file <repo> <base> <path> <message> <conten
   local PREFIX_ALL
   PREFIX_ALL="sweeper/$(basename "$P" | sed 's/\.[^.]*$//')-"
   if [ "${IS_NEW:-false}" = true ]; then
-    REJECTED=$(gh pr list -R "${OWNER}/${R}" --base "$B" --state closed --limit 100 --json headRefName,mergedAt,body \
-                 -q "[.[]|select(.headRefName|startswith(\"${PREFIX_ALL}\"))|select(.mergedAt==null)|select((.body // \"\")|contains(\"${SUPERSEDED_MARK}\")|not)]|length" 2>>"$ERRLOG") || { DELIVER="PR状態の取得に失敗"; return 1; }
+    # 全ページを見る（--limit で打ち切ると、古い却下が窓から落ちて再提案する）
+    REJECTED=$(gh api --paginate "/repos/${OWNER}/${R}/pulls?state=closed&base=${B}&per_page=100" \
+                 --jq ".[]|select(.head.ref|startswith(\"${PREFIX_ALL}\"))|select(.merged_at==null)|select((.body // \"\")|contains(\"${SUPERSEDED_MARK}\")|not)|.number" 2>>"$ERRLOG" | wc -l | tr -d ' ') || { DELIVER="PR状態の取得に失敗"; return 1; }
   else
     REJECTED=$(gh pr list -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --state closed --json mergedAt,body \
                  -q "[.[]|select(.mergedAt==null)|select((.body // \"\")|contains(\"${SUPERSEDED_MARK}\")|not)]|length" 2>>"$ERRLOG") || { DELIVER="PR状態の取得に失敗"; return 1; }
@@ -368,21 +370,14 @@ sync_pr_triage_secret() { # sync_pr_triage_secret <repo> → PRS="同期" / "キ
 }
 
 SKEL_DIR="$(dirname "$0")/../templates/skeleton"
-SKEL_MARK="sweeper が配布した骨格"
 
-sync_skeleton() { # sync_skeleton <repo> <branch> <path> <雛形ファイル> → SKEL_RES="既存" / "配布" / "更新" / "保護のため見送り" / "取得失敗" / "失敗" / "雛形なし"
-  # 無ければ置く。あれば、印の行が残っている（= 人が手を入れていない）ときだけ雛形に収束させる
-  local R=$1 B=$2 P=$3 T=$4 WANT J SHA BODY
+sync_skeleton() { # sync_skeleton <repo> <branch> <path> <雛形ファイル> → SKEL_RES="既存" / "配布" / "配布(保護を一時解除)" / "保護のため見送り" / "取得失敗" / "失敗" / "雛形なし"
+  # 無ければ置くだけ。あれば中身に関係なく触らない（人が埋めた固有値を雛形で上書きする事故を構造的に無くす）
+  local R=$1 B=$2 P=$3 T=$4 WANT
   WANT="$(cat "$T" 2>/dev/null || true)"
   [ -n "$WANT" ] || { SKEL_RES="雛形なし"; return 0; }
   : > "$GH_STDERR"
-  if J=$(gh api "/repos/${OWNER}/${R}/contents/${P}?ref=${B}" 2>"$GH_STDERR"); then
-    SHA=$(printf '%s' "$J" | jq -r '.sha // empty' 2>/dev/null)
-    BODY=$(printf '%s' "$J" | jq -r '.content // empty' 2>/dev/null | base64 -d 2>/dev/null || true)
-    if [ "$BODY" = "$WANT" ] || ! printf '%s' "$BODY" | grep -q "$SKEL_MARK"; then SKEL_RES="既存"; return 0; fi
-    NO_PR=true deliver_file "$R" "$B" "$P" "chore: ${P} の骨格を更新 [sweeper]" "$WANT" "$SHA"
-    SKEL_RES="$DELIVER"; [ "$SKEL_RES" = "配布" ] && SKEL_RES="更新"; return 0
-  fi
+  if gh api "/repos/${OWNER}/${R}/contents/${P}?ref=${B}" -q .sha >/dev/null 2>"$GH_STDERR"; then SKEL_RES="既存"; return 0; fi
   grep -q 'HTTP 404' "$GH_STDERR" || { SKEL_RES="取得失敗"; return 0; }
   NO_PR=true deliver_file "$R" "$B" "$P" "chore: ${P} の骨格を配布 [sweeper]" "$WANT"
   SKEL_RES="$DELIVER"; return 0
