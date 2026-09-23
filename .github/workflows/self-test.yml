@@ -22,7 +22,9 @@ jobs:
       - name: YAML 構文
         run: |
           python3 -c 'import yaml' 2>/dev/null || python3 -m pip install --quiet --break-system-packages 'pyyaml==6.0.2'
-          python3 -c 'import glob,yaml; [yaml.safe_load(open(f)) for f in glob.glob(".github/workflows/*.yml")+glob.glob("templates/*.yml")]'
+          python3 -c 'import glob,yaml; [yaml.safe_load(open(f)) for f in glob.glob(".github/workflows/*.yml")+glob.glob("templates/*.yml")+glob.glob("templates/skeleton/*.yml")+glob.glob("templates/skeleton/*.yaml")]'
+      - name: 配布する Issue フォームの形（GitHub は形が崩れていると Issue テンプレ画面ごと落とす）
+        run: shopt -s nullglob; python3 scripts/check-issue-forms.py templates/skeleton/*.yml templates/skeleton/*.yaml
       - name: トリガー検証の単体テスト
         # ゲート本体より先に走らせる。ゲート自身が壊れて常に成功を返しても気付けないため、
         # 「壊れた入力を確実に落とす」ことをテストで担保する。

@@ -33,10 +33,16 @@ CIが緑でないと main にマージできない** 状態を作るための中
 | 運用設定 | Secret scanning / push protection の有効化 | 全リポジトリ（public は無料） |
 | 運用設定 | Dependabot 設定の配布（weekly。node: npm + github-actions / python: pip + github-actions / それ以外: github-actions のみ。sweeper 配布分は言語変更に追従） | 全リポジトリ |
 | 運用設定 | PR Bot コメント仕分け（pr-triage 呼び出し + `TYPESAFE_API_KEY`）の配布 | 全リポジトリ（Bot のいる PR でのみ動く） |
+| 運用設定 | 骨格ファイル（`AGENTS.md` / `CLAUDE.md` / Issue テンプレ）が無ければ配置。置いたら以後触らない。人が消したら置き直さない | 全リポジトリ（手動保護・ruleset で置けない所は見送り） |
 | CI/CD | 標準CI呼び出し（ci.yml）の配置 | Node / Python |
 | CI/CD | ブランチ保護（CI必須・会話解決必須・admin含む） | 標準CI導入済みのみ |
 | CI/CD | コード健全性ゲート（Fallow: 未使用コード/重複/複雑度） | Node（既定 report-only） |
 | CI/CD | React アンチパターン検出（React Doctor） | React 系（既定 advisory） |
+
+sweeper の PR（保護リポジトリへの dependabot / pr-triage）を**マージせずに閉じると「このリポジトリには要らない」と記録し、
+以後そのファイルは PR でも直接でも置かない**（保護の有無に関係なく効く）。誤って閉じた場合は、そのファイルの閉じた sweeper PR
+（`sweeper/<名前>-*`）**すべて**にラベル `sweeper-superseded` を付ければ翌朝から再提案される。ラベルが無ければ先に作る:
+`gh label create sweeper-superseded -R sinoda1114/<repo>`（詳細は `repo-policy.yml`）。
 
 **型に入れないもの**（理由は repo-policy.yml の `excluded` を参照）: GitHub Project 板の作成
 （Status カラム定義が Web UI 必須で冪等化できない）、GitHub 既定ラベルの削除（破壊的）、

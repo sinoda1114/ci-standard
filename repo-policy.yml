@@ -51,6 +51,23 @@ settings:
   # Bot のいないリポジトリでは起動条件（Bot のレビュー）を満たさないので何も起きない。
   pr_triage: true
 
+  # ↑ dependabot / pr_triage 共通の、保護ブランチへの届け方と却下の扱い（骨格 skeleton は PR を作らないので対象外）:
+  #   - sweeper 管理の保護（必須チェック ci / build）は一時解除して置き再保護。手動保護・ruleset は sweeper/<name>-<hash8> ブランチ + PR
+  #   - 人がマージせずに閉じた sweeper PR は「このリポジトリには要らない」の意思表示として記録する
+  #       まだ既定ブランチに無いファイル（新規導入）: 雛形の中身が変わっても、保護を外しても、直接にも PR でも置かない
+  #       既にあるファイルの更新: その内容に限って再提案しない（雛形の次の改善は届ける）
+  #   - sweeper 自身が置き換えで閉じた PR は本文の [sweeper-superseded] かラベル sweeper-superseded で区別する。
+  #     印の導入（2026-09-21T11:02Z）より前に閉じた PR は区別できないので数えない
+  #   - 誤って閉じたときの戻し方: そのファイルの閉じた sweeper PR すべてにラベル sweeper-superseded を付ける（翌朝から再提案される）。急ぐなら手でファイルを置く
+
+  # 骨格ファイル（templates/skeleton/: AGENTS.md / CLAUDE.md / .github/ISSUE_TEMPLATE/task.yml）が無ければ置く。
+  # どのツール（Claude Code / Codex / Cursor / 手作業）で作ったリポジトリにも、翌朝には運用ルールの入口が入る。
+  # 置いたら以後触らない（人が埋めた固有値を雛形で上書きしないため、収束の対象にしない）。
+  # 人が消した（そのパスのコミット履歴があるのに今は無い）ファイルは「要らない」として置き直さない。
+  # 手動保護・ruleset で直接置けないリポジトリには PR を作らず見送る（価値の低いファイルで人の手を煩わせない）。
+  # .npmrc（ignore-scripts=true）は配らない: 既存リポジトリのネイティブビルドを壊しうるため。新規は claude-project-starter で入る
+  skeleton: true
+
 
 # 型から意図的に除外するもの（理由を明記して、再検討時の判断材料にする）
 excluded:
