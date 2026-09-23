@@ -48,7 +48,7 @@ def check(path):
             errs.append(f"{path}: body[{i}] に attributes.label が無い")
         if t in ("dropdown", "checkboxes") and not attrs.get("options"):
             errs.append(f"{path}: body[{i}] {t} に options が無い")
-        eid = el.get("id")   # markdown 以外は id 必須（無いと GitHub がフォームを無効にする）
+        eid = el.get("id")   # markdown 以外は id 必須（GitHub 仕様では任意だが、回答を機械的に読むための自分たちの規約）
         if not eid:
             errs.append(f"{path}: body[{i}] {t} に id が無い")
         elif not ID_RE.match(str(eid)):

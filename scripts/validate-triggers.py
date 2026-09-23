@@ -30,6 +30,8 @@ ALIASES = {
 
 
 def events(doc):
+    if not isinstance(doc, dict):   # Issue フォームの配列など、ワークフローでない YAML は対象外
+        return []
     # YAML 1.1 では裸の on: が真偽値 True として読まれる
     on = doc.get("on", doc.get(True))
     if isinstance(on, dict):

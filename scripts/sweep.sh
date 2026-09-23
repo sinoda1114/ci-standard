@@ -167,13 +167,11 @@ deliver_file() {
   fi
   # NO_PR=true の呼び出し（骨格ファイル）は PR を作らない。価値の低いファイルのために人の手を煩わせない
   if [ "${NO_PR:-false}" = true ]; then DELIVER="保護のため見送り"; return 0; fi
-  # sha が無い = 既定ブランチにまだ無いファイル（新規導入）。却下判定の範囲を変える
-  local IS_NEW=false; [ -z "$S" ] && IS_NEW=true
-  IS_NEW=$IS_NEW open_pr_with_file "$R" "$B" "$P" "$M" "$C"
+  open_pr_with_file "$R" "$B" "$P" "$M" "$C"
 }
 
 open_pr_with_file() { # open_pr_with_file <repo> <base> <path> <message> <content> → DELIVER="PR作成" / "PR済み" / "失敗"
-  local R=$1 B=$2 P=$3 M=$4 C=$5 SLUG HEAD BJ BS BC OPEN REJECTED
+  local R=$1 B=$2 P=$3 M=$4 C=$5 SLUG HEAD BJ BS BC OPEN
   # ブランチ名に内容ハッシュを含める: 人が閉じた PR は「その内容」の却下として翌日作り直さないが、
   # 雛形を直して内容が変われば別ブランチで新しい PR が出る
   SLUG="$(pr_slug "$P" "$C")"
@@ -400,7 +398,7 @@ sync_pr_triage_secret() { # sync_pr_triage_secret <repo> → PRS="同期" / "キ
 
 SKEL_DIR="$(dirname "$0")/../templates/skeleton"
 
-sync_skeleton() { # sync_skeleton <repo> <branch> <path> <雛形ファイル> [<存在確認パス>] → SKEL_RES="既存" / "配布" / "配布(保護を一時解除)" / "保護のため見送り" / "取得失敗" / "失敗" / "雛形なし"
+sync_skeleton() { # sync_skeleton <repo> <branch> <path> <雛形ファイル> [<存在確認パス>] → SKEL_RES="既存" / "配布" / "配布(保護を一時解除)" / "保護のため見送り" / "削除済みのため見送り" / "取得失敗" / "失敗" / "雛形なし"
   # 無ければ置くだけ。あれば中身に関係なく触らない（人が埋めた固有値を雛形で上書きする事故を構造的に無くす）。
   # 存在確認パスにディレクトリを渡すと、その中に何かあれば置かない（既に Issue テンプレを整えたリポジトリに選択肢を足さない）
   local R=$1 B=$2 P=$3 T=$4 CHK=${5:-$3} WANT
