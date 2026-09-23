@@ -5,6 +5,8 @@
 #   3) 一覧に 1 件（CI 対象外）→ 行が出て正常終了
 #   4) 保護を一時解除して配布した直後に CI 状態の取得が失敗（HTTP 500）しても、保護が戻る
 #   5) 手動保護（PR 必須）で PUT が 409 → ブランチ + PR を作る。2 回目は PR済み（作り直さない）
+#   6) CodeQL: private の想定内の 403 は黙って「不可」、PAT の権限不足は警告を出して「不可」、
+#      解析できる言語が無ければ「対象外」、未設定なら有効化して「on」
 # 使い方: bash scripts/test-sweep-smoke.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -17,10 +19,14 @@ STATE="$STUB/state"; A="\$*"; echo "\$A" >> "$STUB/calls"
 case "$1" in
   empty) case "\$A" in *"/user/repos"*) exit 0;; esac; exit 1;;
   fail)  case "\$A" in *"/user/repos"*) echo "gh: HTTP 401" >&2; exit 1;; esac; exit 1;;
-  one)   case "\$A" in *"/user/repos"*) printf 'smoke-repo\tmain\n'; exit 0;; *"pulls?state=closed"*) echo '[]'; exit 0;; *"commits?sha="*) echo 0; exit 0;; *"contents/"*) echo "gh: HTTP 404 Not Found" >&2; exit 1;; esac; exit 1;;
+  one)   case "\$A" in *"/user/repos"*) printf 'smoke-repo\tmain\n'; exit 0;; *"pulls?state=closed"*) echo '[]'; exit 0;; *"commits?sha="*) echo 0; exit 0;; *"code-scanning/default-setup"*) echo "gh: Code scanning is not enabled for this repository. Please enable code scanning in the repository settings. (HTTP 403)" >&2; exit 1;; *"contents/"*) echo "gh: HTTP 404 Not Found" >&2; exit 1;; esac; exit 1;;   # private で Advanced Security 無し（実応答の文面）
+  cqperm) case "\$A" in *"/user/repos"*) printf 'smoke-repo\tmain\n'; exit 0;; *"pulls?state=closed"*) echo '[]'; exit 0;; *"commits?sha="*) echo 0; exit 0;; *"code-scanning/default-setup"*) echo "gh: Resource not accessible by personal access token (HTTP 403)" >&2; exit 1;; *"contents/"*) echo "gh: HTTP 404 Not Found" >&2; exit 1;; esac; exit 1;;   # PAT の権限足し忘れ
+  cqpatch) case "\$A" in *"/user/repos"*) printf 'smoke-repo\tmain\n'; exit 0;; *"pulls?state=closed"*) echo '[]'; exit 0;; *"commits?sha="*) echo 0; exit 0;; *"-X PATCH"*"code-scanning"*) echo "gh: Resource not accessible by personal access token (HTTP 403)" >&2; exit 1;; *"code-scanning/default-setup"*) echo '{"state":"not-configured","languages":["javascript-typescript"]}'; exit 0;; *"contents/"*) echo "gh: HTTP 404 Not Found" >&2; exit 1;; esac; exit 1;;   # PAT が Read のみ（GET は通り PATCH が 403）
+  cqnolang) case "\$A" in *"/user/repos"*) printf 'smoke-repo\tmain\n'; exit 0;; *"pulls?state=closed"*) echo '[]'; exit 0;; *"commits?sha="*) echo 0; exit 0;; *"-X PATCH"*"code-scanning"*) echo "gh: HTTP 400" >&2; exit 1;; *"code-scanning/default-setup"*) echo '{"state":"not-configured","languages":[]}'; exit 0;; *"contents/"*) echo "gh: HTTP 404 Not Found" >&2; exit 1;; esac; exit 1;;   # 解析できる言語が無い
   prpath)   # CI 対象外リポジトリ。既定ブランチは PR 必須の手動保護。PR の有無を STATE で追跡
     case "\$A" in
       *"/user/repos"*)                       printf 'manual\tmain\n'; exit 0;;
+      *"code-scanning/default-setup"*)       echo '{"state":"configured","languages":[]}'; exit 0;;
       *"/protection"*)                       exit 1;;                       # sweeper 管理の保護ではない
       *"-X PUT"*"contents/"*"branch=main"*)  echo 'gh: Could not create file: Changes must be made through a pull request. (HTTP 409)' >&2; exit 1;;
       *"-X PUT"*"contents/"*)                exit 0;;                       # sweeper/* ブランチへの PUT
@@ -42,6 +48,8 @@ case "$1" in
   reprotect)
     case "\$A" in
       *"/user/repos"*)                       printf 'smoke\tmain\n'; exit 0;;
+      *"-X PATCH"*"code-scanning/default-setup"*) echo '{"run_id":1}'; exit 0;;
+      *"code-scanning/default-setup"*)       echo '{"state":"not-configured","languages":["javascript-typescript"]}'; exit 0;;
       *"contents/package.json"*)             exit 0;;                       # Node リポジトリ
       *"contents/playwright.config"*)        echo "gh: HTTP 404 Not Found" >&2; exit 1;;
       *"workflows/ci.yml"*" -q .content"*)   printf 'uses: sinoda1114/ci-standard/.github/workflows/node-ci.yml@main\n' | base64; exit 0;;  # 標準CI導入済み
@@ -72,10 +80,21 @@ check() { # check <名前> <期待rc> <実rc> <出力に含むべき語>
 }
 mk_stub empty; PATH="$STUB:$PATH" bash scripts/sweep.sh < /dev/null > "$STUB/out" 2>&1; check "一覧が空で正常終了" 0 $? "sweep 完了"
 mk_stub fail;  PATH="$STUB:$PATH" bash scripts/sweep.sh < /dev/null > "$STUB/out" 2>&1; check "一覧取得失敗で非ゼロ終了" 1 $? "一覧の取得に失敗"
-mk_stub one;   PATH="$STUB:$PATH" bash scripts/sweep.sh < /dev/null > "$STUB/out" 2>&1; check "1 件処理して正常終了" 0 $? "| smoke-repo |"
+mk_stub one;   PATH="$STUB:$PATH" bash scripts/sweep.sh < /dev/null > "$STUB/out" 2>&1; rc=$?
+check "1 件処理して正常終了" 0 $rc "| smoke-repo |"
+check "CodeQL が使えない private は不可と記録して続行" 0 $rc "codeql:不可"
+if grep -q '::warning::.*CodeQL' "$STUB/out"; then echo "FAIL private の想定内の 403 で警告を出した"; sed -n '1,30p' "$STUB/out"; fail=1; else echo "ok   private の想定内の 403 では警告しない"; fi
+mk_stub cqperm; PATH="$STUB:$PATH" bash scripts/sweep.sh < /dev/null > "$STUB/out" 2>&1; rc=$?
+check "PAT の権限不足でも不可と記録して続行" 0 $rc "codeql:不可"
+check "PAT の権限不足は警告で知らせる（黙って不可を並べない）" 0 $rc "::warning::smoke-repo: CodeQL"
+mk_stub cqpatch; PATH="$STUB:$PATH" bash scripts/sweep.sh < /dev/null > "$STUB/out" 2>&1; rc=$?
+check "有効化の失敗は警告で知らせる（PAT が Read のみ）" 0 $rc "::warning::smoke-repo: CodeQL の有効化に失敗"
+mk_stub cqnolang; PATH="$STUB:$PATH" bash scripts/sweep.sh < /dev/null > "$STUB/out" 2>&1; rc=$?
+check "解析できる言語が無ければ対象外（PATCH しない）" 0 $rc "codeql:対象外"
 mk_stub reprotect; PATH="$STUB:$PATH" TYPESAFE_API_KEY=dummy bash scripts/sweep.sh < /dev/null > "$STUB/out" 2>&1; rc=$?
 check "解除して配布し CI 取得失敗でも正常終了" 0 $rc "配布(保護を一時解除)"
 check "骨格ファイルも配布される" 0 $rc "骨格:AGENTS:配布 CLAUDE:配布 issue:配布"
+check "CodeQL が未設定なら有効化する" 0 $rc "codeql:on"
 if [ "$(tail -1 "$STUB/state")" = PROTECTED ] && grep -q "保護を再適用" "$STUB/out"; then echo "ok   CI 状態取得失敗の後に保護が戻る"; else echo "FAIL 保護が戻らない: state=$(tr '\n' ' ' < "$STUB/state")"; sed -n '1,30p' "$STUB/out"; fail=1; fi
 mk_stub prpath; PATH="$STUB:$PATH" bash scripts/sweep.sh < /dev/null > "$STUB/out" 2>&1; check "手動保護では PR を作る" 0 $? "dependabot:PR作成 / pr-triage:PR作成"
 PATH="$STUB:$PATH" bash scripts/sweep.sh < /dev/null > "$STUB/out" 2>&1; rc=$?

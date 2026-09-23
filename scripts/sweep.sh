@@ -329,6 +329,34 @@ EOF
   then echo "on"; else echo "不可"; fi
 }
 
+sync_code_scanning() { # sync_code_scanning <repo> → "on" / "既on" / "対象外" / "不可"
+  # CodeQL default setup（GitHub 純正 SAST）。差分ではなくリポジトリ全体と依存を見る唯一の網。
+  # 必須チェックにはしない（protect() の CONTEXTS に足さない）。検知は Security タブと Actions に出る。
+  # public は無料。private は GitHub Advanced Security が要るため 403 で「不可」になる。
+  local R=$1 J CUR LANGS
+  : > "$GH_STDERR"
+  J=$(gh api "/repos/${OWNER}/${R}/code-scanning/default-setup" 2>"$GH_STDERR") || {
+    # private で Advanced Security が無いと "Code scanning is not enabled for this repository" の 403（想定内）。
+    # それ以外（PAT の権限不足 "Resource not accessible"、障害）は黙らず警告する。
+    # 黙ると PAT の権限を足し忘れても全リポジトリに「不可」が並ぶだけで、誰も気付けない
+    grep -qiE 'not enabled for this repository|advanced security' "$GH_STDERR" \
+      || echo "::warning::${R}: CodeQL 設定の取得に失敗: $(tail -1 "$GH_STDERR" | cut -c1-120)" >&2
+    echo "不可"; return; }
+  CUR=$(printf '%s' "$J" | jq -r '.state // "unknown"' 2>/dev/null)
+  [ "$CUR" = "configured" ] && { echo "既on"; return; }
+  # CodeQL が解析できる言語が 1 つも無いリポジトリ（素の HTML/Markdown 等）では PATCH が 400 を返す。
+  # 事前に languages を見て切り分ける（失敗として ERRLOG を汚さないため）
+  LANGS=$(printf '%s' "$J" | jq -r '(.languages // []) | length' 2>/dev/null)
+  [ "${LANGS:-0}" = 0 ] && { echo "対象外"; return; }
+  # ここまで来たリポジトリは有効化できるはず。失敗は PAT が Read のみ等の設定ミスなので警告する
+  : > "$GH_STDERR"
+  if gh api -X PATCH "/repos/${OWNER}/${R}/code-scanning/default-setup" \
+       -f state=configured >/dev/null 2>"$GH_STDERR"; then echo "on"; return; fi
+  cat "$GH_STDERR" >> "$ERRLOG"
+  echo "::warning::${R}: CodeQL の有効化に失敗: $(tail -1 "$GH_STDERR" | cut -c1-120)" >&2
+  echo "不可"
+}
+
 dependabot_body() { # dependabot_body <kind> : node → npm + github-actions / python → pip + github-actions / それ以外 → github-actions のみ
   local ECO=""
   case "$1" in node) ECO=npm;; python) ECO=pip;; esac
@@ -504,6 +532,7 @@ while IFS=$'\t' read -r NAME BRANCH <&3; do   # 一覧は fd 3 から読む（�
   # ---- A. 運用設定の収束（言語を問わず全リポジトリ） ----
   LBL=$(sync_labels "$NAME")
   SS=$(sync_secret_scanning "$NAME")
+  CQ=$(sync_code_scanning "$NAME")
   sync_dependabot "$NAME" "$BRANCH"        # → DEP（サブシェルにしない: UNPROTECTED_FOR_FIX を親へ伝えるため）
   sync_pr_triage "$NAME" "$BRANCH"         # → PRT
   # 鍵は「標準の呼び出しが既定ブランチにある」リポジトリだけに同期する（今回置いた直後も含む）。
@@ -516,7 +545,7 @@ while IFS=$'\t' read -r NAME BRANCH <&3; do   # 一覧は fd 3 から読む（�
   fi
   cleanup_sweeper_branches "$NAME"         # 閉じた/マージ済み sweeper PR のブランチを掃除（却下の記録は閉じた PR 自体に残る）
   sync_skeletons "$NAME" "$BRANCH"         # → SKL
-  OPS="ラベル:${LBL} / scanning:${SS} / dependabot:${DEP} / pr-triage:${PRT}(secret:${PRS}) / 骨格:${SKL}"
+  OPS="ラベル:${LBL} / scanning:${SS} / codeql:${CQ} / dependabot:${DEP} / pr-triage:${PRT}(secret:${PRS}) / 骨格:${SKL}"
 
   # ---- B. CI/CD（Node/Python のみ） ----
   if $KIND_ERR; then
