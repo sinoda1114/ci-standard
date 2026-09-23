@@ -42,6 +42,12 @@ settings:
   secret_scanning: true
   secret_scanning_push_protection: true
 
+  # CodeQL default setup（GitHub 純正 SAST）を有効化する。
+  # AI レビューと Bot は「差分」しか見ないため、既存コードと依存に潜む脆弱性を見る網がこれだけになる。
+  # 必須チェックにはしない（検知は Security タブに出る。CI を止めない）。
+  # public は無料。private は Advanced Security が要るので GET の時点で 403 になり「不可」と記録して続行する。
+  code_scanning_default_setup: true
+
   # Dependabot 設定ファイルを配布（weekly / ルート。node: npm + github-actions / python: pip + github-actions / それ以外: github-actions のみ）
   dependabot: true
 

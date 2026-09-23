@@ -6,7 +6,8 @@
 #
 # 必要セットアップ（1回だけ）:
 #   fine-grained PAT（All repositories / Contents: RW / Administration: RW / Workflows: RW /
-#   Issues: RW / Pull requests: RW / Secrets: RW）をこのリポジトリの Actions secret `ADMIN_TOKEN` に登録する。
+#   Issues: RW / Pull requests: RW / Secrets: RW / Code scanning alerts: RW）を
+#   このリポジトリの Actions secret `ADMIN_TOKEN` に登録する。
 #   GITHUB_TOKEN では他リポジトリへ書き込めないため PAT が必須。
 name: sweeper
 
@@ -37,7 +38,7 @@ jobs:
           GH_TOKEN: ${{ secrets.ADMIN_TOKEN }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
-            echo "::error::Actions secret ADMIN_TOKEN が未設定です（fine-grained PAT: Contents / Administration / Workflows / Issues / Pull requests / Secrets の RW）"
+            echo "::error::Actions secret ADMIN_TOKEN が未設定です（fine-grained PAT: Contents / Administration / Workflows / Issues / Pull requests / Secrets / Code scanning alerts の RW）"
             exit 1
           fi
 

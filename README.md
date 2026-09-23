@@ -31,6 +31,7 @@ CIが緑でないと main にマージできない** 状態を作るための中
 |---|---|---|
 | 運用設定 | `type:*` ラベル（7種・色/説明の是正含む） | 全リポジトリ |
 | 運用設定 | Secret scanning / push protection の有効化 | 全リポジトリ（public は無料） |
+| 運用設定 | CodeQL default setup（純正 SAST）の有効化 | 全リポジトリ（public は無料 / private は不可） |
 | 運用設定 | Dependabot 設定の配布（weekly。node: npm + github-actions / python: pip + github-actions / それ以外: github-actions のみ。sweeper 配布分は言語変更に追従） | 全リポジトリ |
 | 運用設定 | PR Bot コメント仕分け（pr-triage 呼び出し + `TYPESAFE_API_KEY`）の配布 | 全リポジトリ（Bot のいる PR でのみ動く） |
 | 運用設定 | 骨格ファイル（`AGENTS.md` / `CLAUDE.md` / Issue テンプレ）が無ければ配置。置いたら以後触らない。人が消したら置き直さない | 全リポジトリ（手動保護・ruleset で置けない所は見送り） |
@@ -65,7 +66,8 @@ sweeper の PR（保護リポジトリへの dependabot / pr-triage）を**マ�
 1. fine-grained PAT を作成: Settings → Developer settings → Fine-grained tokens →
    Repository access: **All repositories** / Permissions: **Contents: RW**,
    **Administration: RW**, **Workflows: RW**, **Issues: RW**（ラベル操作に必要）,
-   **Pull requests: RW**（保護ブランチへの配布を PR で届ける）, **Secrets: RW**（`TYPESAFE_API_KEY` の配布）
+   **Pull requests: RW**（保護ブランチへの配布を PR で届ける）, **Secrets: RW**（`TYPESAFE_API_KEY` の配布）,
+   **Code scanning alerts: RW**（CodeQL default setup の有効化）
 2. このリポジトリの Settings → Secrets and variables → Actions に `ADMIN_TOKEN` として登録
 3. Actions タブ → sweeper → Run workflow で初回実行（以後は毎日自動）
 
