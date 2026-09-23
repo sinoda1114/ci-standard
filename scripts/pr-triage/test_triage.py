@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """triage.py の回帰テスト（unittest、外部依存なし）。実行: python3 -m unittest discover -s scripts/pr-triage"""
-import json, os, subprocess, sys, tempfile, unittest
+import json, os, subprocess, sys, tempfile, unittest, urllib.error
+from unittest import mock
 from pathlib import Path
 
 HERE = Path(__file__).parent
@@ -140,6 +141,40 @@ class TriageTests(unittest.TestCase):
             p = subprocess.run([sys.executable, str(HERE / "triage.py"), "--threads", str(src), "--out", str(Path(d, "o.json"))],
                                capture_output=True)
             self.assertEqual(p.returncode, 2)
+
+
+class CallHttpTests(unittest.TestCase):
+    KEY = "apikey_" + "A" * 40
+    ROUTE = (KEY, "https://jev.invalid/v1/systemone", "jev-latest")
+
+    def http_error(self, read):
+        fp = mock.Mock(); fp.read.side_effect = read
+        return urllib.error.HTTPError(self.ROUTE[1], 403, "Forbidden", {}, fp)
+
+    def test_sends_explicit_user_agent(self):
+        resp = mock.MagicMock(); resp.__enter__.return_value.read.return_value = b'{"answers": {}}'
+        with mock.patch("urllib.request.urlopen", return_value=resp) as urlopen:
+            self.assertEqual(triage.call(self.ROUTE, "s", {}), ({}, None))
+        ua = urlopen.call_args.args[0].get_header("User-agent")
+        self.assertEqual(ua, triage.USER_AGENT)
+        self.assertFalse(ua.startswith("Python-urllib"))
+
+    def test_http_error_keeps_body_head(self):
+        with mock.patch("urllib.request.urlopen", side_effect=self.http_error(lambda *a: b"error code: 1010\n")):
+            self.assertEqual(triage.call(self.ROUTE, "s", {}), (None, "HTTP 403: error code: 1010"))
+
+    def test_key_is_masked_before_truncation(self):
+        body = ("x" * 110 + " " + self.KEY + " tail").encode()
+        with mock.patch("urllib.request.urlopen", side_effect=self.http_error(lambda *a: body)):
+            _, err = triage.call(self.ROUTE, "s", {})
+        self.assertTrue(err.startswith("HTTP 403: "))
+        self.assertNotIn("apikey", err)
+
+    def test_unreadable_error_body_falls_back_to_status(self):
+        def stalled(*a):
+            raise TimeoutError("timed out")
+        with mock.patch("urllib.request.urlopen", side_effect=self.http_error(stalled)):
+            self.assertEqual(triage.call(self.ROUTE, "s", {}), (None, "HTTP 403"))
 
 
 if __name__ == "__main__":

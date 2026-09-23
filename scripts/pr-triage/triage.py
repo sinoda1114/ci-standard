@@ -77,8 +77,19 @@ def load_route():
     return "", "", ""
 
 
+def http_error_detail(e, key):
+    """HTTPError の応答本文の先頭 120 文字。鍵は切り詰める前に伏せる。本文が読めなければ空文字。"""
+    try:
+        raw = e.read().decode(errors="replace")
+    except Exception:
+        return ""
+    if key:
+        raw = raw.replace(key, "<key>")
+    return " ".join(raw.split())[:120]
+
+
 def call(route, state, questions):
-    """JEV を 1 回呼ぶ。(answers, None) か (None, 短いエラー名)。鍵や本文はエラーに含めない。"""
+    """JEV を 1 回呼ぶ。(answers, None) か (None, 短いエラー)。HTTP エラーは応答本文の先頭を含める（鍵は伏せる）。"""
     key, ep, model = route
     body = json.dumps({"model": model, "state": state, "questions": questions}).encode()
     req = urllib.request.Request(ep, data=body, method="POST",
@@ -90,7 +101,7 @@ def call(route, state, questions):
         except urllib.error.HTTPError as e:
             if e.code in (429, 529) and attempt < 2:
                 time.sleep(2 ** attempt); continue
-            detail = " ".join(e.read().decode(errors="replace").split())[:120].replace(key, "<key>")
+            detail = http_error_detail(e, key)
             return None, f"HTTP {e.code}: {detail}" if detail else f"HTTP {e.code}"
         except Exception as e:
             if attempt < 2:
