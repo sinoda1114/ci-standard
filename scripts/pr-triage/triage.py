@@ -77,15 +77,24 @@ def load_route():
     return "", "", ""
 
 
+CONTROL_RE = re.compile(r"[\x00-\x08\x0e-\x1f\x7f]")   # ANSI エスケープや NUL をログに流さない
+
+
 def http_error_detail(e, key):
-    """HTTPError の応答本文の先頭 120 文字。鍵と秘密情報らしき値は切り詰める前に伏せる。本文が読めなければ空文字。"""
+    """HTTPError の応答本文の先頭 120 文字。鍵と秘密情報らしき値は伏せ、制御文字は除く。本文が読めなければ空文字。"""
+    limit = 4096 + len(key)
     try:
-        raw = e.read(4096 + len(key)).decode(errors="replace")
+        data = e.read(limit)
     except Exception:
         return ""
+    raw = data.decode(errors="replace")
     if key:
         raw = raw.replace(key, "<key>")
-    return " ".join(SECRET_RE.sub("<redacted>", raw).split())[:120]
+        if len(data) >= limit:
+            # 上限で鍵が途中まで入っていると完全一致で伏せられず、空白を畳むと先頭 120 字へ寄ってくる。末尾を捨てる
+            raw = raw[:-len(key)]
+    raw = SECRET_RE.sub("<redacted>", raw)
+    return " ".join(CONTROL_RE.sub("", raw).split())[:120]
 
 
 def call(route, state, questions):

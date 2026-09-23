@@ -87,8 +87,8 @@ jobs:
             python3 "$S/triage.py" --threads out/threads.json --out out/triage.json --md out/triage.md > /dev/null
             # JEV の失敗理由を CI ログに出す。表の見出しには jev の状態しか出ず、2026-09-23 の遮断（error code 1010）は原因を追えなかった。
             # errors は triage.py が鍵と秘密情報を伏せ、種類ごとに 1 件へまとめ済み。
-            # % はワークフローコマンドのエスケープ文字なので %25 にする。診断用なので失敗しても表の投稿は止めない
-            python3 -c 'import json, sys; sys.stdout.write("".join("::warning::JEV " + e.replace("%", "%25") + "\n" for e in json.load(open("out/triage.json"))["errors"]))' \
+            # %・CR・LF はワークフローコマンドの規定どおりエスケープする。診断用なので失敗しても表の投稿は止めない
+            python3 -c 'import json, sys; sys.stdout.write("".join("::warning::JEV " + e.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A") + "\n" for e in json.load(open("out/triage.json"))["errors"]))' \
               || echo "::warning::JEV のエラー一覧を読めなかった"
           fi
           # 既存の固定コメント（全ページを見る。1 ページだけだと長い PR で二重投稿になる）。

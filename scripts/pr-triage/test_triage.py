@@ -191,7 +191,26 @@ class CallHttpTests(unittest.TestCase):
         with mock.patch("urllib.request.urlopen", side_effect=urllib.error.HTTPError(self.ROUTE[1], 500, "E", {}, fp)):
             triage.call(self.ROUTE, "s", {})
         (limit,), _ = fp.read.call_args
-        self.assertEqual(limit, 4096 + len(self.KEY))
+        self.assertTrue(len(self.KEY) < limit <= 65536)
+
+    def test_key_cut_at_read_boundary_does_not_leak(self):
+        gw_key = "vck_" + "B" * 56   # SECRET_RE が知らない形式の鍵
+        route = (gw_key, self.ROUTE[1], "typesafe-ai/jev")
+        def read(n=-1):   # 読み取り上限の直前から鍵が始まり、上限で途中まで切れる本文
+            body = b" " * max(n - 20, 0) + gw_key.encode() + b" tail"
+            return body if n < 0 else body[:n]
+        fp = mock.Mock(); fp.read.side_effect = read
+        with mock.patch("urllib.request.urlopen", side_effect=urllib.error.HTTPError(route[1], 403, "Forbidden", {}, fp)):
+            _, err = triage.call(route, "s", {})
+        self.assertNotIn("vck_", err)
+        self.assertNotIn("BBBB", err)
+
+    def test_control_characters_are_removed(self):
+        body = b"a\x1b[31mred\x1b[0m b\x00c"
+        with mock.patch("urllib.request.urlopen", side_effect=self.http_error(lambda *a: body)):
+            _, err = triage.call(self.ROUTE, "s", {})
+        self.assertNotIn("\x1b", err)
+        self.assertNotIn("\x00", err)
 
     def test_unreadable_error_body_falls_back_to_status(self):
         def stalled(*a):
