@@ -184,11 +184,20 @@ class CallHttpTests(unittest.TestCase):
     def test_arbitrary_body_never_reaches_the_error(self):
         # 公開ログに出るので、許可した診断コード以外は何も出さない（伏せ字の漏れを原理的に起こさない）
         for body in [b"echo " + self.KEY.encode(),
-                     b"-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----",
+                     b"-----BEGIN RSA " + b"PRIVATE KEY-----\nMIIE" + b"x" * 40 + b"\n-----END RSA " + b"PRIVATE KEY-----",
                      b"token ghp_" + b"B" * 36 + b" vck_" + b"C" * 56,
                      b"a\x1b[31mred\x1b[0m b\x00c",
                      b" " * 5000 + b"vck_" + b"D" * 56]:
             self.assertEqual(self.call_with_body(body), (None, "HTTP 403"), body[:40])
+
+    def test_unknown_error_type_value_is_dropped(self):
+        # 形が識別子らしくても、明示した値以外は公開ログに出さない
+        self.assertEqual(self.call_with_body(b'{"type":"internal_database_password"}'), (None, "HTTP 403"))
+
+    def test_close_failure_does_not_escape(self):
+        fp = mock.Mock(); fp.read.return_value = b"error code: 1010"; fp.close.side_effect = OSError("close failed")
+        with mock.patch("urllib.request.urlopen", side_effect=urllib.error.HTTPError(self.ROUTE[1], 403, "F", {}, fp)):
+            self.assertEqual(triage.call(self.ROUTE, "s", {}), (None, "HTTP 403: error code: 1010"))
 
     def test_unreadable_error_body_falls_back_to_status(self):
         def stalled(*a):

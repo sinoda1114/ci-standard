@@ -78,20 +78,28 @@ def load_route():
 
 
 # 公開の Actions ログに出るので、本文そのものは出さず既知の診断コードだけを拾う（許可リスト）。
-# 例: Cloudflare の "error code: 1010"、JSON の "type" / "error_type"（authentication_error 等）
+# Cloudflare の "error code: NNNN" と、JSON の "type" / "error_type" のうち ERROR_TYPES に含まれる値だけ。
+ERROR_TYPES = {"authentication_error", "permission_error", "invalid_request_error", "not_found_error",
+               "rate_limit_error", "overloaded_error", "api_error", "customer_verification_required"}
 DIAGNOSTIC_RE = re.compile(r'error code: \d{3,5}|"(?:error_)?type"\s*:\s*"([a-z_]{3,40})"')
 
 
 def http_error_detail(e):
-    """HTTPError の応答本文から診断コードを 1 つ返す。無ければ・読めなければ空文字。"""
+    """HTTPError の応答本文から診断コードを 1 つ返す。無ければ・読めなければ空文字。例外は外へ出さない。"""
     try:
         raw = e.read(4096).decode(errors="replace")
     except Exception:
-        return ""
-    finally:
+        raw = ""
+    try:
         e.close()
-    m = DIAGNOSTIC_RE.search(raw)
-    return (m.group(1) or m.group(0)) if m else ""
+    except Exception:
+        pass
+    for m in DIAGNOSTIC_RE.finditer(raw):
+        if m.group(1) is None:
+            return m.group(0)
+        if m.group(1) in ERROR_TYPES:
+            return m.group(1)
+    return ""
 
 
 def call(route, state, questions):
