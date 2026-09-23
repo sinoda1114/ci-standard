@@ -63,6 +63,7 @@ settings:
   # 骨格ファイル（templates/skeleton/: AGENTS.md / CLAUDE.md / .github/ISSUE_TEMPLATE/task.yml）が無ければ置く。
   # どのツール（Claude Code / Codex / Cursor / 手作業）で作ったリポジトリにも、翌朝には運用ルールの入口が入る。
   # 置いたら以後触らない（人が埋めた固有値を雛形で上書きしないため、収束の対象にしない）。
+  # 人が消した（そのパスのコミット履歴があるのに今は無い）ファイルは「要らない」として置き直さない。
   # 手動保護・ruleset で直接置けないリポジトリには PR を作らず見送る（価値の低いファイルで人の手を煩わせない）。
   # .npmrc（ignore-scripts=true）は配らない: 既存リポジトリのネイティブビルドを壊しうるため。新規は claude-project-starter で入る
   skeleton: true

@@ -11,7 +11,7 @@
 #   4. Dependabot 設定ファイルの配布
 #   5. PR Bot コメント仕分け（pr-triage 呼び出しワークフロー）の配布と TYPESAFE_API_KEY の配布
 #   6. 骨格ファイル（AGENTS.md / CLAUDE.md / Issue テンプレ）が無ければ置く（templates/skeleton/）。
-#      置いたら以後触らない（人が埋めた内容を雛形で上書きしないため、収束させない）。
+#      置いたら以後触らない（人が埋めた内容を雛形で上書きしないため、収束させない）。人が消したもの（コミット履歴があるのに無い）は置き直さない。
 #      手動保護・ruleset で直接置けないリポジトリには PR を作らず見送る（sweeper 管理の保護は他の配布と同じく一時解除して置く）
 #
 # 保護の復旧（reprotect_pending）: 一時解除したら REPROTECT_* に積み、各リポジトリの末尾・次のリポジトリの先頭・
@@ -115,6 +115,10 @@ pr_prefix() { # pr_prefix <path> → sweeper/<basename 拡張子なし>-
   printf 'sweeper/%s-' "$(basename "$1" | sed 's/\.[^.]*$//')"
 }
 
+pr_slug() { # pr_slug <path> <content> → sweeper/<basename>-<内容ハッシュ8桁>（その内容の PR のブランチ名）
+  printf '%s%s' "$(pr_prefix "$1")" "$(printf '%s\n' "$2" | shasum | cut -c1-8)"
+}
+
 rejected_count() { # rejected_count <repo> <base> <prefix> [<slug>] → 件数を出力。取得失敗は非ゼロ終了
   # 却下 = マージされずに閉じた sweeper PR のうち、REJECT_SINCE 以降に閉じられ、置き換えの印（本文 or ラベル）が無いもの。
   # slug を渡せばその内容の PR だけ、渡さなければ prefix（= そのファイル）の PR 全部を見る。全ページを見る
@@ -135,8 +139,13 @@ deliver_file() {
   local R=$1 B=$2 P=$3 M=$4 C=$5 S=${6:-} rc N
   # 新規導入（既定ブランチにまだ無いファイル）で、人が過去にそのファイルの sweeper PR を断っていれば、
   # 保護の有無に関係なく置かない（保護を外したリポジトリで直接置いて、断られた機能を入れてしまうのを防ぐ）
-  if [ -z "$S" ] && [ "${NO_PR:-false}" != true ]; then
-    N=$(rejected_count "$R" "$B" "$(pr_prefix "$P")") || { DELIVER="PR状態の取得に失敗"; return 1; }
+  # 既にあるファイルの更新でも、その内容の PR が断られていれば直接も置かない（後から保護を外したリポジトリで、断られた更新を入れない）
+  if [ "${NO_PR:-false}" != true ]; then
+    if [ -z "$S" ]; then
+      N=$(rejected_count "$R" "$B" "$(pr_prefix "$P")") || { DELIVER="PR状態の取得に失敗"; return 1; }
+    else
+      N=$(rejected_count "$R" "$B" "" "$(pr_slug "$P" "$C")") || { DELIVER="PR状態の取得に失敗"; return 1; }
+    fi
     [ "${N:-0}" -gt 0 ] && { DELIVER="PR却下済み"; return 0; }
   fi
   put_file "$R" "$B" "$P" "$M" "$C" "$S"; rc=$?
@@ -167,17 +176,12 @@ open_pr_with_file() { # open_pr_with_file <repo> <base> <path> <message> <conten
   local R=$1 B=$2 P=$3 M=$4 C=$5 SLUG HEAD BJ BS BC OPEN REJECTED
   # ブランチ名に内容ハッシュを含める: 人が閉じた PR は「その内容」の却下として翌日作り直さないが、
   # 雛形を直して内容が変われば別ブランチで新しい PR が出る
-  SLUG="sweeper/$(basename "$P" | sed 's/\.[^.]*$//')-$(printf '%s\n' "$C" | shasum | cut -c1-8)"
+  SLUG="$(pr_slug "$P" "$C")"
   # 先に PR の状態を見る（ブランチを作ってから却下に気づくと、毎日「作成→削除」を往復し配布先の on: push CI を起動してしまう）。
   # 取得に失敗した日は配布を見送る（0 件と区別しないと、却下済み PR を作り直してしまう）
   OPEN=$(gh pr list -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --state open --json number -q 'length' 2>>"$ERRLOG") || { DELIVER="PR状態の取得に失敗"; return 1; }
   if [ "${OPEN:-0}" -gt 0 ]; then supersede_old_prs "$R" "$B" "$P" "$SLUG"; DELIVER="PR済み"; return 0; fi   # 前回閉じ損ねた旧 PR があれば再試行
-  # 却下の確認: 新規導入はそのファイル全体を deliver_file で確認済み。既にあるファイルの更新は、その内容の PR だけを見る
-  # （人が「この更新は要らない」と断った内容は再提案しないが、雛形の次の改善は届ける）
-  if [ "${IS_NEW:-false}" != true ]; then
-    REJECTED=$(rejected_count "$R" "$B" "" "$SLUG") || { DELIVER="PR状態の取得に失敗"; return 1; }
-    if [ "${REJECTED:-0}" -gt 0 ]; then DELIVER="PR却下済み"; return 0; fi
-  fi
+  # 却下の確認は deliver_file の冒頭で済んでいる（新規導入はそのファイル全体、更新はその内容の PR）
   local CREATED=false
   if ! gh api "/repos/${OWNER}/${R}/git/ref/heads/${SLUG}" >/dev/null 2>&1; then
     HEAD=$(gh api "/repos/${OWNER}/${R}/git/ref/heads/${B}" -q .object.sha 2>>"$ERRLOG") || { DELIVER="失敗"; return 1; }
@@ -405,6 +409,10 @@ sync_skeleton() { # sync_skeleton <repo> <branch> <path> <雛形ファイル> [<
   : > "$GH_STDERR"
   if gh api "/repos/${OWNER}/${R}/contents/${CHK}?ref=${B}" -q 'type' >/dev/null 2>"$GH_STDERR"; then SKEL_RES="既存"; return 0; fi
   grep -q 'HTTP 404' "$GH_STDERR" || { SKEL_RES="取得失敗"; return 0; }
+  # 過去にこのパスのコミットがあるのに今は無い = 人が消した。「要らない」の意思表示として置き直さない
+  local HIST
+  HIST=$(gh api "/repos/${OWNER}/${R}/commits?sha=${B}&path=${P}&per_page=1" -q 'length' 2>>"$ERRLOG") || { SKEL_RES="取得失敗"; return 0; }
+  [ "${HIST:-0}" -gt 0 ] && { SKEL_RES="削除済みのため見送り"; return 0; }
   NO_PR=true deliver_file "$R" "$B" "$P" "chore: ${P} の骨格を配布 [sweeper]" "$WANT"
   SKEL_RES="$DELIVER"; return 0
 }

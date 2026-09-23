@@ -17,7 +17,7 @@ STATE="$STUB/state"; A="\$*"; echo "\$A" >> "$STUB/calls"
 case "$1" in
   empty) case "\$A" in *"/user/repos"*) exit 0;; esac; exit 1;;
   fail)  case "\$A" in *"/user/repos"*) echo "gh: HTTP 401" >&2; exit 1;; esac; exit 1;;
-  one)   case "\$A" in *"/user/repos"*) printf 'smoke-repo\tmain\n'; exit 0;; *"pulls?state=closed"*) echo '[]'; exit 0;; *"contents/"*) echo "gh: HTTP 404 Not Found" >&2; exit 1;; esac; exit 1;;
+  one)   case "\$A" in *"/user/repos"*) printf 'smoke-repo\tmain\n'; exit 0;; *"pulls?state=closed"*) echo '[]'; exit 0;; *"commits?sha="*) echo 0; exit 0;; *"contents/"*) echo "gh: HTTP 404 Not Found" >&2; exit 1;; esac; exit 1;;
   prpath)   # CI 対象外リポジトリ。既定ブランチは PR 必須の手動保護。PR の有無を STATE で追跡
     case "\$A" in
       *"/user/repos"*)                       printf 'manual\tmain\n'; exit 0;;
@@ -34,6 +34,7 @@ case "$1" in
       "pr list"*"--head "*"--state open"*)    # そのブランチの open PR 数（pr create で記録した head 名を数える）
         H=\$(printf '%s' "\$A" | sed -E 's/.*--head ([^ ]+).*/\\1/'); n=\$(grep -cx "PR \$H" "\$STATE" 2>/dev/null); echo "\${n:-0}"; exit 0;;
       *"pulls?state=closed"*)                cat "$STUB/closed.json" 2>/dev/null || echo '[]'; exit 0;;   # 閉じた PR の一覧（テストごとに差し替え）
+      *"commits?sha="*)                      [ -f "$STUB/deleted" ] && echo 1 || echo 0; exit 0;;   # そのパスのコミット履歴（-q length の結果）
       "pr list"*)                            echo 0; exit 0;;
       "pr create"*)                          H=\$(printf '%s' "\$A" | sed -E 's/.*--head ([^ ]+).*/\\1/'); echo "PR \$H" >> "\$STATE"; exit 0;;
       *)                                     exit 0;;
@@ -46,6 +47,7 @@ case "$1" in
       *"workflows/ci.yml"*" -q .content"*)   printf 'uses: sinoda1114/ci-standard/.github/workflows/node-ci.yml@main\n' | base64; exit 0;;  # 標準CI導入済み
       *"workflows/ci.yml"*)                  echo "gh: HTTP 500 Internal Server Error" >&2; exit 1;;   # CI 状態の取得だけ障害
       *"pulls?state=closed"*)                cat "$STUB/closed.json" 2>/dev/null || echo '[]'; exit 0;;
+      *"commits?sha="*)                      [ -f "$STUB/deleted" ] && echo 1 || echo 0; exit 0;;
       *"-X DELETE"*"/protection"*)           echo UNPROTECTED >> "\$STATE"; exit 0;;
       *"-X PUT"*"/protection"*)              echo PROTECTED >> "\$STATE"; exit 0;;
       *"/protection"*)                       echo "ci / build"; exit 0;;     # sweeper 管理の保護あり
@@ -106,4 +108,7 @@ mk_stub reprotect; touch "$STUB/has-agents"; PATH="$STUB:$PATH" TYPESAFE_API_KEY
 check "既にある AGENTS.md は中身に関係なく触らない" 0 $? "骨格:AGENTS:既存 CLAUDE:"
 if grep -q 'PUT.*contents/AGENTS.md' "$STUB/calls" 2>/dev/null; then echo "FAIL 既存 AGENTS.md に PUT した"; fail=1; else echo "ok   既存 AGENTS.md へ PUT していない"; fi
 rm -f "$STUB/has-agents"
+mk_stub reprotect; touch "$STUB/deleted"; PATH="$STUB:$PATH" TYPESAFE_API_KEY=dummy bash scripts/sweep.sh < /dev/null > "$STUB/out" 2>&1
+check "人が消した骨格ファイルは置き直さない" 0 $? "骨格:AGENTS:削除済みのため見送り CLAUDE:削除済みのため見送り issue:削除済みのため見送り"
+rm -f "$STUB/deleted"
 exit $fail
