@@ -40,8 +40,8 @@ CIが緑でないと main にマージできない** 状態を作るための中
 | CI/CD | React アンチパターン検出（React Doctor） | React 系（既定 advisory） |
 
 sweeper の PR（保護リポジトリへの dependabot / pr-triage）を**マージせずに閉じると「このリポジトリには要らない」と記録し、
-以後そのファイルは PR でも直接でも置かない**（保護の有無に関係なく効く）。誤って閉じた場合は、その PR にラベル
-`sweeper-superseded` を付ければ翌朝から再提案される。ラベルが無ければ先に作る:
+以後そのファイルは PR でも直接でも置かない**（保護の有無に関係なく効く）。誤って閉じた場合は、そのファイルの閉じた sweeper PR
+（`sweeper/<名前>-*`）**すべて**にラベル `sweeper-superseded` を付ければ翌朝から再提案される。ラベルが無ければ先に作る:
 `gh label create sweeper-superseded -R sinoda1114/<repo>`（詳細は `repo-policy.yml`）。
 
 **型に入れないもの**（理由は repo-policy.yml の `excluded` を参照）: GitHub Project 板の作成

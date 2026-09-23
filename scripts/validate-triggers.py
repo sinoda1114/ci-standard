@@ -44,7 +44,7 @@ def events(doc):
 def main():
     bad = []
     # GitHub は .yaml も読む。.yml だけを見ていると見逃す。
-    patterns = [f"{d}/*.{e}" for d in (".github/workflows", "templates") for e in ("yml", "yaml")]
+    patterns = [f"{d}/*.{e}" for d in (".github/workflows", "templates", "templates/skeleton") for e in ("yml", "yaml")]
     files = sorted({f for pat in patterns for f in glob.glob(pat)})
     for f in files:
         try:
