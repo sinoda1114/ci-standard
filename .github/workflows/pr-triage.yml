@@ -87,9 +87,9 @@ jobs:
             python3 "$S/triage.py" --threads out/threads.json --out out/triage.json --md out/triage.md > /dev/null
             # JEV の失敗理由を CI ログに出す。表の見出しには jev の状態しか出ず、2026-09-23 の遮断（error code 1010）は原因を追えなかった。
             # errors は種類ごとに 1 件で、HTTP エラーは許可した診断コードだけを含む（本文は出さない）。
-            # 設計どおりの縮退（budget / deadline / unknown-choice）は notice、それ以外の失敗は warning。
+            # こちらが課した上限による縮退（budget / deadline）は notice、JEV 側の異常（unknown-choice・HTTP エラー等）は warning。
             # %・CR・LF はワークフローコマンドの規定どおりエスケープする。診断用なので失敗しても表の投稿は止めない
-            python3 -c 'import json, sys; sys.stdout.write("".join("::%s::JEV %s\n" % ("notice" if e in ("budget", "deadline", "unknown-choice") else "warning", e.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")) for e in json.load(open("out/triage.json"))["errors"]))' \
+            python3 -c 'import json, sys; sys.stdout.write("".join("::%s::JEV %s\n" % ("notice" if e in ("budget", "deadline") else "warning", e.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")) for e in json.load(open("out/triage.json"))["errors"]))' \
               || echo "::warning::JEV のエラー一覧を読めなかった"
           fi
           # 既存の固定コメント（全ページを見る。1 ページだけだと長い PR で二重投稿になる）。
