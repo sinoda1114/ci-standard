@@ -20,10 +20,36 @@ types も検証する。イベント名だけを見ていると、同じ動機�
         （省略時は .github/workflows と templates）
 """
 import glob
+import re
 import sys
 from typing import NamedTuple
 
 import yaml
+
+
+class _Yaml12BoolLoader(yaml.SafeLoader):
+    """真偽値を true / false だけに絞った SafeLoader。
+
+    PyYAML は YAML 1.1 に従い on / off / yes / no も真偽値にするが、GitHub は YAML 1.2 相当で
+    文字列として扱う。repository_dispatch の types: [on] のような正しい設定を誤って拒否しないよう、
+    GitHub と同じ解釈で読む。
+    """
+
+
+_Yaml12BoolLoader.yaml_implicit_resolvers = {
+    ch: [(tag, rx) for tag, rx in resolvers if tag != "tag:yaml.org,2002:bool"]
+    for ch, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+_Yaml12BoolLoader.add_implicit_resolver(
+    "tag:yaml.org,2002:bool",
+    re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"),
+    list("tTfF"),
+)
+
+
+def load(stream) -> object:
+    """GitHub と同じ真偽値の解釈で YAML を読む。"""
+    return yaml.load(stream, Loader=_Yaml12BoolLoader)
 
 
 class Problem(NamedTuple):
@@ -102,7 +128,7 @@ ALIASES = {
 
 
 def _on_section(doc: object) -> object:
-    """on: の中身を返す。YAML 1.1 では裸の on: が真偽値 True として読まれる。"""
+    """on: の中身を返す。yaml.safe_load（YAML 1.1）で読むと裸の on: が True になるので両方見る。"""
     if not isinstance(doc, dict):
         return None
     return doc.get("on", doc.get(True))
@@ -130,6 +156,8 @@ def _check_types(path: str, ev: str, types: object) -> list[Problem]:
     if not isinstance(values, list) or not all(isinstance(t, str) for t in values):
         return [Problem("structure",
                         f"{path}: '{ev}' の types は文字列か文字列のリストで書く（実際: {types!r}）")]
+    if not values:
+        return [Problem("structure", f"{path}: '{ev}' の types が空（どの activity でも起動しない）")]
 
     if allowed is FREEFORM:
         return []  # 値は利用者が決めるので突き合わせない
@@ -151,6 +179,8 @@ def check(path: str, doc: object) -> list[Problem]:
     items = _event_items(on)
     if items is None:
         return [Problem("structure", f"{path}: on: の形式が不正（{on!r}）")]
+    if not items:
+        return [Problem("structure", f"{path}: on: にイベントが 1 つも無い（ワークフローとして起動しない）")]
 
     found: list[Problem] = []
     for ev, cfg in items.items():
@@ -179,19 +209,21 @@ def summarize(problems: list[Problem]) -> str:
 
 def main(argv: list[str]) -> int:
     dirs = argv[1:] or [".github/workflows", "templates"]
-    patterns = [f"{d}/*.{e}" for d in dirs for e in ("yml", "yaml")]
-    files = sorted({f for pat in patterns for f in glob.glob(pat)})
+    by_dir = {d: sorted(f for e in ("yml", "yaml") for f in glob.glob(f"{d}/*.{e}")) for d in dirs}
 
-    if not files:
-        # cwd 違い・ディレクトリの改名・引数の打ち間違いで検査が一切走らず緑になるのを防ぐ
-        print(f"NG 検査対象が 0 件（{', '.join(dirs)}）。ゲートが空振りしています")
+    # cwd 違い・ディレクトリの改名・引数の打ち間違いで検査が走らず緑になるのを防ぐ。
+    # 合計ではなくディレクトリごとに見る。片方だけ空振りしても全体の件数は 0 にならない
+    empty = [d for d, found in by_dir.items() if not found]
+    if empty:
+        print(f"NG 検査対象が 0 件のディレクトリがある（{', '.join(empty)}）。ゲートが空振りしています")
         return 1
+    files = sorted({f for found in by_dir.values() for f in found})
 
     problems: list[Problem] = []
     for f in files:
         try:
             with open(f, encoding="utf-8") as fh:
-                doc = yaml.safe_load(fh)
+                doc = load(fh)
         except Exception as e:
             problems.append(Problem("structure", f"{f}: YAML として読めない: {e}"))
             continue

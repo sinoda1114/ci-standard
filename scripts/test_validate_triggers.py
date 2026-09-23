@@ -113,6 +113,17 @@ class TestRepositoryDispatch(unittest.TestCase):
         self.assertEqual(problems("on:\n  repository_dispatch:\n    types: [my-custom-event]\n"), [])
         self.assertEqual(problems("on:\n  repository_dispatch:\n    types: deploy\n"), [])
 
+    def test_yaml11_boolean_words_are_strings(self):
+        """PyYAML（YAML 1.1）は on/off/yes/no を真偽値にするが、GitHub は文字列として扱う。
+        dispatch の type 名に使われると、正しい設定を構造エラーで落としていた。"""
+        for word in ("on", "off", "yes", "no"):
+            src = f"on:\n  repository_dispatch:\n    types: [{word}]\n"
+            self.assertEqual([p.text for p in vt.check("t.yml", vt.load(src))], [], word)
+
+    def test_loader_keeps_true_false_as_booleans(self):
+        """true / false まで文字列にすると別の意味が変わるので、そこは残す。"""
+        self.assertIs(vt.load("a: true\n")["a"], True)
+
     def test_mapping_types_is_caught(self):
         """値は自由でも構造は文字列かそのリストでなければならない。"""
         self.assertEqual(len(problems("on:\n  repository_dispatch:\n    types: {foo: bar}\n")), 1)
@@ -157,6 +168,17 @@ class TestRobustness(unittest.TestCase):
         self.assertEqual(len(p), 1)
         self.assertIn("on:", p[0])
 
+    def test_empty_on_mapping_is_caught(self):
+        """on: {} はイベントが 1 つも無く、ワークフローとして起動しない。"""
+        self.assertEqual(len(problems("on: {}\n")), 1)
+
+    def test_empty_on_list_is_caught(self):
+        self.assertEqual(len(problems("on: []\n")), 1)
+
+    def test_empty_types_is_caught(self):
+        """types: [] はどの activity type でも起動しない。"""
+        self.assertEqual(len(problems("on:\n  pull_request:\n    types: []\n")), 1)
+
     def test_on_read_as_boolean_key(self):
         """YAML 1.1 では裸の on: が True として読まれる。そちらの経路も検査する。"""
         doc = yaml.safe_load("on:\n  no_such_event:\n")
@@ -166,17 +188,14 @@ class TestRobustness(unittest.TestCase):
 
 class TestFileDiscovery(unittest.TestCase):
     def _run_in(self, files: dict[str, str]) -> int:
+        # os.chdir でプロセス全体の状態を変えると並列実行で壊れる。ディレクトリを引数で渡す
         with tempfile.TemporaryDirectory() as d:
-            os.makedirs(os.path.join(d, ".github/workflows"), exist_ok=True)
+            wf = os.path.join(d, ".github/workflows")
+            os.makedirs(wf)
             for name, body in files.items():
-                with open(os.path.join(d, ".github/workflows", name), "w") as fh:
+                with open(os.path.join(wf, name), "w") as fh:
                     fh.write(body)
-            cwd = os.getcwd()
-            try:
-                os.chdir(d)
-                return vt.main(["validate-triggers.py"])
-            finally:
-                os.chdir(cwd)
+            return vt.main(["validate-triggers.py", wf])
 
     def test_yaml_extension_is_checked(self):
         """GitHub は .yaml も読む。.yml だけ見ていると見逃す。"""
@@ -198,6 +217,16 @@ class TestFileDiscovery(unittest.TestCase):
     def test_zero_files_fails(self):
         """対象が 0 件でも OK を返していた。cwd 違い・改名・引数ミスで検査が走らず緑になる経路。"""
         self.assertEqual(self._run_in({}), 1)
+
+    def test_partially_missing_directory_fails(self):
+        """片方のディレクトリにファイルがあっても、もう片方が空振りなら失敗させる。
+        既定の呼び出し（.github/workflows と templates）で templates を改名しても素通りしていた。"""
+        with tempfile.TemporaryDirectory() as d:
+            wf = os.path.join(d, "wf")
+            os.makedirs(wf)
+            with open(os.path.join(wf, "a.yml"), "w") as fh:
+                fh.write("on:\n  push:\n")
+            self.assertEqual(vt.main(["validate-triggers.py", wf, os.path.join(d, "typo")]), 1)
 
     def test_nonexistent_directory_fails(self):
         self.assertEqual(vt.main(["validate-triggers.py", "no/such/dir"]), 1)
