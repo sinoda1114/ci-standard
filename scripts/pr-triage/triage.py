@@ -222,7 +222,10 @@ def main():
         t["is_security"] = sec
         if c.get("choice") not in CATEGORIES:
             # 形は正しいがラベルが想定外（内容の不一致）。このスレッドだけ unknown にして続ける（遮断しない）
-            errors.append("unknown-choice"); t["category"] = "security" if sec >= 0.7 else "unknown"
+            # 件数分積むと errors[:20] の切り捨てで後続の HTTP エラーを押し出すので 1 回だけ記録する
+            if "unknown-choice" not in errors:
+                errors.append("unknown-choice")
+            t["category"] = "security" if sec >= 0.7 else "unknown"
             continue
         t["category"] = c["choice"]; t["category_conf"] = c.get("confidence")
         if sec >= 0.7:

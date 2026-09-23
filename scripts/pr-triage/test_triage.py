@@ -102,6 +102,15 @@ class TriageTests(unittest.TestCase):
         self.assertEqual([t["category"] for t in r["threads"]], ["unknown", "docs"])
         self.assertIn("unknown-choice", r["errors"]); self.assertEqual(r["jev"], "partial")
 
+    def test_repeated_unknown_choice_does_not_push_out_http_error(self):
+        def fake(route, state, questions):
+            if "category" in questions:
+                return {"category": {"choice": "Bug"}, "is_security": {"noul": 0.1}}, None
+            return None, "HTTP 403: error code: 1010"
+        r = self._run_with_call(fake, [th(i, "a.py", i) for i in range(25)])
+        self.assertEqual(r["errors"].count("unknown-choice"), 1)
+        self.assertIn("HTTP 403: error code: 1010", r["errors"])
+
     def test_bool_is_not_a_probability(self):
         bad = ({"category": {"choice": "bug"}, "is_security": {"noul": True}}, None)
         r = self._run_with_call(lambda *a: bad, [th(1, "a.py", 1)])
