@@ -42,7 +42,11 @@ set -uo pipefail
 
 OWNER="sinoda1114"
 STANDARD_REPO="${OWNER}/ci-standard"
-SUPERSEDED_MARK="[sweeper-superseded]"   # sweeper 自身が置き換えで閉じた PR の印（人の却下と区別する）
+SUPERSEDED_MARK="[sweeper-superseded]"   # sweeper 自身が置き換えで閉じた PR の印（本文。人の却下と区別する）
+SUPERSEDED_LABEL="sweeper-superseded"    # 同じ印のラベル版（本文は Bot が書き換えうるので、ラベルも付ける）
+# 印の仕組みを入れた日時（ci-standard #8 のマージ）。これより前に閉じた sweeper PR は、sweeper 自身の置き換えでも
+# 印が無く人の却下と区別できないので、却下として数えない
+REJECT_SINCE="2026-09-21T11:02:07Z"
 # 除外: 標準リポ自身 / チーム開発 / 空チュートリアル
 EXCLUDE="ci-standard teamdev-2023-apr-team1 desktop-tutorial flue-test2"
 ERRLOG=$(mktemp)
@@ -107,8 +111,33 @@ sweeper_managed_protection() { # sweeper_managed_protection <repo> <branch> → 
 
 # deliver_file <repo> <branch> <path> <message> <content> [sha] → DELIVER に結果文字列。0 成功 / 1 失敗
 #   直接 PUT → 保護で拒否なら（sweeper 管理の保護）一時解除して PUT / （それ以外）PR を作る
+pr_prefix() { # pr_prefix <path> → sweeper/<basename 拡張子なし>-
+  printf 'sweeper/%s-' "$(basename "$1" | sed 's/\.[^.]*$//')"
+}
+
+rejected_count() { # rejected_count <repo> <base> <prefix> [<slug>] → 件数を出力。取得失敗は非ゼロ終了
+  # 却下 = マージされずに閉じた sweeper PR のうち、REJECT_SINCE 以降に閉じられ、置き換えの印（本文 or ラベル）が無いもの。
+  # slug を渡せばその内容の PR だけ、渡さなければ prefix（= そのファイル）の PR 全部を見る。全ページを見る
+  local R=$1 B=$2 PFX=$3 SLUG=${4:-} J
+  J=$(gh api --paginate "/repos/${OWNER}/${R}/pulls?state=closed&base=${B}&per_page=100" 2>>"$ERRLOG") || return 1
+  printf '%s' "$J" | jq -s --arg pfx "$PFX" --arg slug "$SLUG" --arg mark "$SUPERSEDED_MARK" --arg label "$SUPERSEDED_LABEL" --arg since "$REJECT_SINCE" '
+    [ .[][]
+      | select(if $slug != "" then .head.ref == $slug else (.head.ref | startswith($pfx)) end)
+      | select(.merged_at == null)
+      | select((.closed_at // "") >= $since)
+      | select(((.body // "") | contains($mark)) | not)
+      | select(([.labels[]?.name] | index($label)) | not)
+    ] | length' 2>>"$ERRLOG"
+}
+
 deliver_file() {
-  local R=$1 B=$2 P=$3 M=$4 C=$5 S=${6:-} rc
+  local R=$1 B=$2 P=$3 M=$4 C=$5 S=${6:-} rc N
+  # 新規導入（既定ブランチにまだ無いファイル）で、人が過去にそのファイルの sweeper PR を断っていれば、
+  # 保護の有無に関係なく置かない（保護を外したリポジトリで直接置いて、断られた機能を入れてしまうのを防ぐ）
+  if [ -z "$S" ] && [ "${NO_PR:-false}" != true ]; then
+    N=$(rejected_count "$R" "$B" "$(pr_prefix "$P")") || { DELIVER="PR状態の取得に失敗"; return 1; }
+    [ "${N:-0}" -gt 0 ] && { DELIVER="PR却下済み"; return 0; }
+  fi
   put_file "$R" "$B" "$P" "$M" "$C" "$S"; rc=$?
   if [ $rc -eq 0 ]; then DELIVER="配布"; return 0; fi
   if [ $rc -ne 2 ]; then DELIVER="失敗"; return 1; fi
@@ -142,21 +171,12 @@ open_pr_with_file() { # open_pr_with_file <repo> <base> <path> <message> <conten
   # 取得に失敗した日は配布を見送る（0 件と区別しないと、却下済み PR を作り直してしまう）
   OPEN=$(gh pr list -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --state open --json number -q 'length' 2>>"$ERRLOG") || { DELIVER="PR状態の取得に失敗"; return 1; }
   if [ "${OPEN:-0}" -gt 0 ]; then supersede_old_prs "$R" "$B" "$P" "$SLUG"; DELIVER="PR済み"; return 0; fi   # 前回閉じ損ねた旧 PR があれば再試行
-  # 却下 = 人がマージせずに閉じた PR。sweeper 自身が置き換えで閉じたもの（本文に SUPERSEDED_MARK）は数えない。
-  # 範囲: まだ既定ブランチに無いファイル（新規導入）なら、中身に関係なくそのファイルの sweeper PR 全部を見る
-  #   （人が「このリポジトリには要らない」と断った機能を、雛形が変わるたびに再提案しない）。
-  #   既にあるファイルの更新なら、その内容の PR だけを見る（雛形の改善は届け続ける）
-  local PREFIX_ALL
-  PREFIX_ALL="sweeper/$(basename "$P" | sed 's/\.[^.]*$//')-"
-  if [ "${IS_NEW:-false}" = true ]; then
-    # 全ページを見る（--limit で打ち切ると、古い却下が窓から落ちて再提案する）
-    REJECTED=$(gh api --paginate "/repos/${OWNER}/${R}/pulls?state=closed&base=${B}&per_page=100" \
-                 --jq ".[]|select(.head.ref|startswith(\"${PREFIX_ALL}\"))|select(.merged_at==null)|select((.body // \"\")|contains(\"${SUPERSEDED_MARK}\")|not)|.number" 2>>"$ERRLOG" | wc -l | tr -d ' ') || { DELIVER="PR状態の取得に失敗"; return 1; }
-  else
-    REJECTED=$(gh pr list -R "${OWNER}/${R}" --head "$SLUG" --base "$B" --state closed --json mergedAt,body \
-                 -q "[.[]|select(.mergedAt==null)|select((.body // \"\")|contains(\"${SUPERSEDED_MARK}\")|not)]|length" 2>>"$ERRLOG") || { DELIVER="PR状態の取得に失敗"; return 1; }
+  # 却下の確認: 新規導入はそのファイル全体を deliver_file で確認済み。既にあるファイルの更新は、その内容の PR だけを見る
+  # （人が「この更新は要らない」と断った内容は再提案しないが、雛形の次の改善は届ける）
+  if [ "${IS_NEW:-false}" != true ]; then
+    REJECTED=$(rejected_count "$R" "$B" "" "$SLUG") || { DELIVER="PR状態の取得に失敗"; return 1; }
+    if [ "${REJECTED:-0}" -gt 0 ]; then DELIVER="PR却下済み"; return 0; fi
   fi
-  if [ "${REJECTED:-0}" -gt 0 ]; then DELIVER="PR却下済み"; return 0; fi
   local CREATED=false
   if ! gh api "/repos/${OWNER}/${R}/git/ref/heads/${SLUG}" >/dev/null 2>&1; then
     HEAD=$(gh api "/repos/${OWNER}/${R}/git/ref/heads/${B}" -q .object.sha 2>>"$ERRLOG") || { DELIVER="失敗"; return 1; }
@@ -192,12 +212,16 @@ open_pr_with_file() { # open_pr_with_file <repo> <base> <path> <message> <conten
 supersede_old_prs() { # supersede_old_prs <repo> <base> <path> <現行slug>: 同じファイルの別ハッシュの sweeper PR を置き換えとして閉じる
   # 本文に印を付けてから閉じる（却下判定から除外するため）。印付けに失敗したら閉じない（印無しで閉じると「人の却下」と誤判定される）。
   # 失敗分は翌日の PR済み 経路で再試行される
-  local R=$1 B=$2 P=$3 SLUG=$4 PREFIX OLD
-  PREFIX="sweeper/$(basename "$P" | sed 's/\.[^.]*$//')-"
+  local R=$1 B=$2 P=$3 SLUG=$4 PREFIX OLD L BD
+  PREFIX="$(pr_prefix "$P")"
+  gh label create "$SUPERSEDED_LABEL" -R "${OWNER}/${R}" --color ededed --description "sweeper が置き換えで閉じた PR（人の却下ではない）" >/dev/null 2>&1 < /dev/null || true
   gh pr list -R "${OWNER}/${R}" --base "$B" --state open --limit 100 --json number,headRefName \
-    -q ".[] | select(.headRefName | startswith(\"${PREFIX}\")) | select(.headRefName != \"${SLUG}\") | .number" 2>/dev/null |
+    -q ".[] | select(.headRefName | startswith(\"${PREFIX}\")) | select(.headRefName != \"${SLUG}\") | .number" 2>/dev/null < /dev/null |
   while IFS= read -r OLD; do
-    gh pr edit "$OLD" -R "${OWNER}/${R}" --body "${SUPERSEDED_MARK} 内容を更新した新しい PR に置き換えました（sweeper）。" >/dev/null 2>>"$ERRLOG" || continue
+    # 印はラベルと本文の両方に付ける（本文は Bot が書き換えうる）。どちらも付けられなければ閉じない
+    { gh pr edit "$OLD" -R "${OWNER}/${R}" --add-label "$SUPERSEDED_LABEL" >/dev/null 2>>"$ERRLOG"; L=$?; } || true
+    { gh pr edit "$OLD" -R "${OWNER}/${R}" --body "${SUPERSEDED_MARK} 内容を更新した新しい PR に置き換えました（sweeper）。" >/dev/null 2>>"$ERRLOG"; BD=$?; } || true
+    [ "$L" -eq 0 ] || [ "$BD" -eq 0 ] || continue
     gh pr close "$OLD" -R "${OWNER}/${R}" --delete-branch --comment "内容を更新した新しい PR に置き換えます（sweeper）。" >/dev/null 2>>"$ERRLOG" || true
   done
   return 0
@@ -371,13 +395,14 @@ sync_pr_triage_secret() { # sync_pr_triage_secret <repo> → PRS="同期" / "キ
 
 SKEL_DIR="$(dirname "$0")/../templates/skeleton"
 
-sync_skeleton() { # sync_skeleton <repo> <branch> <path> <雛形ファイル> → SKEL_RES="既存" / "配布" / "配布(保護を一時解除)" / "保護のため見送り" / "取得失敗" / "失敗" / "雛形なし"
-  # 無ければ置くだけ。あれば中身に関係なく触らない（人が埋めた固有値を雛形で上書きする事故を構造的に無くす）
-  local R=$1 B=$2 P=$3 T=$4 WANT
+sync_skeleton() { # sync_skeleton <repo> <branch> <path> <雛形ファイル> [<存在確認パス>] → SKEL_RES="既存" / "配布" / "配布(保護を一時解除)" / "保護のため見送り" / "取得失敗" / "失敗" / "雛形なし"
+  # 無ければ置くだけ。あれば中身に関係なく触らない（人が埋めた固有値を雛形で上書きする事故を構造的に無くす）。
+  # 存在確認パスにディレクトリを渡すと、その中に何かあれば置かない（既に Issue テンプレを整えたリポジトリに選択肢を足さない）
+  local R=$1 B=$2 P=$3 T=$4 CHK=${5:-$3} WANT
   WANT="$(cat "$T" 2>/dev/null || true)"
   [ -n "$WANT" ] || { SKEL_RES="雛形なし"; return 0; }
   : > "$GH_STDERR"
-  if gh api "/repos/${OWNER}/${R}/contents/${P}?ref=${B}" -q .sha >/dev/null 2>"$GH_STDERR"; then SKEL_RES="既存"; return 0; fi
+  if gh api "/repos/${OWNER}/${R}/contents/${CHK}?ref=${B}" -q 'type' >/dev/null 2>"$GH_STDERR"; then SKEL_RES="既存"; return 0; fi
   grep -q 'HTTP 404' "$GH_STDERR" || { SKEL_RES="取得失敗"; return 0; }
   NO_PR=true deliver_file "$R" "$B" "$P" "chore: ${P} の骨格を配布 [sweeper]" "$WANT"
   SKEL_RES="$DELIVER"; return 0
@@ -387,7 +412,7 @@ sync_skeletons() { # sync_skeletons <repo> <branch> → SKL="AGENTS:配布 CLAUD
   local R=$1 B=$2
   sync_skeleton "$R" "$B" "AGENTS.md" "$SKEL_DIR/AGENTS.md"; local A="$SKEL_RES"
   sync_skeleton "$R" "$B" "CLAUDE.md" "$SKEL_DIR/CLAUDE.md"; local C="$SKEL_RES"
-  sync_skeleton "$R" "$B" ".github/ISSUE_TEMPLATE/task.yml" "$SKEL_DIR/task.yml"; local I="$SKEL_RES"
+  sync_skeleton "$R" "$B" ".github/ISSUE_TEMPLATE/task.yml" "$SKEL_DIR/task.yml" ".github/ISSUE_TEMPLATE"; local I="$SKEL_RES"
   SKL="AGENTS:${A} CLAUDE:${C} issue:${I}"
 }
 

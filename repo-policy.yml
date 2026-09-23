@@ -51,11 +51,14 @@ settings:
   # Bot のいないリポジトリでは起動条件（Bot のレビュー）を満たさないので何も起きない。
   pr_triage: true
 
-  # 保護ブランチへの配布（dependabot / pr-triage）: sweeper 管理の保護（必須チェック ci / build）は一時解除して置き再保護、
-  # 手動保護・ruleset は sweeper/<name>-<hash8> ブランチ + PR で届ける。
-  # 人がマージせずに閉じた PR は「このリポジトリには要らない」の意思表示として記録され、
-  #   - まだ既定ブランチに無いファイル（新規導入）は、雛形の中身が変わっても再提案しない
-  #   - 既にあるファイルの更新は、その内容に限って再提案しない（雛形の改善は届け続ける）
+  # ↑ dependabot / pr_triage 共通の、保護ブランチへの届け方と却下の扱い（骨格 skeleton は PR を作らないので対象外）:
+  #   - sweeper 管理の保護（必須チェック ci / build）は一時解除して置き再保護。手動保護・ruleset は sweeper/<name>-<hash8> ブランチ + PR
+  #   - 人がマージせずに閉じた sweeper PR は「このリポジトリには要らない」の意思表示として記録する
+  #       まだ既定ブランチに無いファイル（新規導入）: 雛形の中身が変わっても、保護を外しても、直接にも PR でも置かない
+  #       既にあるファイルの更新: その内容に限って再提案しない（雛形の次の改善は届ける）
+  #   - sweeper 自身が置き換えで閉じた PR は本文の [sweeper-superseded] かラベル sweeper-superseded で区別する。
+  #     印の導入（2026-09-21T11:02Z）より前に閉じた PR は区別できないので数えない
+  #   - 誤って閉じたときの戻し方: 閉じた PR にラベル sweeper-superseded を付ける（翌朝から再提案される）。急ぐなら手でファイルを置く
 
   # 骨格ファイル（templates/skeleton/: AGENTS.md / CLAUDE.md / .github/ISSUE_TEMPLATE/task.yml）が無ければ置く。
   # どのツール（Claude Code / Codex / Cursor / 手作業）で作ったリポジトリにも、翌朝には運用ルールの入口が入る。

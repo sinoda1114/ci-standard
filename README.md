@@ -34,6 +34,9 @@ CIが緑でないと main にマージできない** 状態を作るための中
 | 運用設定 | Dependabot 設定の配布（weekly。node: npm + github-actions / python: pip + github-actions / それ以外: github-actions のみ。sweeper 配布分は言語変更に追従） | 全リポジトリ |
 | 運用設定 | PR Bot コメント仕分け（pr-triage 呼び出し + `TYPESAFE_API_KEY`）の配布 | 全リポジトリ（Bot のいる PR でのみ動く） |
 | 運用設定 | 骨格ファイル（`AGENTS.md` / `CLAUDE.md` / Issue テンプレ）が無ければ配置。置いたら以後触らない | 全リポジトリ（手動保護・ruleset で置けない所は見送り） |
+
+保護リポジトリへの dependabot / pr-triage は PR で届き、**マージせずに閉じると「要らない」と記録して再提案しない**。
+誤って閉じた場合は、その PR にラベル `sweeper-superseded` を付ければ翌朝から再提案される（詳細は `repo-policy.yml`）。
 | CI/CD | 標準CI呼び出し（ci.yml）の配置 | Node / Python |
 | CI/CD | ブランチ保護（CI必須・会話解決必須・admin含む） | 標準CI導入済みのみ |
 | CI/CD | コード健全性ゲート（Fallow: 未使用コード/重複/複雑度） | Node（既定 report-only） |
