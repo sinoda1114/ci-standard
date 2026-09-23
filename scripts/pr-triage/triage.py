@@ -77,28 +77,25 @@ def load_route():
     return "", "", ""
 
 
-CONTROL_RE = re.compile(r"[\x00-\x08\x0e-\x1f\x7f]")   # ANSI エスケープや NUL をログに流さない
+# 公開の Actions ログに出るので、本文そのものは出さず既知の診断コードだけを拾う（許可リスト）。
+# 例: Cloudflare の "error code: 1010"、JSON の "type" / "error_type"（authentication_error 等）
+DIAGNOSTIC_RE = re.compile(r'error code: \d{3,5}|"(?:error_)?type"\s*:\s*"([a-z_]{3,40})"')
 
 
-def http_error_detail(e, key):
-    """HTTPError の応答本文の先頭 120 文字。鍵と秘密情報らしき値は伏せ、制御文字は除く。本文が読めなければ空文字。"""
-    limit = 4096 + len(key)
+def http_error_detail(e):
+    """HTTPError の応答本文から診断コードを 1 つ返す。無ければ・読めなければ空文字。"""
     try:
-        data = e.read(limit)
+        raw = e.read(4096).decode(errors="replace")
     except Exception:
         return ""
-    raw = data.decode(errors="replace")
-    if key:
-        raw = raw.replace(key, "<key>")
-        if len(data) >= limit:
-            # 上限で鍵が途中まで入っていると完全一致で伏せられず、空白を畳むと先頭 120 字へ寄ってくる。末尾を捨てる
-            raw = raw[:-len(key)]
-    raw = SECRET_RE.sub("<redacted>", raw)
-    return " ".join(CONTROL_RE.sub("", raw).split())[:120]
+    finally:
+        e.close()
+    m = DIAGNOSTIC_RE.search(raw)
+    return (m.group(1) or m.group(0)) if m else ""
 
 
 def call(route, state, questions):
-    """JEV を 1 回呼ぶ。(answers, None) か (None, 短いエラー)。HTTP エラーは応答本文の先頭を含める（鍵は伏せる）。"""
+    """JEV を 1 回呼ぶ。(answers, None) か (None, 短いエラー)。HTTP エラーには本文中の診断コードだけを付ける。"""
     key, ep, model = route
     body = json.dumps({"model": model, "state": state, "questions": questions}).encode()
     req = urllib.request.Request(ep, data=body, method="POST",
@@ -110,7 +107,7 @@ def call(route, state, questions):
         except urllib.error.HTTPError as e:
             if e.code in (429, 529) and attempt < 2:
                 time.sleep(2 ** attempt); continue
-            detail = http_error_detail(e, key)
+            detail = http_error_detail(e)
             return None, f"HTTP {e.code}: {detail}" if detail else f"HTTP {e.code}"
         except Exception as e:
             if attempt < 2:

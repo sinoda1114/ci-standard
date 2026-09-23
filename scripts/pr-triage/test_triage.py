@@ -156,9 +156,13 @@ class CallHttpTests(unittest.TestCase):
     KEY = "apikey_" + "A" * 40
     ROUTE = (KEY, "https://jev.invalid/v1/systemone", "jev-latest")
 
-    def http_error(self, read):
+    def http_error(self, read, code=403):
         fp = mock.Mock(); fp.read.side_effect = read
-        return urllib.error.HTTPError(self.ROUTE[1], 403, "Forbidden", {}, fp)
+        return urllib.error.HTTPError(self.ROUTE[1], code, "Forbidden", {}, fp)
+
+    def call_with_body(self, body, code=403):
+        with mock.patch("urllib.request.urlopen", side_effect=self.http_error(lambda *a: body, code)):
+            return triage.call(self.ROUTE, "s", {})
 
     def test_sends_explicit_user_agent(self):
         resp = mock.MagicMock(); resp.__enter__.return_value.read.return_value = b'{"answers": {}}'
@@ -168,55 +172,37 @@ class CallHttpTests(unittest.TestCase):
         self.assertEqual(ua, triage.USER_AGENT)
         self.assertFalse(ua.startswith("Python-urllib"))
 
-    def test_http_error_keeps_body_head(self):
-        with mock.patch("urllib.request.urlopen", side_effect=self.http_error(lambda *a: b"error code: 1010\n")):
-            self.assertEqual(triage.call(self.ROUTE, "s", {}), (None, "HTTP 403: error code: 1010"))
+    def test_cloudflare_error_code_is_kept(self):
+        self.assertEqual(self.call_with_body(b"error code: 1010\n"), (None, "HTTP 403: error code: 1010"))
 
-    def test_key_is_masked_before_truncation(self):
-        body = ("x" * 110 + " " + self.KEY + " tail").encode()
-        with mock.patch("urllib.request.urlopen", side_effect=self.http_error(lambda *a: body)):
-            _, err = triage.call(self.ROUTE, "s", {})
-        self.assertTrue(err.startswith("HTTP 403: "))
-        self.assertNotIn("apikey", err)
+    def test_json_error_type_is_kept(self):
+        body = b'{"detail":{"error_type":"authentication_error","message":"Cannot authenticate. key=apikey_XYZ"}}'
+        self.assertEqual(self.call_with_body(body, 401), (None, "HTTP 401: authentication_error"))
+        body = b'{"error":{"message":"add a card","type":"customer_verification_required"}}'
+        self.assertEqual(self.call_with_body(body), (None, "HTTP 403: customer_verification_required"))
 
-    def test_other_secrets_in_body_are_redacted(self):
-        body = b"upstream echoed ghp_" + b"B" * 36 + b" in its error"
-        with mock.patch("urllib.request.urlopen", side_effect=self.http_error(lambda *a: body)):
-            _, err = triage.call(self.ROUTE, "s", {})
-        self.assertNotIn("ghp_", err)
-        self.assertIn("<redacted>", err)
-
-    def test_error_body_read_is_bounded(self):
-        fp = mock.Mock(); fp.read.return_value = b"x"
-        with mock.patch("urllib.request.urlopen", side_effect=urllib.error.HTTPError(self.ROUTE[1], 500, "E", {}, fp)):
-            triage.call(self.ROUTE, "s", {})
-        (limit,), _ = fp.read.call_args
-        self.assertTrue(len(self.KEY) < limit <= 65536)
-
-    def test_key_cut_at_read_boundary_does_not_leak(self):
-        gw_key = "vck_" + "B" * 56   # SECRET_RE が知らない形式の鍵
-        route = (gw_key, self.ROUTE[1], "typesafe-ai/jev")
-        def read(n=-1):   # 読み取り上限の直前から鍵が始まり、上限で途中まで切れる本文
-            body = b" " * max(n - 20, 0) + gw_key.encode() + b" tail"
-            return body if n < 0 else body[:n]
-        fp = mock.Mock(); fp.read.side_effect = read
-        with mock.patch("urllib.request.urlopen", side_effect=urllib.error.HTTPError(route[1], 403, "Forbidden", {}, fp)):
-            _, err = triage.call(route, "s", {})
-        self.assertNotIn("vck_", err)
-        self.assertNotIn("BBBB", err)
-
-    def test_control_characters_are_removed(self):
-        body = b"a\x1b[31mred\x1b[0m b\x00c"
-        with mock.patch("urllib.request.urlopen", side_effect=self.http_error(lambda *a: body)):
-            _, err = triage.call(self.ROUTE, "s", {})
-        self.assertNotIn("\x1b", err)
-        self.assertNotIn("\x00", err)
+    def test_arbitrary_body_never_reaches_the_error(self):
+        # 公開ログに出るので、許可した診断コード以外は何も出さない（伏せ字の漏れを原理的に起こさない）
+        for body in [b"echo " + self.KEY.encode(),
+                     b"-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----",
+                     b"token ghp_" + b"B" * 36 + b" vck_" + b"C" * 56,
+                     b"a\x1b[31mred\x1b[0m b\x00c",
+                     b" " * 5000 + b"vck_" + b"D" * 56]:
+            self.assertEqual(self.call_with_body(body), (None, "HTTP 403"), body[:40])
 
     def test_unreadable_error_body_falls_back_to_status(self):
         def stalled(*a):
             raise TimeoutError("timed out")
         with mock.patch("urllib.request.urlopen", side_effect=self.http_error(stalled)):
             self.assertEqual(triage.call(self.ROUTE, "s", {}), (None, "HTTP 403"))
+
+    def test_error_body_read_is_bounded(self):
+        fp = mock.Mock(); fp.read.return_value = b"x"
+        with mock.patch("urllib.request.urlopen", side_effect=urllib.error.HTTPError(self.ROUTE[1], 500, "E", {}, fp)):
+            triage.call(self.ROUTE, "s", {})
+        (limit,), _ = fp.read.call_args
+        self.assertTrue(0 < limit <= 65536)
+        fp.close.assert_called()
 
 
 if __name__ == "__main__":
