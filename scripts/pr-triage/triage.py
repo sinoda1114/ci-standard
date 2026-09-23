@@ -23,6 +23,8 @@ from pathlib import Path
 ROUTES = [("TYPESAFE_API_KEY", "https://api.typesafe.ai/v1/systemone", "jev-latest"),
           ("AI_GATEWAY_API_KEY", "https://ai-gateway.vercel.sh/typesafe/v1/systemone", "typesafe-ai/jev")]
 TIMEOUT = 20
+# Cloudflare が urllib 既定の UA（Python-urllib/3.x）を error code 1010 で遮断する（2026-09-23 実測）。
+USER_AGENT = "pr-triage/1 (+https://github.com/sinoda1114/ci-standard)"
 
 
 def _env_int(name, default):
@@ -80,7 +82,7 @@ def call(route, state, questions):
     key, ep, model = route
     body = json.dumps({"model": model, "state": state, "questions": questions}).encode()
     req = urllib.request.Request(ep, data=body, method="POST",
-                                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+                                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json", "User-Agent": USER_AGENT})
     for attempt in range(3):
         try:
             with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
@@ -88,7 +90,8 @@ def call(route, state, questions):
         except urllib.error.HTTPError as e:
             if e.code in (429, 529) and attempt < 2:
                 time.sleep(2 ** attempt); continue
-            return None, f"HTTP {e.code}"
+            detail = " ".join(e.read().decode(errors="replace").split())[:120].replace(key, "<key>")
+            return None, f"HTTP {e.code}: {detail}" if detail else f"HTTP {e.code}"
         except Exception as e:
             if attempt < 2:
                 time.sleep(2 ** attempt); continue
