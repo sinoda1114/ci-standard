@@ -10,7 +10,7 @@ STUB=$(mktemp -d); trap 'rm -rf "$STUB"' EXIT
 # mk_stub <一覧> <runs の応答> <alerts の応答>
 #   一覧:    "name<TAB>branch<TAB>private" の行（そのまま出す）。"FAIL" なら取得失敗
 #   runs:    -q 適用後の 1 行（"結論<TAB>日付<TAB>URL<TAB>sha"）。"E404" / "E403" / "E500" ならその HTTP エラー
-#   alerts:  -q 適用後の 1 行（"件数<TAB>パッケージ"）。"E404" / "E403" / "EDISABLED" ならエラー
+#   alerts:  -q 適用後の出力（パッケージ名を 1 行 1 件）。空なら 0 件。"E404" / "E403" / "EDISABLED" ならエラー
 #   既定ブランチの先頭 sha は常に HEADSHA
 mk_stub() {
   cat > "$STUB/gh" <<EOF
@@ -28,7 +28,7 @@ case "\$A" in
   *"/actions/workflows/ci.yml/runs"*)
     case "$2" in E*) err "$2";; esac; printf '%b\n' "$2"; exit 0;;
   *"/dependabot/alerts"*)
-    case "$3" in E*) err "$3";; esac; printf '%b\n' "$3"; exit 0;;
+    case "$3" in E*) err "$3";; esac; printf '%b' "$3"; exit 0;;
 esac
 exit 1
 EOF
@@ -46,28 +46,33 @@ GREEN='success\t2026-09-22\thttps://example/run/1\tHEADSHA'
 PUB='pub-repo\tmain\tfalse\n'
 PRIV='priv-repo\tmain\ttrue\n'
 
-mk_stub FAIL "$GREEN" '0\t'
+mk_stub FAIL "$GREEN" ''
 [ "$(run)" = 1 ] && ok "一覧取得失敗で非ゼロ終了" || ng "一覧取得失敗で非ゼロ終了"
 
-mk_stub "$PUB" "$GREEN" '0\t'
+# 一覧の取得は成功しても対象が 0 件（PAT の対象リポジトリが絞られた等）なら、1 件も見ていない。
+# OK を出すと health.yml が既存 Issue を閉じてしまう
+mk_stub '' "$GREEN" ''
+[ "$(run)" = 1 ] && ! first_is_ok && ok "対象 0 件で非ゼロ終了" || ng "対象 0 件で非ゼロ終了"
+
+mk_stub "$PUB" "$GREEN" ''
 [ "$(run)" = 0 ] && first_is_ok && ok "全部緑なら OK" || ng "全部緑なら OK"
 
-mk_stub "$PUB" 'startup_failure\t2026-09-21\thttps://example/run/2\tHEADSHA' '0\t'
+mk_stub "$PUB" 'startup_failure\t2026-09-21\thttps://example/run/2\tHEADSHA' ''
 run >/dev/null; ! first_is_ok && has "pub-repo" && ok "startup_failure を赤として拾う" || ng "startup_failure を赤として拾う"
 
-mk_stub "$PUB" 'timed_out\t2026-09-21\thttps://example/run/3\tHEADSHA' '0\t'
+mk_stub "$PUB" 'timed_out\t2026-09-21\thttps://example/run/3\tHEADSHA' ''
 run >/dev/null; ! first_is_ok && ok "timed_out を赤として拾う" || ng "timed_out を赤として拾う"
 
-mk_stub "$PUB" 'skipped\t2026-09-21\thttps://example/run/4\tHEADSHA' '0\t'
+mk_stub "$PUB" 'skipped\t2026-09-21\thttps://example/run/4\tHEADSHA' ''
 run >/dev/null; first_is_ok && ok "skipped は問題にしない" || ng "skipped は問題にしない"
 
-mk_stub "$PUB" E404 '0\t'
+mk_stub "$PUB" E404 ''
 run >/dev/null; first_is_ok && ok "ci.yml が無い（404）なら対象外" || ng "ci.yml が無い（404）なら対象外"
 
-mk_stub "$PUB" E403 '0\t'
+mk_stub "$PUB" E403 ''
 run >/dev/null; ! first_is_ok && has "確認できなかった" && has "pub-repo" && ok "CI 取得の 403 は OK にしない" || ng "CI 取得の 403 は OK にしない"
 
-mk_stub "$PUB" E500 '0\t'
+mk_stub "$PUB" E500 ''
 run >/dev/null; ! first_is_ok && has "確認できなかった" && ok "CI 取得の 500 は OK にしない" || ng "CI 取得の 500 は OK にしない"
 
 mk_stub "$PUB" "$GREEN" E403
@@ -76,27 +81,28 @@ run >/dev/null; ! first_is_ok && has "確認できなかった" && ok "アラー
 mk_stub "$PUB" "$GREEN" EDISABLED
 run >/dev/null; first_is_ok && ok "Dependabot 無効のリポジトリは対象外" || ng "Dependabot 無効のリポジトリは対象外"
 
-mk_stub "$PUB" "$GREEN" '3\tnext×2, undici×1'
-run >/dev/null; ! first_is_ok && has "next×2" && ok "public はパッケージ名を出す" || ng "public はパッケージ名を出す"
+mk_stub "$PUB" "$GREEN" 'next\nnext\nundici\n'
+run >/dev/null; ! first_is_ok && has "next×2" && has "| 3 |" && ok "public はパッケージ名を出す" || ng "public はパッケージ名を出す"
 
 # 出力は public リポジトリ ci-standard の Issue に載る。private の中身を出さない
-mk_stub "$PRIV" "$GREEN" '3\tnext×2, undici×1'
+mk_stub "$PRIV" "$GREEN" 'next\nnext\nundici\n'
 run >/dev/null
 if ! first_is_ok && has "priv-repo" && has "(private)" && ! has "next" && ! has "github.com/sinoda1114/priv-repo"; then
   ok "private は名前と件数だけ（パッケージ名・リンクなし）"
 else ng "private は名前と件数だけ（パッケージ名・リンクなし）"; fi
 
-mk_stub "$PRIV" 'failure\t2026-09-21\thttps://github.com/sinoda1114/priv-repo/actions/runs/5\tHEADSHA' '0\t'
+mk_stub "$PRIV" 'failure\t2026-09-21\thttps://github.com/sinoda1114/priv-repo/actions/runs/5\tHEADSHA' ''
 run >/dev/null
 ! first_is_ok && has "priv-repo" && ! has "actions/runs/5" && ok "private の赤い CI もリンクを出さない" || ng "private の赤い CI もリンクを出さない"
 
 # ci.yml が PR でしか走らないリポジトリでは、main 上の最新 run が何週間も前の古い失敗のまま残る。
 # 今の main を検証した結果ではないので拾わない（拾うと Issue が永久に閉じない。shinoda-dev-lp で実際に起きた）
-mk_stub "$PUB" 'failure\t2026-08-08\thttps://example/run/7\tOLDSHA' '0\t'
+mk_stub "$PUB" 'failure\t2026-08-08\thttps://example/run/7\tOLDSHA' ''
 run >/dev/null; first_is_ok && ok "先頭コミット以外の古い失敗は拾わない" || ng "先頭コミット以外の古い失敗は拾わない"
 
 # sweeper が直さないリポジトリを載せると Issue が永久に閉じない
-mk_stub 'ci-standard\tmain\tfalse\n' 'failure\t2026-09-21\thttps://example/run/6\tHEADSHA' '0\t'
-run >/dev/null; first_is_ok && ok "既定の除外は sweep.sh と同じ" || ng "既定の除外は sweep.sh と同じ"
+# （対象 0 件は別の失敗になるので、除外されない正常なリポジトリを 1 件混ぜる。スタブは全リポジトリに同じ run を返す）
+mk_stub 'ci-standard\tmain\tfalse\npub-repo\tmain\tfalse\n' "$GREEN" ''
+run >/dev/null; first_is_ok && has "1 リポジトリ" && ok "既定の除外は sweep.sh と同じ" || ng "既定の除外は sweep.sh と同じ"
 
 exit $fail

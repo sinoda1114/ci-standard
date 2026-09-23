@@ -65,11 +65,13 @@ while IFS=$'\t' read -r NAME BRANCH PRIVATE; do
     note_unknown "$LABEL" "CI の結論"
   fi
 
-  # 2. critical / high の未解決アラート。1 回の取得で件数とパッケージ名を作る
-  if AL=$(gh api "/repos/${OWNER}/${NAME}/dependabot/alerts?state=open&severity=critical,high&per_page=100" \
-       -q '[.[] | .dependency.package.name] | "\(length)\t\(group_by(.) | map("\(.[0])×\(length)") | join(", "))"' 2>"$ERR"); then
-    IFS=$'\t' read -r CNT PKGS <<<"$AL"
-    if [ "${CNT:-0}" -gt 0 ]; then
+  # 2. critical / high の未解決アラート。100 件を超えても数えるよう全ページを取り、
+  #    パッケージ名を 1 行 1 件で受けて件数とパッケージ別の内訳を作る（-q はページごとに効くので集計はここで行う）
+  if AL=$(gh api --paginate "/repos/${OWNER}/${NAME}/dependabot/alerts?state=open&severity=critical,high&per_page=100" \
+       -q '.[] | .dependency.package.name' 2>"$ERR"); then
+    CNT=$(printf '%s' "$AL" | grep -c .)
+    PKGS=$(printf '%s\n' "$AL" | grep . | sort | uniq -c | awk '{printf "%s%s×%s", (NR>1 ? ", " : ""), $2, $1}')
+    if [ "$CNT" -gt 0 ]; then
       if [ "$PRIVATE" = true ]; then VLABEL="$LABEL"; PKGS="（private のため非公開）"
       else VLABEL="[${NAME}](https://github.com/${OWNER}/${NAME}/security/dependabot)"; fi
       vuln="${vuln}| ${VLABEL} | ${CNT} | ${PKGS} |"$'\n'
@@ -81,6 +83,13 @@ while IFS=$'\t' read -r NAME BRANCH PRIVATE; do
 done <<EOF
 $LIST
 EOF
+
+# 1 件も見ていないのに OK を出すと、health.yml が既存 Issue を閉じてしまう。
+# 一覧の取得は成功しても、PAT の対象リポジトリが絞られると 0 件になる
+if [ "$n_total" = 0 ]; then
+  echo "対象リポジトリが 0 件でした。PAT の対象リポジトリと権限を確認してください" >&2
+  exit 1
+fi
 
 if [ "$n_red" = 0 ] && [ "$n_vuln" = 0 ] && [ "$n_unknown" = 0 ]; then
   echo "OK"

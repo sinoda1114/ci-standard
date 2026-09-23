@@ -52,7 +52,10 @@ jobs:
           set -euo pipefail
           TITLE="[health] CI が赤のまま放置されているリポジトリがあります"
           # report.md の 1 行目が "OK" なら問題なし。既存 Issue があればクローズする
-          NUM=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$TITLE\" in:title" --json number -q '.[0].number // empty')
+          # 検索（--search）は索引への反映が遅れ、作成直後の再実行で「既存なし」と誤判定して二重に立てる。
+          # 一覧を取ってタイトルを完全一致で比べる
+          NUM=$(TITLE="$TITLE" gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 500 --json number,title \
+                  -q '[.[] | select(.title == env.TITLE)][0].number // empty')
           if head -1 report.md | grep -q '^OK'; then
             if [ -n "$NUM" ]; then
               gh issue close "$NUM" --repo "$GITHUB_REPOSITORY" --comment "全リポジトリの CI が緑になったため自動クローズします。"
