@@ -85,6 +85,9 @@ jobs:
           echo "threads=$n（Bot 起票・未解決のみ）"
           if [ "$n" -ge "$MIN_THREADS" ]; then
             python3 "$S/triage.py" --threads out/threads.json --out out/triage.json --md out/triage.md > /dev/null
+            # JEV の失敗理由を CI ログに出す。表の見出しには jev の状態しか出ず、2026-09-23 の遮断（error code 1010）は原因を追えなかった。
+            # errors は triage.py が鍵と秘密情報を伏せ済み。% はワークフローコマンドのエスケープ文字なので %25 にする
+            python3 -c 'import json; [print("::warning::JEV " + e.replace("%", "%25")) for e in json.load(open("out/triage.json"))["errors"][:5]]'
           fi
           # 既存の固定コメント（全ページを見る。1 ページだけだと長い PR で二重投稿になる）。
           # `| head -1` は gh を SIGPIPE(141) で落とし set -e で止まるので、全部読む awk で先頭だけ取る
