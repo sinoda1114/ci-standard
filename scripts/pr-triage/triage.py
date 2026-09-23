@@ -80,7 +80,7 @@ def load_route():
 def http_error_detail(e, key):
     """HTTPError の応答本文の先頭 120 文字。鍵と秘密情報らしき値は切り詰める前に伏せる。本文が読めなければ空文字。"""
     try:
-        raw = e.read(4096).decode(errors="replace")
+        raw = e.read(4096 + len(key)).decode(errors="replace")
     except Exception:
         return ""
     if key:

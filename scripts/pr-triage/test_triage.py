@@ -182,7 +182,7 @@ class CallHttpTests(unittest.TestCase):
         with mock.patch("urllib.request.urlopen", side_effect=urllib.error.HTTPError(self.ROUTE[1], 500, "E", {}, fp)):
             triage.call(self.ROUTE, "s", {})
         (limit,), _ = fp.read.call_args
-        self.assertTrue(0 < limit <= 65536)
+        self.assertEqual(limit, 4096 + len(self.KEY))
 
     def test_unreadable_error_body_falls_back_to_status(self):
         def stalled(*a):
