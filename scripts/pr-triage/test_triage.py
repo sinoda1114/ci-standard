@@ -170,6 +170,20 @@ class CallHttpTests(unittest.TestCase):
         self.assertTrue(err.startswith("HTTP 403: "))
         self.assertNotIn("apikey", err)
 
+    def test_other_secrets_in_body_are_redacted(self):
+        body = b"upstream echoed ghp_" + b"B" * 36 + b" in its error"
+        with mock.patch("urllib.request.urlopen", side_effect=self.http_error(lambda *a: body)):
+            _, err = triage.call(self.ROUTE, "s", {})
+        self.assertNotIn("ghp_", err)
+        self.assertIn("<redacted>", err)
+
+    def test_error_body_read_is_bounded(self):
+        fp = mock.Mock(); fp.read.return_value = b"x"
+        with mock.patch("urllib.request.urlopen", side_effect=urllib.error.HTTPError(self.ROUTE[1], 500, "E", {}, fp)):
+            triage.call(self.ROUTE, "s", {})
+        (limit,), _ = fp.read.call_args
+        self.assertTrue(0 < limit <= 65536)
+
     def test_unreadable_error_body_falls_back_to_status(self):
         def stalled(*a):
             raise TimeoutError("timed out")
