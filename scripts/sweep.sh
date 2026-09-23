@@ -408,8 +408,12 @@ sync_skeleton() { # sync_skeleton <repo> <branch> <path> <雛形ファイル> [<
   if gh api "/repos/${OWNER}/${R}/contents/${CHK}?ref=${B}" -q 'type' >/dev/null 2>"$GH_STDERR"; then SKEL_RES="既存"; return 0; fi
   grep -q 'HTTP 404' "$GH_STDERR" || { SKEL_RES="取得失敗"; return 0; }
   # 過去にこのパスのコミットがあるのに今は無い = 人が消した。「要らない」の意思表示として置き直さない
+  # 存在確認にディレクトリを使う場合（Issue テンプレ）は、ディレクトリごと消したケースも見る
   local HIST
   HIST=$(gh api "/repos/${OWNER}/${R}/commits?sha=${B}&path=${P}&per_page=1" -q 'length' 2>>"$ERRLOG") || { SKEL_RES="取得失敗"; return 0; }
+  if [ "${HIST:-0}" -eq 0 ] && [ "$CHK" != "$P" ]; then
+    HIST=$(gh api "/repos/${OWNER}/${R}/commits?sha=${B}&path=${CHK}&per_page=1" -q 'length' 2>>"$ERRLOG") || { SKEL_RES="取得失敗"; return 0; }
+  fi
   [ "${HIST:-0}" -gt 0 ] && { SKEL_RES="削除済みのため見送り"; return 0; }
   NO_PR=true deliver_file "$R" "$B" "$P" "chore: ${P} の骨格を配布 [sweeper]" "$WANT"
   SKEL_RES="$DELIVER"; return 0
@@ -418,7 +422,12 @@ sync_skeleton() { # sync_skeleton <repo> <branch> <path> <雛形ファイル> [<
 sync_skeletons() { # sync_skeletons <repo> <branch> → SKL="AGENTS:配布 CLAUDE:既存 issue:配布" の形
   local R=$1 B=$2
   sync_skeleton "$R" "$B" "AGENTS.md" "$SKEL_DIR/AGENTS.md"; local A="$SKEL_RES"
-  sync_skeleton "$R" "$B" "CLAUDE.md" "$SKEL_DIR/CLAUDE.md"; local C="$SKEL_RES"
+  # 骨格の CLAUDE.md は AGENTS.md を指すだけなので、AGENTS.md がある（置けた）ときだけ置く（参照先の無い入口を作らない）
+  local C
+  case "$A" in
+    既存|配布|"配布(保護を一時解除)") sync_skeleton "$R" "$B" "CLAUDE.md" "$SKEL_DIR/CLAUDE.md"; C="$SKEL_RES";;
+    *) C="AGENTS なしのため見送り";;
+  esac
   sync_skeleton "$R" "$B" ".github/ISSUE_TEMPLATE/task.yml" "$SKEL_DIR/task.yml" ".github/ISSUE_TEMPLATE"; local I="$SKEL_RES"
   SKL="AGENTS:${A} CLAUDE:${C} issue:${I}"
 }

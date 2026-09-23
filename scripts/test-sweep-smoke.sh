@@ -80,7 +80,7 @@ if [ "$(tail -1 "$STUB/state")" = PROTECTED ] && grep -q "保護を再適用" "$
 mk_stub prpath; PATH="$STUB:$PATH" bash scripts/sweep.sh < /dev/null > "$STUB/out" 2>&1; check "手動保護では PR を作る" 0 $? "dependabot:PR作成 / pr-triage:PR作成"
 PATH="$STUB:$PATH" bash scripts/sweep.sh < /dev/null > "$STUB/out" 2>&1; rc=$?
 check "2 回目は PR済み（作り直さない）" 0 $rc "dependabot:PR済み / pr-triage:PR済み"
-check "手動保護では骨格は PR にせず見送る" 0 $rc "骨格:AGENTS:保護のため見送り CLAUDE:保護のため見送り issue:保護のため見送り"
+check "手動保護では骨格は PR にせず見送る" 0 $rc "骨格:AGENTS:保護のため見送り CLAUDE:AGENTS なしのため見送り issue:保護のため見送り"
 if [ "$(grep -c '^PR ' "$STUB/state")" = 2 ]; then echo "ok   PR は 2 本（dependabot / pr-triage）だけ作られた"; else echo "FAIL PR 作成回数=$(grep -c '^PR ' "$STUB/state")"; cat "$STUB/state"; fail=1; fi
 closed_pr() { # closed_pr <head> <closed_at> <本文> <ラベル名 or 空>
   local lab=""; [ -n "$4" ] && lab="{\"name\":\"$4\"}"
@@ -109,6 +109,6 @@ check "既にある AGENTS.md は中身に関係なく触らない" 0 $? "骨格
 if grep -q 'PUT.*contents/AGENTS.md' "$STUB/calls" 2>/dev/null; then echo "FAIL 既存 AGENTS.md に PUT した"; fail=1; else echo "ok   既存 AGENTS.md へ PUT していない"; fi
 rm -f "$STUB/has-agents"
 mk_stub reprotect; touch "$STUB/deleted"; PATH="$STUB:$PATH" TYPESAFE_API_KEY=dummy bash scripts/sweep.sh < /dev/null > "$STUB/out" 2>&1
-check "人が消した骨格ファイルは置き直さない" 0 $? "骨格:AGENTS:削除済みのため見送り CLAUDE:削除済みのため見送り issue:削除済みのため見送り"
+check "人が消した骨格ファイルは置き直さない（AGENTS が無ければ CLAUDE も置かない）" 0 $? "骨格:AGENTS:削除済みのため見送り CLAUDE:AGENTS なしのため見送り issue:削除済みのため見送り"
 rm -f "$STUB/deleted"
 exit $fail
