@@ -30,8 +30,6 @@ ALIASES = {
 
 
 def events(doc):
-    if not isinstance(doc, dict):   # Issue フォームの配列など、ワークフローでない YAML は対象外
-        return []
     # YAML 1.1 では裸の on: が真偽値 True として読まれる
     on = doc.get("on", doc.get(True))
     if isinstance(on, dict):
@@ -56,6 +54,13 @@ def main():
             print(f"NG {f}: YAML として読めない: {e}")
             bad.append(f)
             continue
+        if not isinstance(doc, dict):
+            # トップレベルが辞書でない YAML は GitHub がワークフローとしても Issue フォームとしても拒否する
+            print(f"NG {f}: トップレベルが辞書でない（{type(doc).__name__}）")
+            bad.append(f)
+            continue
+        if "on" not in doc and True not in doc and "body" in doc:
+            continue   # on: を持たない Issue フォーム（templates/skeleton/task.yml）はトリガー検証の対象外
         for ev in events(doc):
             if ev not in VALID:
                 hint = ""

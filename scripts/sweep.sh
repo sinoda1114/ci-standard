@@ -36,7 +36,7 @@
 #
 # 必要権限（fine-grained PAT）: All repositories /
 #   Contents: RW / Administration: RW / Workflows: RW / Issues: RW（ラベル用）/
-#   Pull requests: RW（保護ブランチへの配布を PR で届けるため。無いと「PR作成不可」と報告）/
+#   Pull requests: RW（保護ブランチへの配布を PR で届け、却下の記録を読むため。読めないとその日は全ファイルの配布を見送り「PR状態の取得に失敗」と報告）/
 #   Secrets: RW（TYPESAFE_API_KEY 配布用。無ければ「権限なし」と報告）
 set -uo pipefail
 
