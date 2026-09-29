@@ -9,6 +9,10 @@
 https://raw.githubusercontent.com/sinoda1114/ci-standard/main/docs/AGENT-PAIRING.md
 ```
 
+**新しいプロジェクトで初めて往復を成立させるときは
+[AGENT-PAIRING-SMOKE-TEST.md](./AGENT-PAIRING-SMOKE-TEST.md) を使う。**
+合格条件と判定方法を並べた検査票で、この文書を一度通しで確認できる。
+
 クラウドセッションからは `api.github.com` が egress ポリシーで 403 になるが、
 **`raw.githubusercontent.com` は 200 で到達できる**（実測）。`add_repo` も不要。
 
