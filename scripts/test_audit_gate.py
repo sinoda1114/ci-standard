@@ -2,6 +2,7 @@
 
 ゲートが壊れて常に成功を返しても気付けるよう、「落とすべき入力を確実に落とす」ことを中心に確かめる。
 """
+import re
 import json
 import os
 import subprocess
@@ -423,6 +424,23 @@ class PnpmConfigTest(unittest.TestCase):
         rc, out = self.check({'pnpm-workspace.yaml': 'auditConfig: {ignoreGhsas: [\n'})
         self.assertEqual(rc, 1, out)
 
+    def test_pnpm_workspace_yaml_の重複キーは落とす(self):
+        # PyYAML は重複キーを後の値で黙って上書きする。前の値に除外設定を書いて検査をすり抜けさせない
+        rc, out = self.check({'pnpm-workspace.yaml': 'auditConfig: {ignoreGhsas: [GHSA-vfj7-8cjw-p6xm]}\nauditConfig: {}\n'})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('重複', out)
+
+    def test_pnpm_workspace_yaml_の綴りを変えたキーも落とす(self):
+        # 大文字小文字・ハイフン・下線の違いですり抜けさせない
+        rc, out = self.check({'pnpm-workspace.yaml': 'audit-config:\n  ignore-ghsas:\n    - GHSA-vfj7-8cjw-p6xm\n'})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('ignore-ghsas', out)
+
+    def test_package_json_の綴りを変えたキーも落とす(self):
+        rc, out = self.check({'package.json': json.dumps({'pnpm': {'AuditConfig': {'ignore_cves': ['CVE-2026-0001']}}})})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('ignore_cves', out)
+
     def test_package_json_が壊れていたら落とす(self):
         rc, out = self.check({'package.json': '{ broken'})
         self.assertEqual(rc, 1, out)
@@ -444,6 +462,34 @@ class EmbeddedCopyTest(unittest.TestCase):
         with open(GATE, encoding='utf-8') as f:
             self.assertEqual(embedded, f.read(),
                              'scripts/audit-gate.py を直したら node-ci.yml の埋め込みも同じ内容にしてください')
+
+class WorkflowExpressionTest(unittest.TestCase):
+    """ワークフローの中の ${{ … }} が、GitHub Actions の式として読める形だけであること（2026-10-03 追加）。
+
+    run: の中の文字列（heredoc の中も含む）でも ${{ は式として評価される。読めない式が 1 つあると
+    ワークフロー全体が起動しなくなり、配布先のすべてのリポジトリで CI が止まる。
+    """
+    EXPR = re.compile(r"\$\{\{(.*?)\}\}")
+    ALLOWED = re.compile(r"^[A-Za-z0-9_.\-'\" ()!=&|,\[\]*<>]*$")
+
+    def test_式として読めない_dollar_brace_brace_が無い(self):
+        wf_dir = os.path.join(HERE, '..', '.github', 'workflows')
+        for name in sorted(os.listdir(wf_dir)):
+            if not name.endswith(('.yml', '.yaml')):
+                continue
+            with open(os.path.join(wf_dir, name), encoding='utf-8') as f:
+                for no, line in enumerate(f, 1):
+                    if '${{' not in line:
+                        continue
+                    exprs = self.EXPR.findall(line)
+                    self.assertEqual(line.count('${{'), len(exprs), f'{name}:{no} 閉じていない ${{{{: {line.strip()}')
+                    for e in exprs:
+                        self.assertRegex(e, self.ALLOWED, f'{name}:{no} 式として読めない: {line.strip()}')
+
+    def test_埋め込みの判定スクリプトに_dollar_brace_brace_が無い(self):
+        with open(GATE, encoding='utf-8') as f:
+            self.assertNotIn('${{', f.read(), 'node-ci.yml に埋め込むと Actions の式として評価される')
+
 
 if __name__ == '__main__':
     unittest.main()

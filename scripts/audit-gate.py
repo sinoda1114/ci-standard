@@ -93,6 +93,47 @@ def load_allowlist(path):
     return entries, errors
 
 
+def normalize_key(key):
+    """大文字小文字・ハイフン・下線の違いを無視して比べるための形にする（綴りを変えてのすり抜けを防ぐ）。"""
+    return key.lower().replace('-', '').replace('_', '') if isinstance(key, str) else None
+
+
+def ignore_settings(section):
+    """auditConfig の中の空でない除外設定を「auditConfig.ignoreGhsas」の形で返す（書かれた綴りのまま）。"""
+    wanted = {normalize_key(k) for k in PNPM_IGNORE_KEYS}
+    found = []
+    for key, cfg in section.items():
+        if normalize_key(key) != 'auditconfig' or not isinstance(cfg, dict):
+            continue
+        found += [f'{key}.{k}' for k, v in cfg.items() if normalize_key(k) in wanted and v]
+    return found
+
+
+def no_duplicate_loader(yaml):
+    """同じキーが 2 回出てきたら読み込みエラーにする SafeLoader を返す。
+
+    PyYAML の既定は後の値で黙って上書きするので、前の値に書いた除外設定を検査が見落とす。
+    """
+    class NoDuplicateLoader(yaml.SafeLoader):
+        pass
+
+    def construct_mapping(loader, node, deep=False):
+        seen = set()
+        for key_node, _ in node.value:
+            key = loader.construct_object(key_node, deep=deep)
+            try:
+                duplicated = key in seen
+            except TypeError:  # 辞書やリストのキー。SafeLoader 自身がエラーにする
+                continue
+            if duplicated:
+                raise yaml.constructor.ConstructorError(None, None, f'重複したキー {key!r}', key_node.start_mark)
+            seen.add(key)
+        return loader.construct_mapping(node, deep=deep)
+
+    NoDuplicateLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, construct_mapping)
+    return NoDuplicateLoader
+
+
 def pnpm_config_errors(project_dir):
     """pnpm の独自の除外設定を探し、見つかった場所の一覧を返す（無ければ空）。"""
     errors = []
@@ -103,9 +144,9 @@ def pnpm_config_errors(project_dir):
                 data = json.load(f)
         except (OSError, ValueError) as e:
             return [f'package.json を読めません（{type(e).__name__}）。除外設定の有無を確かめられないため通しません']
-        audit_cfg = (data.get('pnpm') or {}).get('auditConfig') if isinstance(data, dict) and isinstance(data.get('pnpm'), dict) else None
-        if isinstance(audit_cfg, dict):
-            errors += [f'package.json の pnpm.auditConfig.{k}' for k in PNPM_IGNORE_KEYS if audit_cfg.get(k)]
+        pnpm = data.get('pnpm') if isinstance(data, dict) else None
+        if isinstance(pnpm, dict):
+            errors += ['package.json の pnpm.' + name for name in ignore_settings(pnpm)]
     ws = os.path.join(project_dir, 'pnpm-workspace.yaml')
     if os.path.exists(ws):
         try:
@@ -119,16 +160,16 @@ def pnpm_config_errors(project_dir):
             # 名前の検索で代わりにするとエスケープ表記ですり抜けられるので、検査できないとして落とす
             return errors + ['pnpm-workspace.yaml を検査するための YAML パーサー（PyYAML）がありません。除外設定の有無を確かめられないため通しません']
         try:
-            data = yaml.safe_load(body)
+            data = yaml.load(body, Loader=no_duplicate_loader(yaml))
         except yaml.YAMLError as e:
-            return errors + [f'pnpm-workspace.yaml を YAML として読めません（{type(e).__name__}）。除外設定の有無を確かめられないため通しません']
+            detail = type(e).__name__ + (': ' + e.problem if getattr(e, 'problem', None) else '')
+            return errors + [f'pnpm-workspace.yaml を YAML として読めません（{detail}）。除外設定の有無を確かめられないため通しません']
         if isinstance(data, dict):
             # pnpm 11 は最上位のキーの ${VAR} を展開する。展開後の名前は CI の環境で変わるので、展開を含むキーは落とす
-            errors += [f'pnpm-workspace.yaml の最上位のキー {k!r}（${{…}} の展開を含むキーは検査できないため使えません）'
+            # 文言に波かっこを 2 つ続けて書かない。node-ci.yml に埋め込むと Actions の式として評価され、ワークフロー全体が起動しなくなる
+            errors += ['pnpm-workspace.yaml の最上位のキー ' + repr(k) + '（${…} の展開を含むキーは検査できないため使えません）'
                        for k in data if isinstance(k, str) and '${' in k]
-            cfg = data.get('auditConfig')
-            if isinstance(cfg, dict):
-                errors += [f'pnpm-workspace.yaml の auditConfig.{k}' for k in PNPM_IGNORE_KEYS if cfg.get(k)]
+            errors += ['pnpm-workspace.yaml の ' + name for name in ignore_settings(data)]
     return errors
 
 

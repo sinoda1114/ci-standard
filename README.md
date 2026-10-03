@@ -159,7 +159,7 @@ GHSA-vfj7-8cjw-p6xm    2026-12-31  braces。修正版なし（3.0.3 も影響範
 - **期限は今日から 120 日以内**に限る。それより先の日付を書いた行は CI を落とす（実質の無期限化を防ぐ）。延ばすときも 120 日以内。
 - **critical は例外リストに書いても除外しない**。修正版が無くても、使い方を変えるなどして必ず直す。
 - 期限が 14 日以内に迫った行・期限切れの行は、毎朝の health の Issue に載る（private リポジトリは名前と件数だけ）。
-- **pnpm の独自の除外設定（`package.json` の `pnpm.auditConfig`、`pnpm-workspace.yaml` の `auditConfig` にある `ignoreGhsas` / `ignoreCves`）は使えない**。理由も期限も残らないため、例外リストの有無にかかわらず見つけたら CI を落とす。除外したいものは例外リストに移す。
+- **pnpm の独自の除外設定（`package.json` の `pnpm.auditConfig`、`pnpm-workspace.yaml` の `auditConfig` にある `ignoreGhsas` / `ignoreCves`）は使えない**。理由も期限も残らないため、例外リストの有無にかかわらず見つけたら CI を落とす。除外したいものは例外リストに移す。キー名の大文字小文字・ハイフン・下線の違い（`audit-config` 等）も同じものとして扱い、`pnpm-workspace.yaml` で同じキーを 2 回書いたもの・`${…}` の展開を含む最上位のキー・読めない YAML も落とす。
 - 書式の違う行・同じ GHSA の重複も CI を落とす。
 - audit 自体の失敗（`{"error": …}`、想定外の形の JSON）は「脆弱性なし」と扱わず CI を落とす。
 - GHSA の ID を取り出せない high 以上の指摘は、例外リストで除外できないので常に CI を落とす。
