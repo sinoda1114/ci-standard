@@ -35,7 +35,8 @@ def pnpm_report(*advisories):
     return {'advisories': {str(i): {'module_name': name, 'severity': severity,
                                     'github_advisory_id': ghsa,
                                     'url': f'https://github.com/advisories/{ghsa}'}
-                           for i, (name, ghsa, severity) in enumerate(advisories)}}
+                           for i, (name, ghsa, severity) in enumerate(advisories)},
+            'metadata': {'vulnerabilities': {}}}
 
 
 class AuditGateTest(unittest.TestCase):
@@ -99,6 +100,35 @@ class AuditGateTest(unittest.TestCase):
             p = subprocess.run([sys.executable, GATE, '--pm', 'npm', '--allowlist', path, '--today', TODAY],
                                input='not json', capture_output=True, text=True)
         self.assertEqual(p.returncode, 1)
+
+    def test_audit_のエラー応答は落とす(self):
+        # npm はレジストリ障害などで {"error": …} という正しい JSON を出して失敗する
+        rc, out = self.run_gate({'error': {'code': 'ENOAUDIT', 'summary': 'Your configured registry does not support audit'}},
+                                f'{BRACES} 2026-12-31 修正版なし\n')
+        self.assertEqual(rc, 1, out)
+        self.assertIn('audit', out)
+
+    def test_想定外の形の_JSON_は落とす(self):
+        for report in ({}, {'vulnerabilities': {}}, []):
+            rc, out = self.run_gate(report, '')
+            self.assertEqual(rc, 1, (report, out))
+        rc, out = self.run_gate({'metadata': {}}, '', pm='pnpm')
+        self.assertEqual(rc, 1, out)
+
+    def test_GHSA_の無い_high_は除外できず落とす(self):
+        report = {'auditReportVersion': 2, 'vulnerabilities': {'x': {'name': 'x', 'severity': 'high', 'via': [
+            {'source': 9, 'name': 'x', 'severity': 'high', 'url': 'https://registry.example.com/advisories/9'}]}}}
+        rc, out = self.run_gate(report, '')
+        self.assertEqual(rc, 1, out)
+        rc, out = self.run_gate({'advisories': {'1': {'module_name': 'x', 'severity': 'critical', 'url': ''}}, 'metadata': {}},
+                                '', pm='pnpm')
+        self.assertEqual(rc, 1, out)
+
+    def test_同じ_GHSA_の重複行は書式エラーで落とす(self):
+        rc, out = self.run_gate(npm_report(('braces', BRACES, 'high')),
+                                f'{BRACES} 2026-12-31 修正版なし\n{BRACES} 2027-12-31 延長\n')
+        self.assertEqual(rc, 1, out)
+        self.assertIn('重複', out)
 
     def test_使われていない例外は通知する(self):
         rc, out = self.run_gate(npm_report(), f'{BRACES} 2026-12-31 修正版なし\n')

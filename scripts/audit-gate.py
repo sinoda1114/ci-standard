@@ -10,7 +10,9 @@ high 以上で落とす方針はそのままにし、除外は理由と期限つ
     GHSA-xxxx-xxxx-xxxx  YYYY-MM-DD  理由
   期限の日を過ぎた行は無効になり、CI を落とす（放置を防ぐため）。
 
-終了コード: 0 = 通す / 1 = 落とす（未登録の high 以上、期限切れ、書式エラー、JSON が読めない）
+終了コード: 0 = 通す / 1 = 落とす（未登録の high 以上、期限切れ、書式エラー、audit の失敗や想定外の形の JSON）
+GHSA の ID を取り出せない high 以上の advisory は、例外リストで扱えないので常に落とす（fail-closed）。
+期限の判定は runner の日付（UTC）で行う。
 """
 import argparse
 import datetime
@@ -26,7 +28,9 @@ LINE_RE = re.compile(r'^(GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4})\s+(\d{4}-\d{2
 def load_allowlist(path):
     """{GHSA: (期限, 理由)} と書式エラーの一覧を返す。"""
     entries, errors = {}, []
-    for no, raw in enumerate(open(path, encoding='utf-8'), 1):
+    with open(path, encoding='utf-8') as f:
+        lines = f.readlines()
+    for no, raw in enumerate(lines, 1):
         line = raw.split('#', 1)[0].strip()
         if not line:
             continue
@@ -39,27 +43,56 @@ def load_allowlist(path):
         except ValueError:
             errors.append(f'{path}:{no}: 期限が日付として読めません: {m.group(2)}')
             continue
+        if m.group(1) in entries:
+            errors.append(f'{path}:{no}: 同じ GHSA が重複しています（1 行にまとめてください）: {m.group(1)}')
+            continue
         entries[m.group(1)] = (expiry, m.group(3))
     return entries, errors
 
 
-def advisories(report, pm):
-    """{GHSA: (重大度, パッケージ名)} を返す。重大度が high 未満のものは含めない。"""
-    found = {}
+def shape_error(report, pm):
+    """audit が失敗した・想定外の形のときに理由を返す（正常なら None）。
+
+    npm は失敗すると {"error": …} という正しい JSON を出して非 0 で終わり、ワークフローは
+    その終了コードを捨てている。形を確かめないと「0 件」として通してしまう（fail-open）。
+    """
+    if not isinstance(report, dict):
+        return f'audit の結果がオブジェクトではありません（{type(report).__name__}）'
+    if 'error' in report:
+        err = report['error']
+        detail = err.get('summary') or err.get('code') if isinstance(err, dict) else err
+        return f'audit が失敗しました: {detail}'
     if pm == 'pnpm':
-        for adv in (report.get('advisories') or {}).values():
-            ghsa = adv.get('github_advisory_id') or ''.join(GHSA_RE.findall(adv.get('url', ''))[:1])
-            if adv.get('severity') in BLOCKING and ghsa:
+        if not isinstance(report.get('advisories'), dict) or 'metadata' not in report:
+            return 'pnpm audit の結果に advisories / metadata がありません'
+    elif 'auditReportVersion' not in report or not isinstance(report.get('vulnerabilities'), dict):
+        return 'npm audit の結果に auditReportVersion / vulnerabilities がありません'
+    return None
+
+
+def advisories(report, pm):
+    """{GHSA: (重大度, パッケージ名)} と、ID を取り出せない high 以上の一覧を返す。high 未満は含めない。"""
+    found, no_id = {}, []
+    if pm == 'pnpm':
+        for adv in report['advisories'].values():
+            if adv.get('severity') not in BLOCKING:
+                continue
+            ghsa = adv.get('github_advisory_id') or ''.join(GHSA_RE.findall(adv.get('url') or '')[:1])
+            if ghsa:
                 found[ghsa] = (adv['severity'], adv.get('module_name', '?'))
-        return found
-    for name, vuln in (report.get('vulnerabilities') or {}).items():
+            else:
+                no_id.append(f"{adv.get('module_name', '?')} ({adv['severity']}, url={adv.get('url') or '-'})")
+        return found, no_id
+    for name, vuln in report['vulnerabilities'].items():
         for via in vuln.get('via', []):
-            if not isinstance(via, dict):
-                continue  # 依存元を指す文字列。advisory 本体は別の項目にある
-            ids = GHSA_RE.findall(via.get('url', ''))
-            if via.get('severity') in BLOCKING and ids:
+            if not isinstance(via, dict) or via.get('severity') not in BLOCKING:
+                continue  # 文字列は依存元を指すだけで、advisory 本体は別の項目にある
+            ids = GHSA_RE.findall(via.get('url') or '')
+            if ids:
                 found[ids[0]] = (via['severity'], via.get('name', name))
-    return found
+            else:
+                no_id.append(f"{via.get('name', name)} ({via['severity']}, url={via.get('url') or '-'})")
+    return found, no_id
 
 
 def main():
@@ -75,8 +108,12 @@ def main():
     except ValueError as e:
         print(f'::error::audit の JSON が読めません: {e}')
         return 1
+    problem = shape_error(report, a.pm)
+    if problem:
+        print(f'::error::{problem}（audit が実行できていない可能性があります。脆弱性なしとは扱いません）')
+        return 1
     allow, errors = load_allowlist(a.allowlist)
-    found = advisories(report, a.pm)
+    found, no_id = advisories(report, a.pm)
 
     blocking, expired = [], []
     for ghsa, (sev, pkg) in sorted(found.items()):
@@ -93,11 +130,13 @@ def main():
         print(f'::error::{e}')
     for b in blocking:
         print(f'::error::high 以上の脆弱性（例外リストに無し）: {b}')
+    for n in no_id:
+        print(f'::error::high 以上の脆弱性（GHSA の ID が無いため例外リストで除外できません）: {n}')
     for x in expired:
         print(f'::error::例外の期限切れ: {x}（修正版を確認し、行を消すか期限を延ばしてください）')
-    ok = not (errors or blocking or expired)
-    print(f'audit-gate: high以上 {len(found)} 件 / 除外 {len(found) - len(blocking) - len(expired)} 件 / '
-          f'未登録 {len(blocking)} 件 / 期限切れ {len(expired)} 件 → {"通過" if ok else "失敗"}')
+    ok = not (errors or blocking or expired or no_id)
+    print(f'audit-gate: high以上 {len(found) + len(no_id)} 件 / 除外 {len(found) - len(blocking) - len(expired)} 件 / '
+          f'未登録 {len(blocking)} 件 / ID なし {len(no_id)} 件 / 期限切れ {len(expired)} 件 → {"通過" if ok else "失敗"}')
     return 0 if ok else 1
 
 

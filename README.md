@@ -156,6 +156,9 @@ GHSA-vfj7-8cjw-p6xm    2026-12-31  braces。修正版なし（3.0.3 も影響範
 ```
 
 - 期限の日を過ぎた行は無効になり CI が落ちる。修正版を確認して行を消すか、期限を延ばす（放置を防ぐため）。
-- 書式の違う行・JSON の読めない audit 結果も CI を落とす。
+- 書式の違う行・同じ GHSA の重複も CI を落とす。
+- audit 自体の失敗（`{"error": …}`、想定外の形の JSON）は「脆弱性なし」と扱わず CI を落とす。
+- GHSA の ID を取り出せない high 以上の指摘は、例外リストで除外できないので常に CI を落とす。
+- 期限の判定は runner の日付（UTC）。
 - 使われなくなった行は CI のログに通知が出る。
 - ファイルが無いリポジトリは従来の `npm audit --audit-level=high` のまま。判定は `scripts/audit-gate.py`（テストは `scripts/test_audit_gate.py`）。
