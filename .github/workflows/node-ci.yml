@@ -193,7 +193,8 @@ jobs:
         run: |
           if [ -f .github/audit-allowlist ] && [ "$PM" != yarn ]; then
             # audit は脆弱性があると非 0 で終わるので、合否は判定スクリプトに任せる。audit 自体の失敗（{"error":…} や想定外の形）は判定側で落とす
-            if [ "$PM" = pnpm ]; then pnpm audit --json > "$RUNNER_TEMP/audit.json" || true
+            # pnpm は JSON の advisories 自体を audit-level で絞るので、リポジトリの設定で緩められないよう high を明示する
+            if [ "$PM" = pnpm ]; then pnpm audit --json --audit-level high > "$RUNNER_TEMP/audit.json" || true
             else npm audit --json > "$RUNNER_TEMP/audit.json" || true; fi
             python3 .ci-standard/scripts/audit-gate.py --pm "$([ "$PM" = pnpm ] && echo pnpm || echo npm)" \
               --allowlist .github/audit-allowlist < "$RUNNER_TEMP/audit.json"

@@ -83,8 +83,17 @@ def advisories(report, pm):
             else:
                 no_id.append(f"{adv.get('module_name', '?')} ({adv['severity']}, url={adv.get('url') or '-'})")
         return found, no_id
-    for name, vuln in report['vulnerabilities'].items():
-        for via in vuln.get('via', []):
+    vulns = report['vulnerabilities']
+    for name, vuln in vulns.items():
+        # 構造の壊れた項目を黙って無視しない（high 以上が隠れる経路になるため）
+        if not isinstance(vuln, dict) or not isinstance(vuln.get('via'), list):
+            no_id.append(f'{name} (構造が不正: via がリストではありません)')
+            continue
+        if vuln.get('severity') in BLOCKING and not any(
+                isinstance(v, dict) or (isinstance(v, str) and v in vulns) for v in vuln['via']):
+            no_id.append(f"{name} ({vuln['severity']}, 構造が不正: advisory も参照先の項目もありません)")
+            continue
+        for via in vuln['via']:
             if not isinstance(via, dict) or via.get('severity') not in BLOCKING:
                 continue  # 文字列は依存元を指すだけで、advisory 本体は別の項目にある
             ids = GHSA_RE.findall(via.get('url') or '')
@@ -131,7 +140,7 @@ def main():
     for b in blocking:
         print(f'::error::high 以上の脆弱性（例外リストに無し）: {b}')
     for n in no_id:
-        print(f'::error::high 以上の脆弱性（GHSA の ID が無いため例外リストで除外できません）: {n}')
+        print(f'::error::high 以上の可能性がある指摘（GHSA の ID が無い、または構造が不正なため例外リストで除外できません）: {n}')
     for x in expired:
         print(f'::error::例外の期限切れ: {x}（修正版を確認し、行を消すか期限を延ばしてください）')
     ok = not (errors or blocking or expired or no_id)

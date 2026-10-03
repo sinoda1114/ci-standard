@@ -124,6 +124,22 @@ class AuditGateTest(unittest.TestCase):
                                 '', pm='pnpm')
         self.assertEqual(rc, 1, out)
 
+    def test_項目の構造が壊れた_high_は落とす(self):
+        # via が無い・型が違う・依存元の参照先が無い high の項目を黙って無視しない
+        broken = [
+            {'x': {'severity': 'high'}},
+            {'x': {'severity': 'high', 'via': 'braces'}},
+            {'x': {'severity': 'critical', 'via': ['missing-package']}},
+            {'x': 'not-an-object'},
+        ]
+        for vulns in broken:
+            rc, out = self.run_gate({'auditReportVersion': 2, 'vulnerabilities': vulns}, '')
+            self.assertEqual(rc, 1, (vulns, out))
+
+    def test_依存元が既存の項目を指すだけなら構造エラーにしない(self):
+        rc, out = self.run_gate(npm_report(('braces', BRACES, 'high')), f'{BRACES} 2026-12-31 修正版なし\n')
+        self.assertEqual(rc, 0, out)
+
     def test_同じ_GHSA_の重複行は書式エラーで落とす(self):
         rc, out = self.run_gate(npm_report(('braces', BRACES, 'high')),
                                 f'{BRACES} 2026-12-31 修正版なし\n{BRACES} 2027-12-31 延長\n')
