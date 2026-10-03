@@ -96,7 +96,8 @@ class AuditGateTest(unittest.TestCase):
     def test_壊れた_JSON_は落とす(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, 'audit-allowlist')
-            open(path, 'w').close()
+            with open(path, 'w', encoding='utf-8'):
+                pass
             p = subprocess.run([sys.executable, GATE, '--pm', 'npm', '--allowlist', path, '--today', TODAY],
                                input='not json', capture_output=True, text=True)
         self.assertEqual(p.returncode, 1)
@@ -227,6 +228,16 @@ class AuditGateTest(unittest.TestCase):
         self.assertIn('a, b', out)
         self.assertIn('high以上 2 件', out)
 
+    def test_日付でない_today_はトレースバックでなく使い方のエラー(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, 'audit-allowlist')
+            with open(path, 'w', encoding='utf-8'):
+                pass
+            p = subprocess.run([sys.executable, GATE, '--allowlist', path, '--today', '2026/10/03'],
+                               input='{}', capture_output=True, text=True)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertNotIn('Traceback', p.stderr)
+
     def test_使われていない例外は通知する(self):
         rc, out = self.run_gate(npm_report(), f'{BRACES} 2026-12-31 修正版なし\n')
         self.assertEqual(rc, 0, out)
@@ -323,7 +334,8 @@ class EmbeddedCopyTest(unittest.TestCase):
     """
     def test_埋め込みと本体が一致する(self):
         import yaml
-        wf = yaml.safe_load(open(os.path.join(HERE, '..', '.github', 'workflows', 'node-ci.yml'), encoding='utf-8'))
+        with open(os.path.join(HERE, '..', '.github', 'workflows', 'node-ci.yml'), encoding='utf-8') as f:
+            wf = yaml.safe_load(f)
         runs = [st['run'] for job in wf['jobs'].values() for st in job.get('steps', [])
                 if "<<'AUDIT_GATE_PY'" in st.get('run', '')]
         self.assertEqual(len(runs), 1)

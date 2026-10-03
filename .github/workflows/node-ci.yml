@@ -362,9 +362,10 @@ jobs:
               ap = argparse.ArgumentParser()
               ap.add_argument('--pm', choices=['npm', 'pnpm'], default='npm')
               ap.add_argument('--allowlist', required=True)
-              ap.add_argument('--today', default=None, help='判定日 YYYY-MM-DD（省略時は UTC の今日）')
+              ap.add_argument('--today', type=datetime.date.fromisoformat, default=None,
+                              help='判定日 YYYY-MM-DD（省略時は UTC の今日）。日付でない値は使い方のエラーになる')
               a = ap.parse_args()
-              today = datetime.date.fromisoformat(a.today) if a.today else utc_today()
+              today = a.today or utc_today()
 
               try:
                   report = json.load(sys.stdin)
