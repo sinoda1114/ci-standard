@@ -429,7 +429,22 @@ class PnpmConfigTest(unittest.TestCase):
         # PyYAML は重複キーを後の値で黙って上書きする。前の値に除外設定を書いて検査をすり抜けさせない
         rc, out = self.check({'pnpm-workspace.yaml': 'auditConfig: {ignoreGhsas: [GHSA-vfj7-8cjw-p6xm]}\nauditConfig: {}\n'})
         self.assertEqual(rc, 1, out)
-        self.assertIn('重複', out)
+        self.assertIn('ignoreGhsas', out)
+
+    def test_pnpm_workspace_yaml_の2段の継承は通す(self):
+        # どの値が勝つかを計算しない。正しい 2 段のマージで落とさない
+        rc, out = self.check({'pnpm-workspace.yaml': 'x-base: &base {sharedWorkspaceLockfile: true}\n'
+                                                     'x-overrides: &overrides {<<: *base, sharedWorkspaceLockfile: false}\n'
+                                                     '<<: *overrides\n'})
+        self.assertEqual(rc, 0, out)
+
+    def test_pnpm_workspace_yaml_のマージキーを2回書いた除外設定も落とす(self):
+        # PyYAML と pnpm で勝つ値が食い違っても、書かれている除外設定はすべて見る
+        rc, out = self.check({'pnpm-workspace.yaml': 'x-a: &a {auditConfig: {ignoreGhsas: [GHSA-vfj7-8cjw-p6xm]}}\n'
+                                                     'x-b: &b {auditConfig: {}}\n'
+                                                     '<<: *a\n<<: *b\n'})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('ignoreGhsas', out)
 
     def test_pnpm_workspace_yaml_のマージキーは通す(self):
         # pnpm が読める正しい設定（<<: *anchor）を、重複キーの検査で落とさない
@@ -500,7 +515,8 @@ class WorkflowExpressionTest(unittest.TestCase):
                 continue
             with open(os.path.join(wf_dir, name), encoding='utf-8') as f:
                 for no, line in enumerate(f, 1):
-                    if '${{' not in line or line.lstrip().startswith('#'):
+                    # run: の中のシェルのコメントも Actions は評価するので、# で始まる行も飛ばさない
+                    if '${{' not in line:
                         continue
                     exprs = self.EXPR.findall(line)
                     self.assertEqual(line.count('${{'), len(exprs), f'{name}:{no} 閉じていない ${{{{: {line.strip()}')

@@ -112,29 +112,41 @@ def ignore_settings(section):
     return found
 
 
-def no_duplicate_loader(yaml):
-    """同じキーが 2 回出てきたら読み込みエラーにする SafeLoader を返す。
+def yaml_ignore_settings(yaml, root):
+    """YAML のノードを全部たどり、空でない除外設定と ${…} を含むキーがある場所を返す。
 
-    PyYAML の既定は後の値で黙って上書きするので、前の値に書いた除外設定を検査が見落とす。
-    比べるのは書かれたままの文字列。PyYAML は on と yes をどちらも True に変えるが、pnpm は別々の
-    文字列として読むので、変換後の値で比べると正しい設定を落とす。マージキー（<<）は比べない
-    （SafeLoader の construct_mapping が展開し、明示したキーが優先される。pnpm と同じ）。
+    PyYAML と pnpm は、重複キーやマージキー（<<）でどの値が勝つかが食い違うことがある。
+    勝つ値を計算せず、ファイルに書かれているものを全部見る（どの値が勝っても見落とさない）。
     """
-    class NoDuplicateLoader(yaml.SafeLoader):
-        pass
+    wanted = {normalize_key(k) for k in PNPM_IGNORE_KEYS}
+    found, seen = [], set()
 
-    def construct_mapping(loader, node, deep=False):
-        seen = set()
-        for key_node, _ in node.value:
-            if not isinstance(key_node, yaml.ScalarNode) or key_node.tag == 'tag:yaml.org,2002:merge':
-                continue
-            if key_node.value in seen:
-                raise yaml.constructor.ConstructorError(None, None, f'重複したキー {key_node.value!r}', key_node.start_mark)
-            seen.add(key_node.value)
-        return loader.construct_mapping(node, deep=deep)
+    def has_content(node):
+        if isinstance(node, (yaml.SequenceNode, yaml.MappingNode)):
+            return bool(node.value)
+        return node.value.strip() not in ('', '~', 'null', 'Null', 'NULL')
 
-    NoDuplicateLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, construct_mapping)
-    return NoDuplicateLoader
+    def walk(node, path):
+        if id(node) in seen:  # アンカーと別名で同じノードを何度も指す（循環も含む）
+            return
+        seen.add(id(node))
+        if isinstance(node, yaml.SequenceNode):
+            for item in node.value:
+                walk(item, path)
+        elif isinstance(node, yaml.MappingNode):
+            for key_node, value_node in node.value:
+                key = key_node.value if isinstance(key_node, yaml.ScalarNode) else '?'
+                name = path + [key]
+                if normalize_key(key) in wanted and has_content(value_node):
+                    found.append('.'.join(name))
+                # pnpm 11 は ${VAR} を展開する。展開後の名前は CI の環境で変わるので、展開を含むキーは落とす
+                if '${' in key:
+                    found.append('.'.join(name) + '（${…} の展開を含むキーは検査できないため使えません）')
+                walk(value_node, name)
+
+    if root is not None:
+        walk(root, [])
+    return found
 
 
 def pnpm_config_errors(project_dir):
@@ -163,16 +175,11 @@ def pnpm_config_errors(project_dir):
             # 名前の検索で代わりにするとエスケープ表記ですり抜けられるので、検査できないとして落とす
             return errors + ['pnpm-workspace.yaml を検査するための YAML パーサー（PyYAML）がありません。除外設定の有無を確かめられないため通しません']
         try:
-            data = yaml.load(body, Loader=no_duplicate_loader(yaml))
+            root = yaml.compose(body, Loader=yaml.SafeLoader)  # 値は組み立てず、書かれたままの形で見る
         except yaml.YAMLError as e:
             detail = type(e).__name__ + (': ' + e.problem if getattr(e, 'problem', None) else '')
             return errors + [f'pnpm-workspace.yaml を YAML として読めません（{detail}）。除外設定の有無を確かめられないため通しません']
-        if isinstance(data, dict):
-            # pnpm 11 は最上位のキーの ${VAR} を展開する。展開後の名前は CI の環境で変わるので、展開を含むキーは落とす
-            # 文言に波かっこを 2 つ続けて書かない。node-ci.yml に埋め込むと Actions の式として評価され、ワークフロー全体が起動しなくなる
-            errors += ['pnpm-workspace.yaml の最上位のキー ' + repr(k) + '（${…} の展開を含むキーは検査できないため使えません）'
-                       for k in data if isinstance(k, str) and '${' in k]
-            errors += ['pnpm-workspace.yaml の ' + name for name in ignore_settings(data)]
+        errors += ['pnpm-workspace.yaml の ' + name for name in yaml_ignore_settings(yaml, root)]
     return errors
 
 
