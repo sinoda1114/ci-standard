@@ -21,6 +21,7 @@ import re
 import sys
 
 BLOCKING = {'high', 'critical'}
+SEVERITIES = {'info', 'low', 'moderate', 'high', 'critical'}
 GHSA_RE = re.compile(r'GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}')
 LINE_RE = re.compile(r'^(GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4})\s+(\d{4}-\d{2}-\d{2})\s+(\S.*)$')
 
@@ -70,38 +71,64 @@ def shape_error(report, pm):
     return None
 
 
-def advisories(report, pm):
-    """{GHSA: (重大度, パッケージ名)} と、ID を取り出せない high 以上の一覧を返す。high 未満は含めない。"""
-    found, no_id = {}, []
-    if pm == 'pnpm':
-        for adv in report['advisories'].values():
-            if adv.get('severity') not in BLOCKING:
-                continue
+def pnpm_advisories(report):
+    """pnpm: {GHSA: (重大度, パッケージ名)} と、除外できない指摘（ID なし・重大度が不明）の一覧。"""
+    found, bad = {}, []
+    for adv in report['advisories'].values():
+        sev = adv.get('severity') if isinstance(adv, dict) else None
+        if sev not in SEVERITIES:
+            bad.append(f'{adv.get("module_name", "?") if isinstance(adv, dict) else adv} (重大度が不明: {sev})')
+        elif sev in BLOCKING:
             ghsa = adv.get('github_advisory_id') or ''.join(GHSA_RE.findall(adv.get('url') or '')[:1])
             if ghsa:
-                found[ghsa] = (adv['severity'], adv.get('module_name', '?'))
+                found[ghsa] = (sev, adv.get('module_name', '?'))
             else:
-                no_id.append(f"{adv.get('module_name', '?')} ({adv['severity']}, url={adv.get('url') or '-'})")
-        return found, no_id
+                bad.append(f"{adv.get('module_name', '?')} ({sev}, url={adv.get('url') or '-'})")
+    return found, bad
+
+
+def reaches_blocking_advisory(name, vulns, seen=None):
+    """npm: 項目 name から、依存元の参照をたどって high 以上の advisory 本体に届くか（循環は届かない扱い）。"""
+    seen = seen or set()
+    if name in seen or not isinstance(vulns.get(name), dict):
+        return False
+    seen.add(name)
+    for via in vulns[name].get('via') or []:
+        if isinstance(via, dict) and via.get('severity') in BLOCKING:
+            return True
+        if isinstance(via, str) and reaches_blocking_advisory(via, vulns, seen):
+            return True
+    return False
+
+
+def npm_advisories(report):
+    """npm: {GHSA: (重大度, パッケージ名)} と、除外できない指摘（ID なし・構造が不正）の一覧。"""
+    found, bad = {}, []
     vulns = report['vulnerabilities']
     for name, vuln in vulns.items():
         # 構造の壊れた項目を黙って無視しない（high 以上が隠れる経路になるため）
-        if not isinstance(vuln, dict) or not isinstance(vuln.get('via'), list):
-            no_id.append(f'{name} (構造が不正: via がリストではありません)')
-            continue
-        if vuln.get('severity') in BLOCKING and not any(
-                isinstance(v, dict) or (isinstance(v, str) and v in vulns) for v in vuln['via']):
-            no_id.append(f"{name} ({vuln['severity']}, 構造が不正: advisory も参照先の項目もありません)")
+        if not isinstance(vuln, dict) or not isinstance(vuln.get('via'), list) or vuln.get('severity') not in SEVERITIES:
+            bad.append(f'{name} (構造が不正: via がリストでない、または重大度が不明)')
             continue
         for via in vuln['via']:
-            if not isinstance(via, dict) or via.get('severity') not in BLOCKING:
-                continue  # 文字列は依存元を指すだけで、advisory 本体は別の項目にある
-            ids = GHSA_RE.findall(via.get('url') or '')
-            if ids:
-                found[ids[0]] = (via['severity'], via.get('name', name))
-            else:
-                no_id.append(f"{via.get('name', name)} ({via['severity']}, url={via.get('url') or '-'})")
-    return found, no_id
+            if isinstance(via, str):
+                continue  # 依存元を指すだけ。advisory 本体は別の項目にある（到達は下で確かめる）
+            if not isinstance(via, dict) or via.get('severity') not in SEVERITIES:
+                bad.append(f'{name} (構造が不正: advisory の重大度が不明: {via})')
+            elif via['severity'] in BLOCKING:
+                ids = GHSA_RE.findall(via.get('url') or '')
+                if ids:
+                    found[ids[0]] = (via['severity'], via.get('name', name))
+                else:
+                    bad.append(f"{via.get('name', name)} ({via['severity']}, url={via.get('url') or '-'})")
+        if vuln['severity'] in BLOCKING and not reaches_blocking_advisory(name, vulns):
+            bad.append(f"{name} ({vuln['severity']}, 構造が不正: high 以上の advisory 本体に到達できません)")
+    return found, bad
+
+
+def advisories(report, pm):
+    """{GHSA: (重大度, パッケージ名)} と、例外リストで除外できない high 以上の可能性がある指摘の一覧。"""
+    return pnpm_advisories(report) if pm == 'pnpm' else npm_advisories(report)
 
 
 def main():

@@ -136,6 +136,31 @@ class AuditGateTest(unittest.TestCase):
             rc, out = self.run_gate({'auditReportVersion': 2, 'vulnerabilities': vulns}, '')
             self.assertEqual(rc, 1, (vulns, out))
 
+    def test_advisory_本体に到達できない_high_は落とす(self):
+        # 空の advisory・自己参照・循環・severity の無い advisory は、high を隠す経路になる
+        broken = [
+            {'x': {'severity': 'high', 'via': [{}]}},
+            {'x': {'severity': 'high', 'via': ['x']}},
+            {'x': {'severity': 'high', 'via': ['y']}, 'y': {'severity': 'high', 'via': ['x']}},
+            {'x': {'severity': 'high', 'via': [{'url': f'https://github.com/advisories/{BRACES}'}]}},
+        ]
+        for vulns in broken:
+            rc, out = self.run_gate({'auditReportVersion': 2, 'vulnerabilities': vulns}, f'{BRACES} 2026-12-31 修正版なし\n')
+            self.assertEqual(rc, 1, (vulns, out))
+
+    def test_severity_の表記違いや不明な値は落とす(self):
+        for sev in ('HIGH', 'severe', None):
+            via = {'name': 'x', 'url': 'https://github.com/advisories/GHSA-aaaa-bbbb-cccc'}
+            if sev is not None:
+                via['severity'] = sev
+            report = {'auditReportVersion': 2, 'vulnerabilities': {'x': {'severity': 'high', 'via': [via]}}}
+            rc, out = self.run_gate(report, '')
+            self.assertEqual(rc, 1, (sev, out))
+        report = {'advisories': {'1': {'module_name': 'x', 'severity': 'HIGH',
+                                       'github_advisory_id': 'GHSA-aaaa-bbbb-cccc'}}, 'metadata': {}}
+        rc, out = self.run_gate(report, '', pm='pnpm')
+        self.assertEqual(rc, 1, out)
+
     def test_依存元が既存の項目を指すだけなら構造エラーにしない(self):
         rc, out = self.run_gate(npm_report(('braces', BRACES, 'high')), f'{BRACES} 2026-12-31 修正版なし\n')
         self.assertEqual(rc, 0, out)
@@ -151,6 +176,23 @@ class AuditGateTest(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn('使われていない', out)
 
+
+
+class EmbeddedCopyTest(unittest.TestCase):
+    """node-ci.yml に埋め込んだ判定スクリプトが scripts/audit-gate.py と同一であること。
+
+    ワークフローと判定の版がずれないよう埋め込んでいるので、片方だけ直すとここで落ちる。
+    """
+    def test_埋め込みと本体が一致する(self):
+        import yaml
+        wf = yaml.safe_load(open(os.path.join(HERE, '..', '.github', 'workflows', 'node-ci.yml'), encoding='utf-8'))
+        runs = [st['run'] for job in wf['jobs'].values() for st in job.get('steps', [])
+                if "<<'AUDIT_GATE_PY'" in st.get('run', '')]
+        self.assertEqual(len(runs), 1)
+        embedded = runs[0].split("<<'AUDIT_GATE_PY'\n", 1)[1].split('\nAUDIT_GATE_PY\n', 1)[0] + '\n'
+        with open(GATE, encoding='utf-8') as f:
+            self.assertEqual(embedded, f.read(),
+                             'scripts/audit-gate.py を直したら node-ci.yml の埋め込みも同じ内容にしてください')
 
 if __name__ == '__main__':
     unittest.main()
