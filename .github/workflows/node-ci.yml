@@ -303,22 +303,21 @@ jobs:
                   except (OSError, UnicodeDecodeError) as e:
                       return errors + [f'pnpm-workspace.yaml を読めません（{type(e).__name__}）。除外設定の有無を確かめられないため通しません']
                   try:
-                      import yaml  # GitHub のランナーには入っている。無ければ下の安全側の検査に切り替える
+                      import yaml  # GitHub のランナー（ubuntu）には入っている
                   except ImportError:
-                      yaml = None
-                  if yaml is not None:
-                      try:
-                          data = yaml.safe_load(body)
-                      except yaml.YAMLError as e:
-                          return errors + [f'pnpm-workspace.yaml を YAML として読めません（{type(e).__name__}）。除外設定の有無を確かめられないため通しません']
-                      cfg = data.get('auditConfig') if isinstance(data, dict) else None
+                      # 名前の検索で代わりにするとエスケープ表記ですり抜けられるので、検査できないとして落とす
+                      return errors + ['pnpm-workspace.yaml を検査するための YAML パーサー（PyYAML）がありません。除外設定の有無を確かめられないため通しません']
+                  try:
+                      data = yaml.safe_load(body)
+                  except yaml.YAMLError as e:
+                      return errors + [f'pnpm-workspace.yaml を YAML として読めません（{type(e).__name__}）。除外設定の有無を確かめられないため通しません']
+                  if isinstance(data, dict):
+                      # pnpm 11 は最上位のキーの ${VAR} を展開する。展開後の名前は CI の環境で変わるので、展開を含むキーは落とす
+                      errors += [f'pnpm-workspace.yaml の最上位のキー {k!r}（${{…}} の展開を含むキーは検査できないため使えません）'
+                                 for k in data if isinstance(k, str) and '${' in k]
+                      cfg = data.get('auditConfig')
                       if isinstance(cfg, dict):
                           errors += [f'pnpm-workspace.yaml の auditConfig.{k}' for k in PNPM_IGNORE_KEYS if cfg.get(k)]
-                  else:
-                      # YAML を読めない環境では、コメント以外にキー名が出てくれば落とす（書き方の違いですり抜けさせない）
-                      lines = [ln for ln in body.splitlines() if not ln.lstrip().startswith('#')]
-                      errors += [f'pnpm-workspace.yaml の {k}（YAML を解析できないため名前で検出）' for k in PNPM_IGNORE_KEYS
-                                 if any(k in ln for ln in lines)]
               return errors
 
 

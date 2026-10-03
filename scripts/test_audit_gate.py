@@ -410,6 +410,12 @@ class PnpmConfigTest(unittest.TestCase):
         rc, out = self.check({'pnpm-workspace.yaml': 'auditConfig:\n  ignoreGhsas: []\n'})
         self.assertEqual(rc, 0, out)
 
+    def test_pnpm_workspace_yaml_の環境変数を展開するキーは落とす(self):
+        # pnpm 11 は最上位のキーの ${VAR} を展開する。展開後に auditConfig になる書き方ですり抜けさせない
+        rc, out = self.check({'pnpm-workspace.yaml': '"${AUDIT_KEY}":\n  ignoreGhsas:\n    - GHSA-vfj7-8cjw-p6xm\n'})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('${', out)
+
     def test_pnpm_workspace_yaml_が壊れていたら落とす(self):
         rc, out = self.check({'pnpm-workspace.yaml': 'auditConfig: {ignoreGhsas: [\n'})
         self.assertEqual(rc, 1, out)

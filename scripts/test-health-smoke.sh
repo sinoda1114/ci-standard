@@ -109,7 +109,8 @@ mk_stub 'ci-standard\tmain\tfalse\npub-repo\tmain\tfalse\n' "$GREEN" ''
 run >/dev/null; first_is_ok && has "1 リポジトリ" && ok "既定の除外は sweep.sh と同じ" || ng "既定の除外は sweep.sh と同じ"
 
 # 例外リスト（.github/audit-allowlist）の期限が 14 日以内に迫ったら知らせる。期限の日に突然 CI が落ちるのを防ぐ
-day() { python3 -c "import datetime,sys;print((datetime.date.today()+datetime.timedelta(days=int(sys.argv[1]))).isoformat())" "$1"; }
+# 本体と同じ UTC の日付で作る（JST の午前 0〜9 時に回すと 1 日ずれるため）
+day() { python3 -c "import datetime,sys;print((datetime.datetime.now(datetime.timezone.utc).date()+datetime.timedelta(days=int(sys.argv[1]))).isoformat())" "$1"; }
 SOON=$(day 10); FAR=$(day 60); PAST=$(day -1)
 mk_stub "$PUB" "$GREEN" '' "# コメント\nGHSA-vfj7-8cjw-p6xm  ${SOON}  braces 修正版なし\n"
 run >/dev/null; ! first_is_ok && has "例外リストの期限" && has "GHSA-vfj7-8cjw-p6xm" && has "${SOON}" \
