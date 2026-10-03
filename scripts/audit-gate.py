@@ -106,6 +106,9 @@ def ignore_settings(section):
         if normalize_key(key) != 'auditconfig' or not isinstance(cfg, dict):
             continue
         found += [f'{key}.{k}' for k, v in cfg.items() if normalize_key(k) in wanted and v]
+        # 展開後の名前は CI の環境で変わるので、${…} を含むキーは除外設定かどうか確かめられない
+        found += [str(key) + '.' + k + '（${…} の展開を含むキーは検査できないため使えません）'
+                  for k in cfg if isinstance(k, str) and '${' in k]
     return found
 
 
@@ -113,6 +116,9 @@ def no_duplicate_loader(yaml):
     """同じキーが 2 回出てきたら読み込みエラーにする SafeLoader を返す。
 
     PyYAML の既定は後の値で黙って上書きするので、前の値に書いた除外設定を検査が見落とす。
+    比べるのは書かれたままの文字列。PyYAML は on と yes をどちらも True に変えるが、pnpm は別々の
+    文字列として読むので、変換後の値で比べると正しい設定を落とす。マージキー（<<）は比べない
+    （SafeLoader の construct_mapping が展開し、明示したキーが優先される。pnpm と同じ）。
     """
     class NoDuplicateLoader(yaml.SafeLoader):
         pass
@@ -120,14 +126,11 @@ def no_duplicate_loader(yaml):
     def construct_mapping(loader, node, deep=False):
         seen = set()
         for key_node, _ in node.value:
-            key = loader.construct_object(key_node, deep=deep)
-            try:
-                duplicated = key in seen
-            except TypeError:  # 辞書やリストのキー。SafeLoader 自身がエラーにする
+            if not isinstance(key_node, yaml.ScalarNode) or key_node.tag == 'tag:yaml.org,2002:merge':
                 continue
-            if duplicated:
-                raise yaml.constructor.ConstructorError(None, None, f'重複したキー {key!r}', key_node.start_mark)
-            seen.add(key)
+            if key_node.value in seen:
+                raise yaml.constructor.ConstructorError(None, None, f'重複したキー {key_node.value!r}', key_node.start_mark)
+            seen.add(key_node.value)
         return loader.construct_mapping(node, deep=deep)
 
     NoDuplicateLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, construct_mapping)

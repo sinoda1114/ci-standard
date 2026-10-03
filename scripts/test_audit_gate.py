@@ -398,7 +398,7 @@ class PnpmConfigTest(unittest.TestCase):
         rc, out = self.check({'package.json': '{}',
                               'pnpm-workspace.yaml': 'packages:\n  - "."\nauditConfig:\n  ignoreGhsas:\n    - GHSA-vfj7-8cjw-p6xm\n'})
         self.assertEqual(rc, 1, out)
-        self.assertIn('pnpm-workspace.yaml', out)
+        self.assertIn('auditConfig.ignoreGhsas', out)  # PyYAML が無いときの別の理由の失敗で通らないよう、検出したキー名まで見る
 
     def test_pnpm_workspace_yaml_のフロー形式も落とす(self):
         rc, out = self.check({'pnpm-workspace.yaml': 'packages: ["."]\nauditConfig: {ignoreGhsas: [GHSA-vfj7-8cjw-p6xm]}\n'})
@@ -423,12 +423,33 @@ class PnpmConfigTest(unittest.TestCase):
     def test_pnpm_workspace_yaml_が壊れていたら落とす(self):
         rc, out = self.check({'pnpm-workspace.yaml': 'auditConfig: {ignoreGhsas: [\n'})
         self.assertEqual(rc, 1, out)
+        self.assertIn('YAML として読めません', out)
 
     def test_pnpm_workspace_yaml_の重複キーは落とす(self):
         # PyYAML は重複キーを後の値で黙って上書きする。前の値に除外設定を書いて検査をすり抜けさせない
         rc, out = self.check({'pnpm-workspace.yaml': 'auditConfig: {ignoreGhsas: [GHSA-vfj7-8cjw-p6xm]}\nauditConfig: {}\n'})
         self.assertEqual(rc, 1, out)
         self.assertIn('重複', out)
+
+    def test_pnpm_workspace_yaml_のマージキーは通す(self):
+        # pnpm が読める正しい設定（<<: *anchor）を、重複キーの検査で落とさない
+        rc, out = self.check({'pnpm-workspace.yaml': 'x-common: &common\n  react: ^19\ncatalog:\n  <<: *common\n  vue: ^3\n'})
+        self.assertEqual(rc, 0, out)
+
+    def test_pnpm_workspace_yaml_のマージで持ち込んだ除外設定は落とす(self):
+        rc, out = self.check({'pnpm-workspace.yaml': 'x-base: &base\n  auditConfig:\n    ignoreGhsas: [GHSA-vfj7-8cjw-p6xm]\n<<: *base\n'})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('ignoreGhsas', out)
+
+    def test_pnpm_workspace_yaml_の_on_と_yes_は別のキーとして通す(self):
+        # PyYAML はどちらも真偽値 True に変えるが、pnpm は文字列として別々に読む
+        rc, out = self.check({'pnpm-workspace.yaml': 'catalog:\n  on: 1.0.0\n  yes: 2.0.0\n'})
+        self.assertEqual(rc, 0, out)
+
+    def test_auditConfig_の中の環境変数を展開するキーも落とす(self):
+        rc, out = self.check({'pnpm-workspace.yaml': 'auditConfig:\n  "${K}":\n    - GHSA-vfj7-8cjw-p6xm\n'})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('${', out)
 
     def test_pnpm_workspace_yaml_の綴りを変えたキーも落とす(self):
         # 大文字小文字・ハイフン・下線の違いですり抜けさせない
@@ -470,7 +491,7 @@ class WorkflowExpressionTest(unittest.TestCase):
     ワークフロー全体が起動しなくなり、配布先のすべてのリポジトリで CI が止まる。
     """
     EXPR = re.compile(r"\$\{\{(.*?)\}\}")
-    ALLOWED = re.compile(r"^[A-Za-z0-9_.\-'\" ()!=&|,\[\]*<>]*$")
+    ALLOWED = re.compile(r"^[\x20-\x7e]*[^\s][\x20-\x7e]*$")  # ASCII の印字可能文字だけで、空でない
 
     def test_式として読めない_dollar_brace_brace_が無い(self):
         wf_dir = os.path.join(HERE, '..', '.github', 'workflows')
@@ -479,7 +500,7 @@ class WorkflowExpressionTest(unittest.TestCase):
                 continue
             with open(os.path.join(wf_dir, name), encoding='utf-8') as f:
                 for no, line in enumerate(f, 1):
-                    if '${{' not in line:
+                    if '${{' not in line or line.lstrip().startswith('#'):
                         continue
                     exprs = self.EXPR.findall(line)
                     self.assertEqual(line.count('${{'), len(exprs), f'{name}:{no} 閉じていない ${{{{: {line.strip()}')
