@@ -159,7 +159,8 @@ GHSA-vfj7-8cjw-p6xm    2026-12-31  braces。修正版なし（3.0.3 も影響範
 - 書式の違う行・同じ GHSA の重複も CI を落とす。
 - audit 自体の失敗（`{"error": …}`、想定外の形の JSON）は「脆弱性なし」と扱わず CI を落とす。
 - GHSA の ID を取り出せない high 以上の指摘は、例外リストで除外できないので常に CI を落とす。
-- 期限の判定は runner の日付（UTC）。
+- 期限の判定は UTC の日付（`TZ` の設定に左右されない）。
+- `#` で始まる行はコメント。理由の中に `#` を書いてもよい（例: `issue #123 参照`）。
 - 使われなくなった行は CI のログに通知が出る。
 - ファイルが無いリポジトリは従来の `npm audit --audit-level=high` のまま。判定は `scripts/audit-gate.py`（テストは `scripts/test_audit_gate.py`）。
 - 判定スクリプトは、呼び出されたワークフローと版がずれないよう `node-ci.yml` に埋め込んである。`scripts/audit-gate.py` を直したら埋め込みも同じ内容にする（一致しないと self-test が落ちる）。

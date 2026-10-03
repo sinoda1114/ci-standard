@@ -194,13 +194,13 @@ jobs:
 
           使い方: npm audit --json | python3 audit-gate.py --pm npm --allowlist .github/audit-allowlist [--today YYYY-MM-DD]
 
-          例外リストの書式（1 行 1 件、# 以降はコメント）:
+          例外リストの書式（1 行 1 件。# で始まる行はコメント。理由の中の # はそのまま理由の一部）:
               GHSA-xxxx-xxxx-xxxx  YYYY-MM-DD  理由
             期限の日を過ぎた行は無効になり、CI を落とす（放置を防ぐため）。
 
           終了コード: 0 = 通す / 1 = 落とす（未登録の high 以上、期限切れ、書式エラー、audit の失敗や想定外の形の JSON）
           GHSA の ID を取り出せない high 以上の advisory は、例外リストで扱えないので常に落とす（fail-closed）。
-          期限の判定は runner の日付（UTC）で行う。
+          期限の判定は UTC の日付で行う（TZ の設定に左右されない）。
           """
           import argparse
           import datetime
@@ -211,6 +211,28 @@ jobs:
           BLOCKING = {'high', 'critical'}
           SEVERITIES = {'info', 'low', 'moderate', 'high', 'critical'}
           GHSA_RE = re.compile(r'GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}')
+          def utc_today():
+              """期限の判定に使う今日の日付（UTC）。TZ が設定されていても変わらない。"""
+              return datetime.datetime.now(datetime.timezone.utc).date()
+
+
+          def text(value):
+              """外部の値を文字列として扱う（文字列以外は空文字）。型違いで落ちないようにする。"""
+              return value if isinstance(value, str) else ''
+
+
+          def severity_of(obj):
+              """重大度を返す。辞書でない・文字列でない・未知の値は None（呼び出し側で構造の不正とする）。"""
+              sev = obj.get('severity') if isinstance(obj, dict) else None
+              return sev if isinstance(sev, str) and sev in SEVERITIES else None
+
+
+          def emit(kind, message):
+              """ワークフローコマンドを 1 行で出す。外部の文字列の改行で別のコマンド行が作られないよう無害化する。"""
+              safe = message.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+              print(f'::{kind}::{safe}')
+
+
           LINE_RE = re.compile(r'^(GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4})\s+(\d{4}-\d{2}-\d{2})\s+(\S.*)$')
 
 
@@ -220,8 +242,8 @@ jobs:
               with open(path, encoding='utf-8') as f:
                   lines = f.readlines()
               for no, raw in enumerate(lines, 1):
-                  line = raw.split('#', 1)[0].strip()
-                  if not line:
+                  line = raw.strip()
+                  if not line or line.startswith('#'):
                       continue
                   m = LINE_RE.match(line)
                   if not m:
@@ -263,15 +285,17 @@ jobs:
               """pnpm: {GHSA: (重大度, パッケージ名)} と、除外できない指摘（ID なし・重大度が不明）の一覧。"""
               found, bad = {}, []
               for adv in report['advisories'].values():
-                  sev = adv.get('severity') if isinstance(adv, dict) else None
-                  if sev not in SEVERITIES:
-                      bad.append(f'{adv.get("module_name", "?") if isinstance(adv, dict) else adv} (重大度が不明: {sev})')
+                  sev = severity_of(adv)
+                  mod = text(adv.get('module_name')) if isinstance(adv, dict) else ''
+                  if sev is None:
+                      bad.append(f'{mod or "?"} (重大度が不明、または構造が不正)')
                   elif sev in BLOCKING:
-                      ghsa = adv.get('github_advisory_id') or ''.join(GHSA_RE.findall(adv.get('url') or '')[:1])
+                      ghsa = ''.join(GHSA_RE.findall(text(adv.get('github_advisory_id')))[:1]) \
+                          or ''.join(GHSA_RE.findall(text(adv.get('url')))[:1])
                       if ghsa:
-                          found[ghsa] = (sev, adv.get('module_name', '?'))
+                          found[ghsa] = (sev, mod or '?')
                       else:
-                          bad.append(f"{adv.get('module_name', '?')} ({sev}, url={adv.get('url') or '-'})")
+                          bad.append(f"{mod or '?'} ({sev}, url={text(adv.get('url')) or '-'})")
               return found, bad
 
 
@@ -282,7 +306,7 @@ jobs:
                   return False
               seen.add(name)
               for via in vulns[name].get('via') or []:
-                  if isinstance(via, dict) and via.get('severity') in BLOCKING:
+                  if severity_of(via) in BLOCKING:
                       return True
                   if isinstance(via, str) and reaches_blocking_advisory(via, vulns, seen):
                       return True
@@ -295,7 +319,7 @@ jobs:
               vulns = report['vulnerabilities']
               for name, vuln in vulns.items():
                   # 構造の壊れた項目を黙って無視しない（high 以上が隠れる経路になるため）
-                  if not isinstance(vuln, dict) or not isinstance(vuln.get('via'), list) or vuln.get('severity') not in SEVERITIES:
+                  if not isinstance(vuln, dict) or not isinstance(vuln.get('via'), list) or severity_of(vuln) is None:
                       bad.append(f'{name} (構造が不正: via がリストでない、または重大度が不明)')
                       continue
                   for via in vuln['via']:
@@ -303,15 +327,17 @@ jobs:
                           if via not in vulns:  # 参照先が無いのは壊れた結果。別の経路で届いても見逃さない
                               bad.append(f'{name} (構造が不正: 参照先の項目がありません: {via})')
                           continue  # 依存元を指すだけ。advisory 本体は別の項目にある（到達は下で確かめる）
-                      if not isinstance(via, dict) or via.get('severity') not in SEVERITIES:
-                          bad.append(f'{name} (構造が不正: advisory の重大度が不明: {via})')
-                      elif via['severity'] in BLOCKING:
-                          ids = GHSA_RE.findall(via.get('url') or '')
+                      sev = severity_of(via)
+                      if sev is None:
+                          bad.append(f'{name} (構造が不正: advisory の重大度が不明)')
+                      elif sev in BLOCKING:
+                          ids = GHSA_RE.findall(text(via.get('url')))
+                          pkg = text(via.get('name')) or name
                           if ids:
-                              found[ids[0]] = (via['severity'], via.get('name', name))
+                              found[ids[0]] = (sev, pkg)
                           else:
-                              bad.append(f"{via.get('name', name)} ({via['severity']}, url={via.get('url') or '-'})")
-                  if vuln['severity'] in BLOCKING and not reaches_blocking_advisory(name, vulns):
+                              bad.append(f"{pkg} ({sev}, url={text(via.get('url')) or '-'})")
+                  if severity_of(vuln) in BLOCKING and not reaches_blocking_advisory(name, vulns):
                       bad.append(f"{name} ({vuln['severity']}, 構造が不正: high 以上の advisory 本体に到達できません)")
               return found, bad
 
@@ -325,49 +351,53 @@ jobs:
               ap = argparse.ArgumentParser()
               ap.add_argument('--pm', choices=['npm', 'pnpm'], default='npm')
               ap.add_argument('--allowlist', required=True)
-              ap.add_argument('--today', default=datetime.date.today().isoformat())
+              ap.add_argument('--today', default=None, help='判定日 YYYY-MM-DD（省略時は UTC の今日）')
               a = ap.parse_args()
-              today = datetime.date.fromisoformat(a.today)
+              today = datetime.date.fromisoformat(a.today) if a.today else utc_today()
 
               try:
                   report = json.load(sys.stdin)
               except ValueError as e:
-                  print(f'::error::audit の JSON が読めません: {e}')
+                  emit('error', f'audit の JSON が読めません: {e}')
                   return 1
               problem = shape_error(report, a.pm)
               if problem:
-                  print(f'::error::{problem}（audit が実行できていない可能性があります。脆弱性なしとは扱いません）')
+                  emit('error', f'{problem}（audit が実行できていない可能性があります。脆弱性なしとは扱いません）')
                   return 1
               allow, errors = load_allowlist(a.allowlist)
-              found, no_id = advisories(report, a.pm)
+              try:
+                  found, no_id = advisories(report, a.pm)
+              except Exception as e:  # 想定外の構造でもトレースバックではなく判定の失敗として扱う
+                  emit('error', f'audit の結果を解釈できません（{type(e).__name__}: {e}）')
+                  return 1
 
-              blocking, expired = [], []
+              blocking, expired, allowed = [], [], 0
               for ghsa, (sev, pkg) in sorted(found.items()):
                   if ghsa not in allow:
                       blocking.append(f'{ghsa} ({sev}, {pkg})')
                   elif allow[ghsa][0] < today:
                       expired.append(f'{ghsa} ({sev}, {pkg}) 期限 {allow[ghsa][0]}')
                   else:
-                      print(f'::notice::例外リストにより除外: {ghsa} ({sev}, {pkg}) 期限 {allow[ghsa][0]} 理由: {allow[ghsa][1]}')
+                      allowed += 1
+                      emit('notice', f'例外リストにより除外: {ghsa} ({sev}, {pkg}) 期限 {allow[ghsa][0]} 理由: {allow[ghsa][1]}')
               for ghsa in sorted(set(allow) - set(found)):
                   if allow[ghsa][0] < today:  # 使われていなくても期限切れの行は放置させない
                       expired.append(f'{ghsa}（使われていない例外）期限 {allow[ghsa][0]}')
                   else:
-                      print(f'::notice::使われていない例外です（解消済みなら行を消してください）: {ghsa}')
+                      emit('notice', f'使われていない例外です（解消済みなら行を消してください）: {ghsa}')
 
               for e in errors:
-                  print(f'::error::{e}')
+                  emit('error', e)
               for b in blocking:
-                  print(f'::error::high 以上の脆弱性（例外リストに無し）: {b}')
+                  emit('error', f'high 以上の脆弱性（例外リストに無し）: {b}')
               for n in no_id:
-                  print(f'::error::high 以上の可能性がある指摘（GHSA の ID が無い、または構造が不正なため例外リストで除外できません）: {n}')
+                  emit('error', f'high 以上の可能性がある指摘（GHSA の ID が無い、または構造が不正なため例外リストで除外できません）: {n}')
               for x in expired:
-                  print(f'::error::例外の期限切れ: {x}（修正版を確認し、行を消すか期限を延ばしてください）')
+                  emit('error', f'例外の期限切れ: {x}（修正版を確認し、行を消すか期限を延ばしてください）')
               ok = not (errors or blocking or expired or no_id)
-              print(f'audit-gate: high以上 {len(found) + len(no_id)} 件 / 除外 {len(found) - len(blocking) - len(expired)} 件 / '
+              print(f'audit-gate: high以上 {len(found) + len(no_id)} 件 / 除外 {allowed} 件 / '
                     f'未登録 {len(blocking)} 件 / ID なし {len(no_id)} 件 / 期限切れ {len(expired)} 件 → {"通過" if ok else "失敗"}')
               return 0 if ok else 1
-
 
           if __name__ == '__main__':
               sys.exit(main())

@@ -43,7 +43,7 @@ class AuditGateTest(unittest.TestCase):
     def run_gate(self, report, allowlist, pm='npm'):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, 'audit-allowlist')
-            with open(path, 'w') as f:
+            with open(path, 'w', encoding='utf-8') as f:
                 f.write(allowlist)
             p = subprocess.run([sys.executable, GATE, '--pm', pm, '--allowlist', path, '--today', TODAY],
                                input=json.dumps(report), capture_output=True, text=True)
@@ -182,6 +182,52 @@ class AuditGateTest(unittest.TestCase):
         rc, out = self.run_gate(npm_report(), f'{BRACES} 2026-10-02 修正版なし\n')
         self.assertEqual(rc, 1, out)
         self.assertIn('期限切れ', out)
+
+    def test_集計の除外件数は使われていない期限切れを含めない(self):
+        report = npm_report(('braces', BRACES, 'high'))
+        rc, out = self.run_gate(report, f'{BRACES} 2026-12-31 修正版なし\nGHSA-aaaa-bbbb-cccc 2026-10-01 古い例外\n')
+        self.assertEqual(rc, 1, out)
+        self.assertIn('除外 1 件', out)
+        rc, out = self.run_gate(npm_report(), 'GHSA-aaaa-bbbb-cccc 2026-10-01 古い例外\n')
+        self.assertNotIn('除外 -', out)
+
+    def test_型の違う値はトレースバックでなくエラーとして落とす(self):
+        cases = [
+            {'auditReportVersion': 2, 'vulnerabilities': {'x': {'severity': 'high', 'via': [{'severity': 'high', 'url': 123}]}}},
+            {'auditReportVersion': 2, 'vulnerabilities': {'x': {'severity': ['high'], 'via': []}}},
+            {'auditReportVersion': 2, 'vulnerabilities': {'x': {'severity': 'high', 'via': [{'severity': {'a': 1}}]}}},
+        ]
+        for report in cases:
+            rc, out = self.run_gate(report, '')
+            self.assertEqual(rc, 1, (report, out))
+            self.assertNotIn('Traceback', out)
+        rc, out = self.run_gate({'advisories': {'1': {'severity': ['high'], 'url': 5}}, 'metadata': {}}, '', pm='pnpm')
+        self.assertEqual(rc, 1, out)
+        self.assertNotIn('Traceback', out)
+
+    def test_既定の今日は_UTC_で決まる(self):
+        # TZ を UTC+14 にしても、--today を省いたときの判定日は UTC の日付になる
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, 'audit-allowlist')
+            open(path, 'w', encoding='utf-8').close()
+            code = ("import datetime,runpy,sys;sys.argv=['x','--allowlist','/dev/null'];"
+                    "g=runpy.run_path(%r);print(g['utc_today']())" % GATE)
+            env = dict(os.environ, TZ='Etc/GMT-14')
+            got = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, env=env).stdout.strip()
+        import datetime
+        self.assertEqual(got, datetime.datetime.now(datetime.timezone.utc).date().isoformat())
+
+    def test_理由に_シャープ_を書いてもコメント扱いにしない(self):
+        rc, out = self.run_gate(npm_report(('braces', BRACES, 'high')), f'{BRACES} 2026-12-31 修正版なし issue #123 参照\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn('#123', out)
+
+    def test_ログに出す外部の文字列は改行を無害化する(self):
+        report = {'auditReportVersion': 2, 'vulnerabilities': {'x': {'severity': 'high', 'via': [
+            {'severity': 'high', 'name': 'x\n::add-mask::secret', 'url': 'https://example.com/a'}]}}}
+        rc, out = self.run_gate(report, '')
+        self.assertEqual(rc, 1, out)
+        self.assertNotIn('\n::add-mask::', out)
 
     def test_使われていない例外は通知する(self):
         rc, out = self.run_gate(npm_report(), f'{BRACES} 2026-12-31 修正版なし\n')
