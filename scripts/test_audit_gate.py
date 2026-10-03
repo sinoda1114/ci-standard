@@ -171,6 +171,18 @@ class AuditGateTest(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertIn('重複', out)
 
+    def test_参照先の無い依存元が混ざったら落とす(self):
+        # 別の経路で advisory に届いても、存在しない項目を指す参照は壊れた結果として扱う
+        report = npm_report(('braces', BRACES, 'high'))
+        report['vulnerabilities']['x'] = {'name': 'x', 'severity': 'high', 'via': ['braces', 'missing-package']}
+        rc, out = self.run_gate(report, f'{BRACES} 2026-12-31 修正版なし\n')
+        self.assertEqual(rc, 1, out)
+
+    def test_使われていない例外でも期限切れなら落とす(self):
+        rc, out = self.run_gate(npm_report(), f'{BRACES} 2026-10-02 修正版なし\n')
+        self.assertEqual(rc, 1, out)
+        self.assertIn('期限切れ', out)
+
     def test_使われていない例外は通知する(self):
         rc, out = self.run_gate(npm_report(), f'{BRACES} 2026-12-31 修正版なし\n')
         self.assertEqual(rc, 0, out)

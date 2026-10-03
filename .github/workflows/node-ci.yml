@@ -300,6 +300,8 @@ jobs:
                       continue
                   for via in vuln['via']:
                       if isinstance(via, str):
+                          if via not in vulns:  # 参照先が無いのは壊れた結果。別の経路で届いても見逃さない
+                              bad.append(f'{name} (構造が不正: 参照先の項目がありません: {via})')
                           continue  # 依存元を指すだけ。advisory 本体は別の項目にある（到達は下で確かめる）
                       if not isinstance(via, dict) or via.get('severity') not in SEVERITIES:
                           bad.append(f'{name} (構造が不正: advisory の重大度が不明: {via})')
@@ -348,7 +350,10 @@ jobs:
                   else:
                       print(f'::notice::例外リストにより除外: {ghsa} ({sev}, {pkg}) 期限 {allow[ghsa][0]} 理由: {allow[ghsa][1]}')
               for ghsa in sorted(set(allow) - set(found)):
-                  print(f'::notice::使われていない例外です（解消済みなら行を消してください）: {ghsa}')
+                  if allow[ghsa][0] < today:  # 使われていなくても期限切れの行は放置させない
+                      expired.append(f'{ghsa}（使われていない例外）期限 {allow[ghsa][0]}')
+                  else:
+                      print(f'::notice::使われていない例外です（解消済みなら行を消してください）: {ghsa}')
 
               for e in errors:
                   print(f'::error::{e}')
