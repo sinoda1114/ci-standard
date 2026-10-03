@@ -144,3 +144,18 @@ Reusable Workflow）が Bot のレビュー投稿をきっかけに起動し、3
   参照しないコードになっているが、保証はコード側にあり GitHub 側にはない。
   **各リポジトリを触る機会に PR で除去して収束させる**（`setup-ci.sh` / `rollout-all.sh`
   も inherit を出さないよう修正済み）。
+
+## audit の例外リスト（修正版がまだ無い脆弱性）
+
+`node-ci.yml` の audit は high 以上で CI を落とす。修正版が公開されていない脆弱性で CI が止まり続ける場合だけ、
+対象リポジトリに `.github/audit-allowlist` を置いて、理由と期限つきで除外できる（npm / pnpm。yarn は従来どおり best-effort）。
+
+```
+# GHSA-ID              期限        理由
+GHSA-vfj7-8cjw-p6xm    2026-12-31  braces。修正版なし（3.0.3 も影響範囲）。eslint-config-next 経由の開発用依存
+```
+
+- 期限の日を過ぎた行は無効になり CI が落ちる。修正版を確認して行を消すか、期限を延ばす（放置を防ぐため）。
+- 書式の違う行・JSON の読めない audit 結果も CI を落とす。
+- 使われなくなった行は CI のログに通知が出る。
+- ファイルが無いリポジトリは従来の `npm audit --audit-level=high` のまま。判定は `scripts/audit-gate.py`（テストは `scripts/test_audit_gate.py`）。

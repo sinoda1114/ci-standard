@@ -35,6 +35,9 @@ jobs:
         # 2026-09-21 に pull_request_review_thread を配布して全リポジトリを止めた再発防止。
         run: python3 scripts/validate-triggers.py
 
+      - name: audit の例外リスト判定の単体テスト
+        run: python3 -m unittest discover -s scripts -p 'test_audit_gate.py' -v
+
       - name: pr-triage 単体テスト
         run: python3 -m unittest discover -s scripts/pr-triage -v
       - name: sweep.sh スモーク（gh スタブ。bash -n では未定義変数などの実行時エラーを検出できない）

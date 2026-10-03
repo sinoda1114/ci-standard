@@ -176,10 +176,29 @@ jobs:
         if: env.HAS_BUILD == 'true'
         run: ${{ needs.detect.outputs.pm }} run build
 
+      # 修正版が公開されていない脆弱性は、リポジトリの .github/audit-allowlist に理由と期限つきで書けば除外できる
+      # （書式と判定は scripts/audit-gate.py）。ファイルが無いリポジトリは従来どおりの audit のまま。
+      - name: 例外リスト用の判定スクリプトを取得
+        if: hashFiles('.github/audit-allowlist') != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: sinoda1114/ci-standard
+          ref: main
+          path: .ci-standard
+          persist-credentials: false
+
       - name: Audit (high以上を検出)
         env:
           PM: ${{ needs.detect.outputs.pm }}
         run: |
+          if [ -f .github/audit-allowlist ] && [ "$PM" != yarn ]; then
+            # audit は脆弱性があると非 0 で終わるので、合否は判定スクリプトに任せる（JSON が壊れていれば判定側で落ちる）
+            if [ "$PM" = pnpm ]; then pnpm audit --json > "$RUNNER_TEMP/audit.json" || true
+            else npm audit --json > "$RUNNER_TEMP/audit.json" || true; fi
+            python3 .ci-standard/scripts/audit-gate.py --pm "$([ "$PM" = pnpm ] && echo pnpm || echo npm)" \
+              --allowlist .github/audit-allowlist < "$RUNNER_TEMP/audit.json"
+            exit $?
+          fi
           case "$PM" in
             pnpm) pnpm audit --audit-level high ;;
             # yarn は classic/berry で audit の作法が違うため best-effort（CIを落とさない）
