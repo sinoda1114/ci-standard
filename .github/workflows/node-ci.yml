@@ -491,6 +491,10 @@ jobs:
           # 例外リストの有無にかかわらず、見つけたら落とす（例外リストへ移す）
           # 判定は python3 -I（隔離モード）で動かす。ci.env などの PYTHONPATH・sitecustomize で判定を無効にさせないため
           if [ "$PM" = pnpm ]; then
+            # pnpm-workspace.yaml の検査には PyYAML が要る。-I は user site を読まないので、無ければ system に入れる
+            if [ -f pnpm-workspace.yaml ] && ! python3 -I -c 'import yaml' 2>/dev/null; then
+              sudo apt-get install -y -qq python3-yaml >/dev/null 2>&1 || echo "::warning::python3-yaml を入れられませんでした（pnpm-workspace.yaml の検査は落ちます）"
+            fi
             python3 -I "$RUNNER_TEMP/audit-gate.py" --pm pnpm --config-only --project-dir . || exit 1
           fi
           if [ -f .github/audit-allowlist ] && [ "$PM" != yarn ]; then

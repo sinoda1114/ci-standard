@@ -14,6 +14,7 @@ GATE = os.path.join(HERE, 'audit-gate.py')
 TODAY = '2026-10-03'
 BRACES = 'GHSA-vfj7-8cjw-p6xm'
 NEXT_RCE = 'GHSA-vcvr-r3jv-pc5j'
+ISOLATED = ['-I'] if subprocess.run([sys.executable, '-I', '-c', 'import yaml'], capture_output=True).returncode == 0 else []
 
 
 def npm_report(*advisories):
@@ -367,7 +368,9 @@ class PnpmConfigTest(unittest.TestCase):
             for name, body in files.items():
                 with open(os.path.join(d, name), 'w', encoding='utf-8') as f:
                     f.write(body)
-            p = subprocess.run([sys.executable, GATE, '--pm', 'pnpm', '--config-only', '--project-dir', d],
+            # 本番（node-ci.yml）と同じく -I（隔離モード）で動かす（CI の self-test は system に PyYAML を入れる）。
+            # 手元で -I から PyYAML が見えないときだけ -I を外す
+            p = subprocess.run([sys.executable, *ISOLATED, GATE, '--pm', 'pnpm', '--config-only', '--project-dir', d],
                                capture_output=True, text=True)
             return p.returncode, p.stdout + p.stderr
 
