@@ -6,12 +6,14 @@
 #   1. 既定ブランチの最新の完了済み ci.yml run が success / skipped / neutral 以外
 #      （failure だけでなく startup_failure・timed_out・cancelled も赤。2026-09-21 の障害は startup_failure だった）
 #   2. critical / high の未解決 Dependabot アラートがある
-#   3. 上の 2 つを確認できなかった（権限不足・レート制限・障害）。見えていないことを「問題なし」と言わない
+#   3. 例外リスト（.github/audit-allowlist）に、期限が 14 日以内（または期限切れ）の行がある
+#      （期限の日に突然 CI が落ちるのを防ぐ。修正版が出たか確かめて行を消すか、理由を確かめて期限を延ばす）
+#   4. 上の 3 つを確認できなかった（権限不足・レート制限・障害）。見えていないことを「問題なし」と言わない
 #
 # 出力は public リポジトリ ci-standard の Issue に載る。private リポジトリは名前と件数だけにし、
 # パッケージ名とリンクは出さない（どの private リポジトリに何の脆弱性があるかを公開しないため）。
 #
-# 必要な PAT 権限: Actions: read（run の取得）、Dependabot alerts: read（アラートの取得）。
+# 必要な PAT 権限: Actions: read（run の取得）、Dependabot alerts: read（アラートの取得）、Contents: read（例外リストの取得）。
 #
 # sweeper と違い、このスクリプトは**何も変更しない**（読むだけ）。
 # 使い方: GH_TOKEN=<PAT> bash scripts/health-watch.sh
@@ -30,7 +32,24 @@ LIST=$(gh api --paginate "/user/repos?per_page=100&affiliation=owner" \
        | \"\(.name)\t\(.default_branch)\t\(.private)\"" 2>/dev/null) || {
   echo "リポジトリ一覧の取得に失敗しました" >&2; exit 1; }
 
-red=""; vuln=""; unknown=""; n_red=0; n_vuln=0; n_unknown=0; n_total=0
+red=""; vuln=""; soon=""; unknown=""; n_red=0; n_vuln=0; n_soon=0; n_unknown=0; n_total=0
+SOON_DAYS="${SOON_DAYS:-14}"
+
+# 例外リストの本文から、期限が SOON_DAYS 日以内の行を "GHSA<TAB>期限<TAB>残り日数" で出す（書式は ci-standard の audit-gate.py と同じ）
+soon_entries() { python3 -c '
+import datetime, re, sys
+today, days = datetime.date.fromisoformat(sys.argv[1]), int(sys.argv[2])
+for line in sys.stdin:
+    m = re.match(r"\s*(GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4})\s+(\d{4}-\d{2}-\d{2})\s", line)
+    if not m:
+        continue
+    try:
+        left = (datetime.date.fromisoformat(m.group(2)) - today).days
+    except ValueError:
+        continue
+    if left <= days:
+        print(f"{m.group(1)}\t{m.group(2)}\t{left}")
+' "$TODAY" "$SOON_DAYS"; }
 
 # 直前の gh api の失敗を分類する。404 は「対象が無い」、それ以外は「確認できなかった」
 http_code() { grep -oE 'HTTP [0-9]+' "$ERR" | tail -1; }
@@ -80,6 +99,21 @@ while IFS=$'\t' read -r NAME BRANCH PRIVATE; do
   elif ! grep -qiE 'HTTP 404|alerts are disabled' "$ERR"; then   # Dependabot 無効は対象外
     note_unknown "$LABEL" "脆弱性アラート"
   fi
+
+  # 3. 例外リストの期限。ファイルが無い（404）リポジトリは対象外
+  if ALW=$(gh api -H "Accept: application/vnd.github.raw" \
+        "/repos/${OWNER}/${NAME}/contents/.github/audit-allowlist?ref=${BRANCH}" 2>"$ERR"); then
+    SOONS=$(printf '%s\n' "$ALW" | soon_entries)
+    CNT=$(printf '%s' "$SOONS" | grep -c .)
+    if [ "$CNT" -gt 0 ]; then
+      if [ "$PRIVATE" = true ]; then DETAIL="（private のため非公開）"
+      else DETAIL=$(printf '%s\n' "$SOONS" | awk -F'\t' '{printf "%s%s（期限 %s、%s）", (NR>1 ? "<br>" : ""), $1, $2, ($3 < 0 ? "期限切れ" : "あと " $3 " 日")}'); fi
+      soon="${soon}| ${LABEL} | ${CNT} | ${DETAIL} |"$'\n'
+      n_soon=$((n_soon + 1))
+    fi
+  elif ! grep -q 'HTTP 404' "$ERR"; then
+    note_unknown "$LABEL" "例外リスト"
+  fi
 done <<EOF
 $LIST
 EOF
@@ -91,7 +125,7 @@ if [ "$n_total" = 0 ]; then
   exit 1
 fi
 
-if [ "$n_red" = 0 ] && [ "$n_vuln" = 0 ] && [ "$n_unknown" = 0 ]; then
+if [ "$n_red" = 0 ] && [ "$n_vuln" = 0 ] && [ "$n_soon" = 0 ] && [ "$n_unknown" = 0 ]; then
   echo "OK"
   echo
   echo "${n_total} リポジトリを確認し、赤い CI と critical/high の脆弱性はありませんでした（${TODAY}）。"
@@ -123,11 +157,23 @@ if [ "$n_vuln" -gt 0 ]; then
   echo
 fi
 
+if [ "$n_soon" -gt 0 ]; then
+  echo "## 例外リストの期限が近い・切れている（${n_soon} 件）"
+  echo
+  echo "期限の日を過ぎると CI が落ちます。修正版が出ていれば行を消し、出ていなければ理由を確かめて期限を延ばしてください"
+  echo "（期限は今日から 120 日以内まで）。"
+  echo
+  echo "| リポジトリ | 件数 | 例外 |"
+  echo "|---|---|---|"
+  printf '%s' "$soon"
+  echo
+fi
+
 if [ "$n_unknown" -gt 0 ]; then
   echo "## 確認できなかった（${n_unknown} 件）"
   echo
   echo "見えていないものを「問題なし」とは扱いません。多くは PAT の権限不足です"
-  echo "（Actions: read / Dependabot alerts: read）。"
+  echo "（Actions: read / Dependabot alerts: read / Contents: read）。"
   echo
   echo "| リポジトリ | 対象 | 応答 |"
   echo "|---|---|---|"

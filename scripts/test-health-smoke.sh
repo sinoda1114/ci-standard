@@ -7,10 +7,11 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 STUB=$(mktemp -d); trap 'rm -rf "$STUB"' EXIT
 
-# mk_stub <一覧> <runs の応答> <alerts の応答>
+# mk_stub <一覧> <runs の応答> <alerts の応答> [<例外リストの中身>]
 #   一覧:    "name<TAB>branch<TAB>private" の行（そのまま出す）。"FAIL" なら取得失敗
 #   runs:    -q 適用後の 1 行（"結論<TAB>日付<TAB>URL<TAB>sha"）。"E404" / "E403" / "E500" ならその HTTP エラー
 #   alerts:  -q 適用後の出力（パッケージ名を 1 行 1 件）。空なら 0 件。"E404" / "E403" / "EDISABLED" ならエラー
+#   例外リスト: .github/audit-allowlist の中身。省略・空なら 404（ファイルなし）。"E403" / "E500" ならその HTTP エラー
 #   既定ブランチの先頭 sha は常に HEADSHA
 mk_stub() {
   cat > "$STUB/gh" <<EOF
@@ -29,6 +30,8 @@ case "\$A" in
     case "$2" in E*) err "$2";; esac; printf '%b\n' "$2"; exit 0;;
   *"/dependabot/alerts"*)
     case "$3" in E*) err "$3";; esac; printf '%b' "$3"; exit 0;;
+  *"/contents/.github/audit-allowlist"*)
+    case "${4:-}" in ""|E404) err E404;; E*) err "${4:-}";; esac; printf '%b' "${4:-}"; exit 0;;
 esac
 exit 1
 EOF
@@ -104,5 +107,27 @@ run >/dev/null; first_is_ok && ok "先頭コミット以外の古い失敗は拾
 # （対象 0 件は別の失敗になるので、除外されない正常なリポジトリを 1 件混ぜる。スタブは全リポジトリに同じ run を返す）
 mk_stub 'ci-standard\tmain\tfalse\npub-repo\tmain\tfalse\n' "$GREEN" ''
 run >/dev/null; first_is_ok && has "1 リポジトリ" && ok "既定の除外は sweep.sh と同じ" || ng "既定の除外は sweep.sh と同じ"
+
+# 例外リスト（.github/audit-allowlist）の期限が 14 日以内に迫ったら知らせる。期限の日に突然 CI が落ちるのを防ぐ
+day() { python3 -c "import datetime,sys;print((datetime.date.today()+datetime.timedelta(days=int(sys.argv[1]))).isoformat())" "$1"; }
+SOON=$(day 10); FAR=$(day 60); PAST=$(day -1)
+mk_stub "$PUB" "$GREEN" '' "# コメント\nGHSA-vfj7-8cjw-p6xm  ${SOON}  braces 修正版なし\n"
+run >/dev/null; ! first_is_ok && has "例外リストの期限" && has "GHSA-vfj7-8cjw-p6xm" && has "${SOON}" \
+  && ok "期限が 14 日以内の例外を拾う" || ng "期限が 14 日以内の例外を拾う"
+
+mk_stub "$PUB" "$GREEN" '' "GHSA-vfj7-8cjw-p6xm  ${FAR}  braces 修正版なし\n"
+run >/dev/null; first_is_ok && ok "期限が先の例外は問題にしない" || ng "期限が先の例外は問題にしない"
+
+mk_stub "$PUB" "$GREEN" '' "GHSA-vfj7-8cjw-p6xm  ${PAST}  braces 修正版なし\n"
+run >/dev/null; ! first_is_ok && has "期限切れ" && ok "期限切れの例外も拾う" || ng "期限切れの例外も拾う"
+
+mk_stub "$PRIV" "$GREEN" '' "GHSA-vfj7-8cjw-p6xm  ${SOON}  braces 修正版なし\n"
+run >/dev/null
+if ! first_is_ok && has "priv-repo" && ! has "GHSA-vfj7-8cjw-p6xm" && ! has "braces"; then
+  ok "private の例外は名前と件数だけ（GHSA・理由を出さない）"
+else ng "private の例外は名前と件数だけ（GHSA・理由を出さない）"; fi
+
+mk_stub "$PUB" "$GREEN" '' E403
+run >/dev/null; ! first_is_ok && has "確認できなかった" && has "例外リスト" && ok "例外リスト取得の 403 は OK にしない" || ng "例外リスト取得の 403 は OK にしない"
 
 exit $fail

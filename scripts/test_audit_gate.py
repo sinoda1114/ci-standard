@@ -327,6 +327,80 @@ class FileAndClockTest(unittest.TestCase):
         self.assertEqual(g['utc_today'](), real.date(2026, 10, 3))
 
 
+class AllowlistPolicyTest(unittest.TestCase):
+    """例外リストの使い方の制限（2026-10-03 追加）: 期限は今日から 120 日以内、critical は除外できない。"""
+    run_gate = AuditGateTest.run_gate
+
+    def test_期限が120日先までなら通す(self):
+        rc, out = self.run_gate(npm_report(('braces', BRACES, 'high')), f'{BRACES} 2027-01-31 修正版なし\n')  # 10/3 + 120 日
+        self.assertEqual(rc, 0, out)
+
+    def test_期限が121日以上先なら落とす(self):
+        rc, out = self.run_gate(npm_report(('braces', BRACES, 'high')), f'{BRACES} 2027-02-01 修正版なし\n')
+        self.assertEqual(rc, 1, out)
+        self.assertIn('120 日', out)
+
+    def test_使われていない例外でも期限が先すぎれば落とす(self):
+        rc, out = self.run_gate(npm_report(), f'{BRACES} 2099-12-31 修正版なし\n')
+        self.assertEqual(rc, 1, out)
+        self.assertIn('120 日', out)
+
+    def test_critical_は例外リストにあっても落とす_npm(self):
+        rc, out = self.run_gate(npm_report(('next', NEXT_RCE, 'critical')), f'{NEXT_RCE} 2026-12-31 様子見\n')
+        self.assertEqual(rc, 1, out)
+        self.assertIn('critical', out)
+        self.assertIn(NEXT_RCE, out)
+
+    def test_critical_は例外リストにあっても落とす_pnpm(self):
+        rc, out = self.run_gate(pnpm_report(('next', NEXT_RCE, 'critical')), f'{NEXT_RCE} 2026-12-31 様子見\n', pm='pnpm')
+        self.assertEqual(rc, 1, out)
+        self.assertIn('critical', out)
+
+
+class PnpmConfigTest(unittest.TestCase):
+    """pnpm の独自の除外設定（auditConfig.ignoreGhsas / ignoreCves）を見つけたら落とす（2026-10-03 追加）。
+
+    例外リストを通さず、理由も期限もなく除外できてしまうため。
+    """
+    def check(self, files):
+        with tempfile.TemporaryDirectory() as d:
+            for name, body in files.items():
+                with open(os.path.join(d, name), 'w', encoding='utf-8') as f:
+                    f.write(body)
+            p = subprocess.run([sys.executable, GATE, '--pm', 'pnpm', '--config-only', '--project-dir', d],
+                               capture_output=True, text=True)
+            return p.returncode, p.stdout + p.stderr
+
+    def test_除外設定が無ければ通す(self):
+        rc, out = self.check({'package.json': json.dumps({'name': 'x', 'pnpm': {'overrides': {}}})})
+        self.assertEqual(rc, 0, out)
+
+    def test_package_json_が無くても通す(self):
+        rc, out = self.check({})
+        self.assertEqual(rc, 0, out)
+
+    def test_package_json_の_ignoreGhsas_は落とす(self):
+        rc, out = self.check({'package.json': json.dumps({'pnpm': {'auditConfig': {'ignoreGhsas': [BRACES]}}})})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('ignoreGhsas', out)
+        self.assertIn('audit-allowlist', out)
+
+    def test_package_json_の_ignoreCves_は落とす(self):
+        rc, out = self.check({'package.json': json.dumps({'pnpm': {'auditConfig': {'ignoreCves': ['CVE-2026-0001']}}})})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('ignoreCves', out)
+
+    def test_pnpm_workspace_yaml_の除外設定は落とす(self):
+        rc, out = self.check({'package.json': '{}',
+                              'pnpm-workspace.yaml': 'packages:\n  - "."\nauditConfig:\n  ignoreGhsas:\n    - GHSA-vfj7-8cjw-p6xm\n'})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('pnpm-workspace.yaml', out)
+
+    def test_package_json_が壊れていたら落とす(self):
+        rc, out = self.check({'package.json': '{ broken'})
+        self.assertEqual(rc, 1, out)
+
+
 class EmbeddedCopyTest(unittest.TestCase):
     """node-ci.yml に埋め込んだ判定スクリプトが scripts/audit-gate.py と同一であること。
 
