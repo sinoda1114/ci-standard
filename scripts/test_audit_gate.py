@@ -217,6 +217,16 @@ class AuditGateTest(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertNotIn('\n::add-mask::', out)
 
+    def test_同じ_GHSA_が複数パッケージに出たら全部の名前を出す(self):
+        url = f'https://github.com/advisories/{BRACES}'
+        report = {'auditReportVersion': 2, 'vulnerabilities': {
+            'a': {'severity': 'high', 'via': [{'severity': 'high', 'name': 'a', 'url': url}]},
+            'b': {'severity': 'high', 'via': [{'severity': 'high', 'name': 'b', 'url': url}]}}}
+        rc, out = self.run_gate(report, f'{BRACES} 2026-12-31 修正版なし\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn('a, b', out)
+        self.assertIn('high以上 2 件', out)
+
     def test_使われていない例外は通知する(self):
         rc, out = self.run_gate(npm_report(), f'{BRACES} 2026-12-31 修正版なし\n')
         self.assertEqual(rc, 0, out)

@@ -227,6 +227,12 @@ jobs:
               return sev if isinstance(sev, str) and sev in SEVERITIES else None
 
 
+          def add_found(found, ghsa, sev, pkg):
+              """同じ GHSA が複数パッケージに出ても上書きせず、パッケージ名をまとめ、重い方の重大度を残す。"""
+              old_sev, pkgs = found.get(ghsa, (sev, set()))
+              found[ghsa] = ('critical' if 'critical' in (old_sev, sev) else sev, pkgs | {pkg})
+
+
           def emit(kind, message):
               """ワークフローコマンドを 1 行で出す。外部の文字列の改行で別のコマンド行が作られないよう無害化する。"""
               safe = message.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
@@ -296,7 +302,7 @@ jobs:
                       ghsa = ''.join(GHSA_RE.findall(text(adv.get('github_advisory_id')))[:1]) \
                           or ''.join(GHSA_RE.findall(text(adv.get('url')))[:1])
                       if ghsa:
-                          found[ghsa] = (sev, mod or '?')
+                          add_found(found, ghsa, sev, mod or '?')
                       else:
                           bad.append(f"{mod or '?'} ({sev}, url={text(adv.get('url')) or '-'})")
               return found, bad, broken
@@ -339,7 +345,7 @@ jobs:
                           ids = GHSA_RE.findall(text(via.get('url')))
                           pkg = text(via.get('name')) or name
                           if ids:
-                              found[ids[0]] = (sev, pkg)
+                              add_found(found, ids[0], sev, pkg)
                           else:
                               bad.append(f"{pkg} ({sev}, url={text(via.get('url')) or '-'})")
                   if not dangling and severity_of(vuln) in BLOCKING and not reaches_blocking_advisory(name, vulns):
@@ -377,7 +383,8 @@ jobs:
                   return 1
 
               blocking, expired, allowed = [], [], 0
-              for ghsa, (sev, pkg) in sorted(found.items()):
+              for ghsa, (sev, pkgs) in sorted(found.items()):
+                  pkg = ', '.join(sorted(pkgs))
                   if ghsa not in allow:
                       blocking.append(f'{ghsa} ({sev}, {pkg})')
                   elif allow[ghsa][0] < today:
@@ -402,7 +409,7 @@ jobs:
               for x in expired:
                   emit('error', f'例外の期限切れ: {x}（修正版を確認し、行を消すか期限を延ばしてください）')
               ok = not (errors or blocking or expired or no_id or broken)
-              print(f'audit-gate: high以上 {len(found) + len(no_id)} 件 / 除外 {allowed} 件 / 未登録 {len(blocking)} 件 / '
+              print(f'audit-gate: high以上 {sum(len(p) for _, p in found.values()) + len(no_id)} 件 / 除外 {allowed} 件 / 未登録 {len(blocking)} 件 / '
                     f'ID なし {len(no_id)} 件 / 構造エラー {len(broken)} 件 / 期限切れ {len(expired)} 件 → {"通過" if ok else "失敗"}')
               return 0 if ok else 1
 
