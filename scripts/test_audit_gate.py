@@ -205,18 +205,6 @@ class AuditGateTest(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertNotIn('Traceback', out)
 
-    def test_既定の今日は_UTC_で決まる(self):
-        # TZ を UTC+14 にしても、--today を省いたときの判定日は UTC の日付になる
-        with tempfile.TemporaryDirectory() as d:
-            path = os.path.join(d, 'audit-allowlist')
-            open(path, 'w', encoding='utf-8').close()
-            code = ("import datetime,runpy,sys;sys.argv=['x','--allowlist','/dev/null'];"
-                    "g=runpy.run_path(%r);print(g['utc_today']())" % GATE)
-            env = dict(os.environ, TZ='Etc/GMT-14')
-            got = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, env=env).stdout.strip()
-        import datetime
-        self.assertEqual(got, datetime.datetime.now(datetime.timezone.utc).date().isoformat())
-
     def test_理由に_シャープ_を書いてもコメント扱いにしない(self):
         rc, out = self.run_gate(npm_report(('braces', BRACES, 'high')), f'{BRACES} 2026-12-31 修正版なし issue #123 参照\n')
         self.assertEqual(rc, 0, out)
@@ -234,6 +222,88 @@ class AuditGateTest(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn('使われていない', out)
 
+
+
+FIXTURES = os.path.join(HERE, 'fixtures')
+
+
+class RealOutputTest(unittest.TestCase):
+    """実際の npm / pnpm が出した audit の JSON で確かめる（手書きの見本だけに頼らない）。"""
+    def run_file(self, name, pm, allowlist):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, 'audit-allowlist')
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(allowlist)
+            with open(os.path.join(FIXTURES, name), encoding='utf-8') as f:
+                p = subprocess.run([sys.executable, GATE, '--pm', pm, '--allowlist', path, '--today', TODAY],
+                                   stdin=f, capture_output=True, text=True)
+        return p.returncode, p.stdout + p.stderr
+
+    def test_pnpm_11_の脆弱性0件の出力は通す(self):
+        rc, out = self.run_file('pnpm11-audit-empty.json', 'pnpm', '')
+        self.assertEqual(rc, 0, out)
+
+    def test_npm_11_の実出力で例外リストが効く(self):
+        # next 16.3.8 + eslint-config-next 16.3.8 の lockfile（braces の high が残る）を npm 11.13.0 で audit した結果
+        rc, out = self.run_file('npm11-audit-next-eslint.json', 'npm', f'{BRACES} 2026-12-31 修正版なし\n')
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_file('npm11-audit-next-eslint.json', 'npm', '')
+        self.assertEqual(rc, 1, out)
+        self.assertIn(BRACES, out)
+
+
+class FileAndClockTest(unittest.TestCase):
+    def gate(self, allow_bytes, report=None):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, 'audit-allowlist')
+            if allow_bytes is not None:
+                with open(path, 'wb') as f:
+                    f.write(allow_bytes)
+            p = subprocess.run([sys.executable, GATE, '--pm', 'npm', '--allowlist', path, '--today', TODAY],
+                               input=json.dumps(report or npm_report(('braces', BRACES, 'high'))),
+                               capture_output=True, text=True)
+        return p.returncode, p.stdout + p.stderr
+
+    def test_BOM_付きの例外リストを読める(self):
+        rc, out = self.gate(f'\ufeff{BRACES} 2026-12-31 修正版なし\n'.encode('utf-8'))
+        self.assertEqual(rc, 0, out)
+
+    def test_読めない例外リストはトレースバックでなくエラーにする(self):
+        for data in (b'\xff\xfe\x00broken', None):
+            rc, out = self.gate(data)
+            self.assertEqual(rc, 1, out)
+            self.assertNotIn('Traceback', out)
+            self.assertIn('::error::', out)
+
+    def test_集計の件数に_high_未満の構造エラーや二重計上を混ぜない(self):
+        report = {'auditReportVersion': 2, 'vulnerabilities': {
+            'x': {'severity': 'high', 'via': ['missing']},
+            'm': {'severity': 'moderate', 'via': ['gone']}}}
+        rc, out = self.gate(b'', report)
+        self.assertEqual(rc, 1, out)
+        self.assertIn('high以上 0 件', out)
+        self.assertIn('構造エラー 2 件', out)
+
+    def test_既定の今日はローカルでなく_UTC_の日付(self):
+        # UTC では 10/3 23:00、ローカル（UTC+10）では 10/4 になる時刻に固定して確かめる
+        import datetime as real
+        import runpy
+
+        class FakeDateTime(real.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                utc = real.datetime(2026, 10, 3, 23, 0, tzinfo=real.timezone.utc)
+                return utc.astimezone(tz) if tz else real.datetime(2026, 10, 4, 9, 0)
+
+        class FakeDate(real.date):
+            @classmethod
+            def today(cls):
+                return real.date(2026, 10, 4)
+
+        g = runpy.run_path(GATE)
+        fake = type('M', (), {'datetime': FakeDateTime, 'date': FakeDate, 'timezone': real.timezone})
+        g['utc_today'].__globals__['datetime'] = fake
+        self.assertEqual(g['utc_today'](), real.date(2026, 10, 3))
 
 
 class EmbeddedCopyTest(unittest.TestCase):

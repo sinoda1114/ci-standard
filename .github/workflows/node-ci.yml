@@ -239,8 +239,11 @@ jobs:
           def load_allowlist(path):
               """{GHSA: (期限, 理由)} と書式エラーの一覧を返す。"""
               entries, errors = {}, []
-              with open(path, encoding='utf-8') as f:
-                  lines = f.readlines()
+              try:
+                  with open(path, encoding='utf-8-sig') as f:  # BOM 付きでも読めるように
+                      lines = f.readlines()
+              except (OSError, UnicodeDecodeError) as e:
+                  return {}, [f'{path}: 例外リストを UTF-8 として読めません（{type(e).__name__}）']
               for no, raw in enumerate(lines, 1):
                   line = raw.strip()
                   if not line or line.startswith('#'):
@@ -283,12 +286,12 @@ jobs:
 
           def pnpm_advisories(report):
               """pnpm: {GHSA: (重大度, パッケージ名)} と、除外できない指摘（ID なし・重大度が不明）の一覧。"""
-              found, bad = {}, []
+              found, bad, broken = {}, [], []
               for adv in report['advisories'].values():
                   sev = severity_of(adv)
                   mod = text(adv.get('module_name')) if isinstance(adv, dict) else ''
                   if sev is None:
-                      bad.append(f'{mod or "?"} (重大度が不明、または構造が不正)')
+                      broken.append(f'{mod or "?"} (重大度が不明、または構造が不正)')
                   elif sev in BLOCKING:
                       ghsa = ''.join(GHSA_RE.findall(text(adv.get('github_advisory_id')))[:1]) \
                           or ''.join(GHSA_RE.findall(text(adv.get('url')))[:1])
@@ -296,7 +299,7 @@ jobs:
                           found[ghsa] = (sev, mod or '?')
                       else:
                           bad.append(f"{mod or '?'} ({sev}, url={text(adv.get('url')) or '-'})")
-              return found, bad
+              return found, bad, broken
 
 
           def reaches_blocking_advisory(name, vulns, seen=None):
@@ -315,21 +318,23 @@ jobs:
 
           def npm_advisories(report):
               """npm: {GHSA: (重大度, パッケージ名)} と、除外できない指摘（ID なし・構造が不正）の一覧。"""
-              found, bad = {}, []
+              found, bad, broken = {}, [], []
               vulns = report['vulnerabilities']
               for name, vuln in vulns.items():
                   # 構造の壊れた項目を黙って無視しない（high 以上が隠れる経路になるため）
                   if not isinstance(vuln, dict) or not isinstance(vuln.get('via'), list) or severity_of(vuln) is None:
-                      bad.append(f'{name} (構造が不正: via がリストでない、または重大度が不明)')
+                      broken.append(f'{name} (via がリストでない、または重大度が不明)')
                       continue
+                  dangling = False
                   for via in vuln['via']:
                       if isinstance(via, str):
                           if via not in vulns:  # 参照先が無いのは壊れた結果。別の経路で届いても見逃さない
-                              bad.append(f'{name} (構造が不正: 参照先の項目がありません: {via})')
+                              broken.append(f'{name} (参照先の項目がありません: {via})')
+                              dangling = True
                           continue  # 依存元を指すだけ。advisory 本体は別の項目にある（到達は下で確かめる）
                       sev = severity_of(via)
                       if sev is None:
-                          bad.append(f'{name} (構造が不正: advisory の重大度が不明)')
+                          broken.append(f'{name} (advisory の重大度が不明)')
                       elif sev in BLOCKING:
                           ids = GHSA_RE.findall(text(via.get('url')))
                           pkg = text(via.get('name')) or name
@@ -337,13 +342,13 @@ jobs:
                               found[ids[0]] = (sev, pkg)
                           else:
                               bad.append(f"{pkg} ({sev}, url={text(via.get('url')) or '-'})")
-                  if severity_of(vuln) in BLOCKING and not reaches_blocking_advisory(name, vulns):
-                      bad.append(f"{name} ({vuln['severity']}, 構造が不正: high 以上の advisory 本体に到達できません)")
-              return found, bad
+                  if not dangling and severity_of(vuln) in BLOCKING and not reaches_blocking_advisory(name, vulns):
+                      broken.append(f"{name} ({vuln['severity']}, high 以上の advisory 本体に到達できません)")
+              return found, bad, broken
 
 
           def advisories(report, pm):
-              """{GHSA: (重大度, パッケージ名)} と、例外リストで除外できない high 以上の可能性がある指摘の一覧。"""
+              """{GHSA: (重大度, パッケージ名)}、GHSA の ID が無い high 以上、構造エラーの 3 つを返す（後の 2 つは除外できない）。"""
               return pnpm_advisories(report) if pm == 'pnpm' else npm_advisories(report)
 
 
@@ -366,7 +371,7 @@ jobs:
                   return 1
               allow, errors = load_allowlist(a.allowlist)
               try:
-                  found, no_id = advisories(report, a.pm)
+                  found, no_id, broken = advisories(report, a.pm)
               except Exception as e:  # 想定外の構造でもトレースバックではなく判定の失敗として扱う
                   emit('error', f'audit の結果を解釈できません（{type(e).__name__}: {e}）')
                   return 1
@@ -391,12 +396,14 @@ jobs:
               for b in blocking:
                   emit('error', f'high 以上の脆弱性（例外リストに無し）: {b}')
               for n in no_id:
-                  emit('error', f'high 以上の可能性がある指摘（GHSA の ID が無い、または構造が不正なため例外リストで除外できません）: {n}')
+                  emit('error', f'high 以上の脆弱性（GHSA の ID が無いため例外リストで除外できません）: {n}')
+              for b in broken:
+                  emit('error', f'audit の結果の構造が不正です（high 以上が隠れている可能性があるため通しません）: {b}')
               for x in expired:
                   emit('error', f'例外の期限切れ: {x}（修正版を確認し、行を消すか期限を延ばしてください）')
-              ok = not (errors or blocking or expired or no_id)
-              print(f'audit-gate: high以上 {len(found) + len(no_id)} 件 / 除外 {allowed} 件 / '
-                    f'未登録 {len(blocking)} 件 / ID なし {len(no_id)} 件 / 期限切れ {len(expired)} 件 → {"通過" if ok else "失敗"}')
+              ok = not (errors or blocking or expired or no_id or broken)
+              print(f'audit-gate: high以上 {len(found) + len(no_id)} 件 / 除外 {allowed} 件 / 未登録 {len(blocking)} 件 / '
+                    f'ID なし {len(no_id)} 件 / 構造エラー {len(broken)} 件 / 期限切れ {len(expired)} 件 → {"通過" if ok else "失敗"}')
               return 0 if ok else 1
 
           if __name__ == '__main__':
