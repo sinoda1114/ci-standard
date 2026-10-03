@@ -396,6 +396,24 @@ class PnpmConfigTest(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertIn('pnpm-workspace.yaml', out)
 
+    def test_pnpm_workspace_yaml_のフロー形式も落とす(self):
+        rc, out = self.check({'pnpm-workspace.yaml': 'packages: ["."]\nauditConfig: {ignoreGhsas: [GHSA-vfj7-8cjw-p6xm]}\n'})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('ignoreGhsas', out)
+
+    def test_pnpm_workspace_yaml_の引用符つきキーも落とす(self):
+        rc, out = self.check({'pnpm-workspace.yaml': 'auditConfig:\n  "ignoreCves":\n    - CVE-2026-0001\n'})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('ignoreCves', out)
+
+    def test_pnpm_workspace_yaml_の空の除外設定は通す(self):
+        rc, out = self.check({'pnpm-workspace.yaml': 'auditConfig:\n  ignoreGhsas: []\n'})
+        self.assertEqual(rc, 0, out)
+
+    def test_pnpm_workspace_yaml_が壊れていたら落とす(self):
+        rc, out = self.check({'pnpm-workspace.yaml': 'auditConfig: {ignoreGhsas: [\n'})
+        self.assertEqual(rc, 1, out)
+
     def test_package_json_が壊れていたら落とす(self):
         rc, out = self.check({'package.json': '{ broken'})
         self.assertEqual(rc, 1, out)

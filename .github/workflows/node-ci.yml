@@ -301,11 +301,24 @@ jobs:
                       with open(ws, encoding='utf-8-sig') as f:
                           body = f.read()
                   except (OSError, UnicodeDecodeError) as e:
-                      return errors + [f'pnpm-workspace.yaml を読めません（{type(e).__name__}）']
-                  # YAML の依存を増やさないため、キー名で検出する（コメント行は除く）
-                  lines = [ln for ln in body.splitlines() if not ln.lstrip().startswith('#')]
-                  errors += [f'pnpm-workspace.yaml の auditConfig.{k}' for k in PNPM_IGNORE_KEYS
-                             if any(re.match(rf'\s*{k}\s*:', ln) for ln in lines)]
+                      return errors + [f'pnpm-workspace.yaml を読めません（{type(e).__name__}）。除外設定の有無を確かめられないため通しません']
+                  try:
+                      import yaml  # GitHub のランナーには入っている。無ければ下の安全側の検査に切り替える
+                  except ImportError:
+                      yaml = None
+                  if yaml is not None:
+                      try:
+                          data = yaml.safe_load(body)
+                      except yaml.YAMLError as e:
+                          return errors + [f'pnpm-workspace.yaml を YAML として読めません（{type(e).__name__}）。除外設定の有無を確かめられないため通しません']
+                      cfg = data.get('auditConfig') if isinstance(data, dict) else None
+                      if isinstance(cfg, dict):
+                          errors += [f'pnpm-workspace.yaml の auditConfig.{k}' for k in PNPM_IGNORE_KEYS if cfg.get(k)]
+                  else:
+                      # YAML を読めない環境では、コメント以外にキー名が出てくれば落とす（書き方の違いですり抜けさせない）
+                      lines = [ln for ln in body.splitlines() if not ln.lstrip().startswith('#')]
+                      errors += [f'pnpm-workspace.yaml の {k}（YAML を解析できないため名前で検出）' for k in PNPM_IGNORE_KEYS
+                                 if any(k in ln for ln in lines)]
               return errors
 
 
@@ -477,15 +490,16 @@ jobs:
           AUDIT_GATE_PY
           # pnpm の独自の除外設定（auditConfig.ignoreGhsas / ignoreCves）は例外リストを素通りし、理由も期限も残らない。
           # 例外リストの有無にかかわらず、見つけたら落とす（例外リストへ移す）
+          # 判定は python3 -I（隔離モード）で動かす。ci.env などの PYTHONPATH・sitecustomize で判定を無効にさせないため
           if [ "$PM" = pnpm ]; then
-            python3 "$RUNNER_TEMP/audit-gate.py" --pm pnpm --config-only --project-dir . || exit 1
+            python3 -I "$RUNNER_TEMP/audit-gate.py" --pm pnpm --config-only --project-dir . || exit 1
           fi
           if [ -f .github/audit-allowlist ] && [ "$PM" != yarn ]; then
             # audit は脆弱性があると非 0 で終わるので、合否は判定スクリプトに任せる。audit 自体の失敗（{"error":…} や想定外の形）は判定側で落とす
             # pnpm は JSON の advisories 自体を audit-level で絞るので、リポジトリの設定で緩められないよう high を明示する
             if [ "$PM" = pnpm ]; then pnpm audit --json --audit-level high > "$RUNNER_TEMP/audit.json" || true
             else npm audit --json > "$RUNNER_TEMP/audit.json" || true; fi
-            python3 "$RUNNER_TEMP/audit-gate.py" --pm "$([ "$PM" = pnpm ] && echo pnpm || echo npm)" \
+            python3 -I "$RUNNER_TEMP/audit-gate.py" --pm "$([ "$PM" = pnpm ] && echo pnpm || echo npm)" \
               --allowlist .github/audit-allowlist < "$RUNNER_TEMP/audit.json"
             exit $?
           fi

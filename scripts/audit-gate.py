@@ -112,11 +112,24 @@ def pnpm_config_errors(project_dir):
             with open(ws, encoding='utf-8-sig') as f:
                 body = f.read()
         except (OSError, UnicodeDecodeError) as e:
-            return errors + [f'pnpm-workspace.yaml を読めません（{type(e).__name__}）']
-        # YAML の依存を増やさないため、キー名で検出する（コメント行は除く）
-        lines = [ln for ln in body.splitlines() if not ln.lstrip().startswith('#')]
-        errors += [f'pnpm-workspace.yaml の auditConfig.{k}' for k in PNPM_IGNORE_KEYS
-                   if any(re.match(rf'\s*{k}\s*:', ln) for ln in lines)]
+            return errors + [f'pnpm-workspace.yaml を読めません（{type(e).__name__}）。除外設定の有無を確かめられないため通しません']
+        try:
+            import yaml  # GitHub のランナーには入っている。無ければ下の安全側の検査に切り替える
+        except ImportError:
+            yaml = None
+        if yaml is not None:
+            try:
+                data = yaml.safe_load(body)
+            except yaml.YAMLError as e:
+                return errors + [f'pnpm-workspace.yaml を YAML として読めません（{type(e).__name__}）。除外設定の有無を確かめられないため通しません']
+            cfg = data.get('auditConfig') if isinstance(data, dict) else None
+            if isinstance(cfg, dict):
+                errors += [f'pnpm-workspace.yaml の auditConfig.{k}' for k in PNPM_IGNORE_KEYS if cfg.get(k)]
+        else:
+            # YAML を読めない環境では、コメント以外にキー名が出てくれば落とす（書き方の違いですり抜けさせない）
+            lines = [ln for ln in body.splitlines() if not ln.lstrip().startswith('#')]
+            errors += [f'pnpm-workspace.yaml の {k}（YAML を解析できないため名前で検出）' for k in PNPM_IGNORE_KEYS
+                       if any(k in ln for ln in lines)]
     return errors
 
 

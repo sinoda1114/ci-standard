@@ -130,4 +130,16 @@ else ng "private の例外は名前と件数だけ（GHSA・理由を出さな�
 mk_stub "$PUB" "$GREEN" '' E403
 run >/dev/null; ! first_is_ok && has "確認できなかった" && has "例外リスト" && ok "例外リスト取得の 403 は OK にしない" || ng "例外リスト取得の 403 は OK にしない"
 
+# BOM 付きの例外リストでも先頭行を読む（audit-gate.py は utf-8-sig で受け付けている）
+mk_stub "$PUB" "$GREEN" '' "\xef\xbb\xbfGHSA-vfj7-8cjw-p6xm  ${SOON}  braces 修正版なし\n"
+run >/dev/null; ! first_is_ok && has "GHSA-vfj7-8cjw-p6xm" && ok "BOM 付きの先頭行も拾う" || ng "BOM 付きの先頭行も拾う"
+
+# 例外リストを解析できない（UTF-8 でない）ときは「問題なし」にしない
+mk_stub "$PUB" "$GREEN" '' "\x82\xa0GHSA-vfj7-8cjw-p6xm  ${SOON}  \x83\x65\n"
+run >/dev/null; ! first_is_ok && has "確認できなかった" && ok "解析できない例外リストは OK にしない" || ng "解析できない例外リストは OK にしない"
+
+# 理由のない行は CI では書式エラーになる。health も同じ書式でだけ読む
+mk_stub "$PUB" "$GREEN" '' "GHSA-vfj7-8cjw-p6xm  ${SOON}\n"
+run >/dev/null; first_is_ok && ok "理由のない行は例外として数えない（CI 側で書式エラー）" || ng "理由のない行は例外として数えない（CI 側で書式エラー）"
+
 exit $fail

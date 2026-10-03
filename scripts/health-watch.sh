@@ -24,6 +24,7 @@ OWNER="${OWNER:-sinoda1114}"
 EXCLUDE="${EXCLUDE:-ci-standard teamdev-2023-apr-team1 desktop-tutorial flue-test2}"
 ONLY="${ONLY:-}"   # 動作確認用: スペース区切りでリポジトリ名を指定すると、それだけを見る
 TODAY=$(TZ=Asia/Tokyo date +%Y-%m-%d)
+TODAY_UTC=$(date -u +%Y-%m-%d)   # 例外リストの期限は CI（audit-gate.py）と同じ UTC の日付で数える
 ERR=$(mktemp); trap 'rm -f "$ERR"' EXIT
 
 # アーカイブ済み・フォーク・他人のリポジトリは除く。既定ブランチ名と private かどうかも取る
@@ -35,12 +36,15 @@ LIST=$(gh api --paginate "/user/repos?per_page=100&affiliation=owner" \
 red=""; vuln=""; soon=""; unknown=""; n_red=0; n_vuln=0; n_soon=0; n_unknown=0; n_total=0
 SOON_DAYS="${SOON_DAYS:-14}"
 
-# 例外リストの本文から、期限が SOON_DAYS 日以内の行を "GHSA<TAB>期限<TAB>残り日数" で出す（書式は ci-standard の audit-gate.py と同じ）
+# 例外リストの本文から、期限が SOON_DAYS 日以内の行を "GHSA<TAB>期限<TAB>残り日数" で出す。
+# 書式（GHSA-ID 期限 理由。BOM 付き可）と日付の基準（UTC）は audit-gate.py に合わせる。
+# 読めない（UTF-8 でない等）ときは非 0 で終わる。呼び出し側で「確認できなかった」にする
 soon_entries() { python3 -c '
 import datetime, re, sys
 today, days = datetime.date.fromisoformat(sys.argv[1]), int(sys.argv[2])
-for line in sys.stdin:
-    m = re.match(r"\s*(GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4})\s+(\d{4}-\d{2}-\d{2})\s", line)
+text = sys.stdin.buffer.read().decode("utf-8-sig")   # 不正な文字は例外にする（環境の既定に任せると黙って置き換わる）
+for line in text.splitlines():
+    m = re.match(r"\s*(GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4})\s+(\d{4}-\d{2}-\d{2})\s+\S", line)
     if not m:
         continue
     try:
@@ -49,7 +53,7 @@ for line in sys.stdin:
         continue
     if left <= days:
         print(f"{m.group(1)}\t{m.group(2)}\t{left}")
-' "$TODAY" "$SOON_DAYS"; }
+' "$TODAY_UTC" "$SOON_DAYS"; }
 
 # 直前の gh api の失敗を分類する。404 は「対象が無い」、それ以外は「確認できなかった」
 http_code() { grep -oE 'HTTP [0-9]+' "$ERR" | tail -1; }
@@ -61,15 +65,17 @@ while IFS=$'\t' read -r NAME BRANCH PRIVATE; do
   case " $EXCLUDE " in *" $NAME "*) continue;; esac
   if [ -n "$ONLY" ]; then case " $ONLY " in *" $NAME "*) ;; *) continue;; esac; fi
   n_total=$((n_total + 1))
+  # ブランチ名に & や # が入っても問い合わせが変わらないよう、URL に入れる前にエンコードする
+  QBRANCH=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$BRANCH")
   if [ "$PRIVATE" = true ]; then LABEL="${NAME} (private)"; else LABEL="[${NAME}](https://github.com/${OWNER}/${NAME})"; fi
 
   # 1. 標準CI（ci.yml）の最新の完了済み run。実行中の run は結論が無いので見ない。
   #    ci.yml が PR でしか走らないリポジトリでは main 上の最新 run が何週間も前のまま残るので、
   #    既定ブランチの先頭コミットを検証した run だけを見る（古い失敗で Issue が閉じなくなるのを防ぐ）
-  if RUN=$(gh api "/repos/${OWNER}/${NAME}/actions/workflows/ci.yml/runs?branch=${BRANCH}&status=completed&per_page=1" \
+  if RUN=$(gh api "/repos/${OWNER}/${NAME}/actions/workflows/ci.yml/runs?branch=${QBRANCH}&status=completed&per_page=1" \
         -q '.workflow_runs[0] // empty | "\(.conclusion)\t\(.created_at[:10])\t\(.html_url)\t\(.head_sha)"' 2>"$ERR"); then
     IFS=$'\t' read -r CONC WHEN URL SHA <<<"$RUN"
-    if [ -n "$RUN" ] && ! HEAD=$(gh api "/repos/${OWNER}/${NAME}/branches/${BRANCH}" -q .commit.sha 2>"$ERR"); then
+    if [ -n "$RUN" ] && ! HEAD=$(gh api "/repos/${OWNER}/${NAME}/branches/${QBRANCH}" -q .commit.sha 2>"$ERR"); then
       note_unknown "$LABEL" "既定ブランチの先頭"
     elif [ -n "$RUN" ] && [ "$SHA" = "$HEAD" ]; then
       case "$CONC" in
@@ -102,9 +108,12 @@ while IFS=$'\t' read -r NAME BRANCH PRIVATE; do
 
   # 3. 例外リストの期限。ファイルが無い（404）リポジトリは対象外
   if ALW=$(gh api -H "Accept: application/vnd.github.raw" \
-        "/repos/${OWNER}/${NAME}/contents/.github/audit-allowlist?ref=${BRANCH}" 2>"$ERR"); then
-    SOONS=$(printf '%s\n' "$ALW" | soon_entries)
-    CNT=$(printf '%s' "$SOONS" | grep -c .)
+        "/repos/${OWNER}/${NAME}/contents/.github/audit-allowlist?ref=${QBRANCH}" 2>"$ERR"); then
+    if ! SOONS=$(printf '%s\n' "$ALW" | soon_entries 2>/dev/null); then
+      note_unknown "$LABEL" "例外リスト（解析できない）"; CNT=0
+    else
+      CNT=$(printf '%s' "$SOONS" | grep -c .)
+    fi
     if [ "$CNT" -gt 0 ]; then
       if [ "$PRIVATE" = true ]; then DETAIL="（private のため非公開）"
       else DETAIL=$(printf '%s\n' "$SOONS" | awk -F'\t' '{printf "%s%s（期限 %s、%s）", (NR>1 ? "<br>" : ""), $1, $2, ($3 < 0 ? "期限切れ" : "あと " $3 " 日")}'); fi
