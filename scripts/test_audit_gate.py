@@ -466,6 +466,12 @@ class PnpmConfigTest(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertIn('${', out)
 
+    def test_pnpm_workspace_yaml_のスカラーでないキーは落とす(self):
+        # 配列のキー（? [ignoreGhsas]）を文字列にするパーサーでは除外設定になりうる。pnpm の設定として正しくないので落とす
+        rc, out = self.check({'pnpm-workspace.yaml': 'auditConfig:\n  ? [ignoreGhsas]\n  : [GHSA-vfj7-8cjw-p6xm]\n'})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('スカラーでないキー', out)
+
     def test_pnpm_workspace_yaml_の綴りを変えたキーも落とす(self):
         # 大文字小文字・ハイフン・下線の違いですり抜けさせない
         rc, out = self.check({'pnpm-workspace.yaml': 'audit-config:\n  ignore-ghsas:\n    - GHSA-vfj7-8cjw-p6xm\n'})
@@ -509,11 +515,15 @@ class WorkflowExpressionTest(unittest.TestCase):
     ALLOWED = re.compile(r"^[\x20-\x7e]*[^\s][\x20-\x7e]*$")  # ASCII の印字可能文字だけで、空でない
 
     def test_式として読めない_dollar_brace_brace_が無い(self):
-        wf_dir = os.path.join(HERE, '..', '.github', 'workflows')
-        for name in sorted(os.listdir(wf_dir)):
-            if not name.endswith(('.yml', '.yaml')):
-                continue
-            with open(os.path.join(wf_dir, name), encoding='utf-8') as f:
+        # 配布するテンプレートも、配布先で同じ事故を起こすので対象にする
+        paths = [os.path.join(d, n) for d in (os.path.join(HERE, '..', '.github', 'workflows'),
+                                              os.path.join(HERE, '..', 'templates'),
+                                              os.path.join(HERE, '..', 'templates', 'skeleton'))
+                 if os.path.isdir(d) for n in sorted(os.listdir(d)) if n.endswith(('.yml', '.yaml'))]
+        self.assertTrue(any('templates' in p for p in paths), 'テンプレートが見つからない')
+        for path in paths:
+            name = os.path.relpath(path, os.path.join(HERE, '..'))
+            with open(path, encoding='utf-8') as f:
                 for no, line in enumerate(f, 1):
                     # run: の中のシェルのコメントも Actions は評価するので、# で始まる行も飛ばさない
                     if '${{' not in line:

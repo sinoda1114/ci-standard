@@ -135,6 +135,10 @@ run >/dev/null; ! first_is_ok && has "確認できなかった" && has "例外�
 mk_stub "$PUB" "$GREEN" '' "\xef\xbb\xbfGHSA-vfj7-8cjw-p6xm  ${SOON}  braces 修正版なし\n"
 run >/dev/null; ! first_is_ok && has "GHSA-vfj7-8cjw-p6xm" && ok "BOM 付きの先頭行も拾う" || ng "BOM 付きの先頭行も拾う"
 
+# 行の分け方は audit-gate.py（\n・\r・\r\n だけ）に合わせる。日付と理由の間が改ページでも CI では有効な例外なので拾う
+mk_stub "$PUB" "$GREEN" '' "GHSA-vfj7-8cjw-p6xm  ${SOON}\\fbraces 修正版なし\n"
+run >/dev/null; ! first_is_ok && has "GHSA-vfj7-8cjw-p6xm" && ok "区切りが改ページの行も拾う（CI と同じ分け方）" || ng "区切りが改ページの行も拾う（CI と同じ分け方）"
+
 # 例外リストを解析できない（UTF-8 でない）ときは「問題なし」にしない
 mk_stub "$PUB" "$GREEN" '' "\x82\xa0GHSA-vfj7-8cjw-p6xm  ${SOON}  \x83\x65\n"
 run >/dev/null; ! first_is_ok && has "確認できなかった" && ok "解析できない例外リストは OK にしない" || ng "解析できない例外リストは OK にしない"

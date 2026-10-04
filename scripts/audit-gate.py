@@ -135,7 +135,13 @@ def yaml_ignore_settings(yaml, root):
                 walk(item, path)
         elif isinstance(node, yaml.MappingNode):
             for key_node, value_node in node.value:
-                key = key_node.value if isinstance(key_node, yaml.ScalarNode) else '?'
+                if not isinstance(key_node, yaml.ScalarNode):
+                    # 配列などのキーを文字列にするパーサーでは、除外設定の名前になりうる。pnpm の設定として正しくないので落とす
+                    found.append('.'.join(path + ['?']) + '（スカラーでないキーは使えません）')
+                    walk(key_node, path + ['?'])
+                    walk(value_node, path + ['?'])
+                    continue
+                key = key_node.value
                 name = path + [key]
                 if normalize_key(key) in wanted and has_content(value_node):
                     found.append('.'.join(name))
