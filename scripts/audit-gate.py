@@ -124,34 +124,36 @@ def yaml_ignore_settings(yaml, root):
     def has_content(node):
         if isinstance(node, (yaml.SequenceNode, yaml.MappingNode)):
             return bool(node.value)
-        return node.value.strip() not in ('', '~', 'null', 'Null', 'NULL')
+        return node.tag != 'tag:yaml.org,2002:null'  # 引用符つきの 'null' や '~' は文字列なので空ではない
 
-    def walk(node, path):
-        if id(node) in seen:  # アンカーと別名で同じノードを何度も指す（循環も含む）
+    def walk(node, path, in_audit):
+        # 同じノードでも auditConfig の下かどうかで見方が変わる（アンカーを別名で auditConfig に入れる書き方）
+        if (id(node), in_audit) in seen:  # 循環も含めて、同じ見方では一度だけたどる
             return
-        seen.add(id(node))
+        seen.add((id(node), in_audit))
         if isinstance(node, yaml.SequenceNode):
             for item in node.value:
-                walk(item, path)
+                walk(item, path, in_audit)
         elif isinstance(node, yaml.MappingNode):
             for key_node, value_node in node.value:
                 if not isinstance(key_node, yaml.ScalarNode):
                     # 配列などのキーを文字列にするパーサーでは、除外設定の名前になりうる。pnpm の設定として正しくないので落とす
                     found.append('.'.join(path + ['?']) + '（スカラーでないキーは使えません）')
-                    walk(key_node, path + ['?'])
-                    walk(value_node, path + ['?'])
+                    walk(key_node, path + ['?'], in_audit)
+                    walk(value_node, path + ['?'], in_audit)
                     continue
                 key = key_node.value
                 name = path + [key]
-                if normalize_key(key) in wanted and has_content(value_node):
+                # 除外設定として効くのは auditConfig の下だけ（catalogs などの同じ名前のキーは別物）
+                if in_audit and normalize_key(key) in wanted and has_content(value_node):
                     found.append('.'.join(name))
                 # pnpm 11 は ${VAR} を展開する。展開後の名前は CI の環境で変わるので、展開を含むキーは落とす
                 if '${' in key:
                     found.append('.'.join(name) + '（${…} の展開を含むキーは検査できないため使えません）')
-                walk(value_node, name)
+                walk(value_node, name, in_audit or normalize_key(key) == 'auditconfig')
 
     if root is not None:
-        walk(root, [])
+        walk(root, [], False)
     return found
 
 
@@ -163,7 +165,7 @@ def pnpm_config_errors(project_dir):
         try:
             with open(pkg, encoding='utf-8-sig') as f:
                 data = json.load(f)
-        except (OSError, ValueError) as e:
+        except (OSError, ValueError, RecursionError) as e:  # RecursionError は入れ子が深すぎるとき
             return [f'package.json を読めません（{type(e).__name__}）。除外設定の有無を確かめられないため通しません']
         pnpm = data.get('pnpm') if isinstance(data, dict) else None
         if isinstance(pnpm, dict):
@@ -182,10 +184,11 @@ def pnpm_config_errors(project_dir):
             return errors + ['pnpm-workspace.yaml を検査するための YAML パーサー（PyYAML）がありません。除外設定の有無を確かめられないため通しません']
         try:
             root = yaml.compose(body, Loader=yaml.SafeLoader)  # 値は組み立てず、書かれたままの形で見る
-        except yaml.YAMLError as e:
+            found = yaml_ignore_settings(yaml, root)
+        except (yaml.YAMLError, RecursionError) as e:  # RecursionError は入れ子が深すぎるとき
             detail = type(e).__name__ + (': ' + e.problem if getattr(e, 'problem', None) else '')
             return errors + [f'pnpm-workspace.yaml を YAML として読めません（{detail}）。除外設定の有無を確かめられないため通しません']
-        errors += ['pnpm-workspace.yaml の ' + name for name in yaml_ignore_settings(yaml, root)]
+        errors += ['pnpm-workspace.yaml の ' + name for name in found]
     return errors
 
 

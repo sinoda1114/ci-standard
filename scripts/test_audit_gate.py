@@ -466,6 +466,28 @@ class PnpmConfigTest(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertIn('${', out)
 
+    def test_auditConfig_の外の同じ名前のキーは通す(self):
+        # 名前付きカタログが ignoreCves という名前でも、除外設定ではない
+        rc, out = self.check({'pnpm-workspace.yaml': 'catalogs:\n  ignoreCves:\n    lodash: ^4.17.21\n'})
+        self.assertEqual(rc, 0, out)
+
+    def test_アンカー経由で_auditConfig_に入れた除外設定は落とす(self):
+        rc, out = self.check({'pnpm-workspace.yaml': 'x-ign: &ign {ignoreGhsas: [GHSA-vfj7-8cjw-p6xm]}\nauditConfig: *ign\n'})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('ignoreGhsas', out)
+
+    def test_引用符つきの_null_は空として扱わない(self):
+        rc, out = self.check({'pnpm-workspace.yaml': "auditConfig:\n  ignoreGhsas: 'null'\n"})
+        self.assertEqual(rc, 1, out)
+
+    def test_入れ子が深すぎるファイルは理由を出して落とす(self):
+        rc, out = self.check({'pnpm-workspace.yaml': '[' * 5000 + ']' * 5000 + '\n'})
+        self.assertEqual(rc, 1, out)
+        self.assertNotIn('Traceback', out)
+        rc, out = self.check({'package.json': '[' * 100000 + ']' * 100000})
+        self.assertEqual(rc, 1, out)
+        self.assertNotIn('Traceback', out)
+
     def test_pnpm_workspace_yaml_のスカラーでないキーは落とす(self):
         # 配列のキー（? [ignoreGhsas]）を文字列にするパーサーでは除外設定になりうる。pnpm の設定として正しくないので落とす
         rc, out = self.check({'pnpm-workspace.yaml': 'auditConfig:\n  ? [ignoreGhsas]\n  : [GHSA-vfj7-8cjw-p6xm]\n'})
