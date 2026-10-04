@@ -32,6 +32,20 @@ jobs:
         # 「壊れた入力を確実に落とす」ことをテストで担保する。
         run: python3 -m unittest discover -s scripts -p 'test_validate_triggers.py' -v
 
+      - name: ワークフローの文法と式の検査（actionlint）
+        # run: の中の ${{ … }} も Actions の式として評価される。読めない式が 1 つあると、ワークフロー全体が起動しない。
+        # 2026-10-04 に、判定スクリプトの f-string の ${{…}} で node-ci.yml を全リポジトリで止めかけた再発防止。
+        # 版とチェックサムを固定して取得する（公式の checksums.txt の値）。シェルの検査（shellcheck）は対象外にしている。
+        env:
+          ACTIONLINT_VERSION: '1.7.12'
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/$tarball" "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
+          echo "${ACTIONLINT_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -shellcheck= -pyflakes= .github/workflows/*.yml templates/*.yml
+
       - name: ワークフローのトリガー名検証
         # YAML として妥当でも、存在しないイベント名は GitHub が構文エラーにする。
         # 2026-09-21 に pull_request_review_thread を配布して全リポジトリを止めた再発防止。
