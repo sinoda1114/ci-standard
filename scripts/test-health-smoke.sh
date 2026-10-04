@@ -142,6 +142,7 @@ run >/dev/null; ! first_is_ok && has "GHSA-vfj7-8cjw-p6xm" && ok "区切りが�
 # 例外リストを解析できない（UTF-8 でない）ときは「問題なし」にしない
 mk_stub "$PUB" "$GREEN" '' "\x82\xa0GHSA-vfj7-8cjw-p6xm  ${SOON}  \x83\x65\n"
 run >/dev/null; ! first_is_ok && has "確認できなかった" && ok "解析できない例外リストは OK にしない" || ng "解析できない例外リストは OK にしない"
+run >/dev/null; has "UTF-8 でない" && ok "解析できない理由を応答欄に出す" || ng "解析できない理由を応答欄に出す"
 
 # 理由のない行は CI では書式エラーになる。health も同じ書式でだけ読む
 mk_stub "$PUB" "$GREEN" '' "GHSA-vfj7-8cjw-p6xm  ${SOON}\n"

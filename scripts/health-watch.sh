@@ -58,8 +58,8 @@ for line in re.split(r"\r\n|\r|\n", text):
 
 # 直前の gh api の失敗を分類する。404 は「対象が無い」、それ以外は「確認できなかった」
 http_code() { grep -oE 'HTTP [0-9]+' "$ERR" | tail -1; }
-note_unknown() { # note_unknown <表示名> <何を>
-  unknown="${unknown}| ${1} | ${2} | $(http_code) |"$'\n'; n_unknown=$((n_unknown + 1)); }
+note_unknown() { # note_unknown <表示名> <何を> [応答欄。省略時は直前の gh api の HTTP コード]
+  unknown="${unknown}| ${1} | ${2} | ${3:-$(http_code)} |"$'\n'; n_unknown=$((n_unknown + 1)); }
 
 while IFS=$'\t' read -r NAME BRANCH PRIVATE; do
   [ -n "$NAME" ] || continue
@@ -111,7 +111,7 @@ while IFS=$'\t' read -r NAME BRANCH PRIVATE; do
   if ALW=$(gh api -H "Accept: application/vnd.github.raw" \
         "/repos/${OWNER}/${NAME}/contents/.github/audit-allowlist?ref=${QBRANCH}" 2>"$ERR"); then
     if ! SOONS=$(printf '%s\n' "$ALW" | soon_entries 2>/dev/null); then
-      note_unknown "$LABEL" "例外リスト（解析できない）"; CNT=0
+      note_unknown "$LABEL" "例外リスト（解析できない）" "UTF-8 でない等"; CNT=0   # 取得は成功しているので HTTP コードは無い
     else
       CNT=$(printf '%s' "$SOONS" | grep -c .)
     fi
