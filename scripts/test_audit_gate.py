@@ -2,6 +2,7 @@
 
 ゲートが壊れて常に成功を返しても気付けるよう、「落とすべき入力を確実に落とす」ことを中心に確かめる。
 """
+import re
 import json
 import os
 import subprocess
@@ -14,6 +15,7 @@ GATE = os.path.join(HERE, 'audit-gate.py')
 TODAY = '2026-10-03'
 BRACES = 'GHSA-vfj7-8cjw-p6xm'
 NEXT_RCE = 'GHSA-vcvr-r3jv-pc5j'
+ISOLATED = ['-I'] if subprocess.run([sys.executable, '-I', '-c', 'import yaml'], capture_output=True).returncode == 0 else []
 
 
 def npm_report(*advisories):
@@ -327,6 +329,187 @@ class FileAndClockTest(unittest.TestCase):
         self.assertEqual(g['utc_today'](), real.date(2026, 10, 3))
 
 
+class AllowlistPolicyTest(unittest.TestCase):
+    """例外リストの使い方の制限（2026-10-03 追加）: 期限は今日から 120 日以内、critical は除外できない。"""
+    run_gate = AuditGateTest.run_gate
+
+    def test_期限が120日先までなら通す(self):
+        rc, out = self.run_gate(npm_report(('braces', BRACES, 'high')), f'{BRACES} 2027-01-31 修正版なし\n')  # 10/3 + 120 日
+        self.assertEqual(rc, 0, out)
+
+    def test_期限が121日以上先なら落とす(self):
+        rc, out = self.run_gate(npm_report(('braces', BRACES, 'high')), f'{BRACES} 2027-02-01 修正版なし\n')
+        self.assertEqual(rc, 1, out)
+        self.assertIn('120 日', out)
+
+    def test_使われていない例外でも期限が先すぎれば落とす(self):
+        rc, out = self.run_gate(npm_report(), f'{BRACES} 2099-12-31 修正版なし\n')
+        self.assertEqual(rc, 1, out)
+        self.assertIn('120 日', out)
+
+    def test_critical_は例外リストにあっても落とす_npm(self):
+        rc, out = self.run_gate(npm_report(('next', NEXT_RCE, 'critical')), f'{NEXT_RCE} 2026-12-31 様子見\n')
+        self.assertEqual(rc, 1, out)
+        self.assertIn('critical', out)
+        self.assertIn(NEXT_RCE, out)
+
+    def test_critical_は例外リストにあっても落とす_pnpm(self):
+        rc, out = self.run_gate(pnpm_report(('next', NEXT_RCE, 'critical')), f'{NEXT_RCE} 2026-12-31 様子見\n', pm='pnpm')
+        self.assertEqual(rc, 1, out)
+        self.assertIn('critical', out)
+
+
+class PnpmConfigTest(unittest.TestCase):
+    """pnpm の独自の除外設定（auditConfig.ignoreGhsas / ignoreCves）を見つけたら落とす（2026-10-03 追加）。
+
+    例外リストを通さず、理由も期限もなく除外できてしまうため。
+    """
+    def check(self, files):
+        with tempfile.TemporaryDirectory() as d:
+            for name, body in files.items():
+                with open(os.path.join(d, name), 'w', encoding='utf-8') as f:
+                    f.write(body)
+            # 本番（node-ci.yml）と同じく -I（隔離モード）で動かす（CI の self-test は system に PyYAML を入れる）。
+            # 手元で -I から PyYAML が見えないときだけ -I を外す
+            p = subprocess.run([sys.executable, *ISOLATED, GATE, '--pm', 'pnpm', '--config-only', '--project-dir', d],
+                               capture_output=True, text=True)
+            return p.returncode, p.stdout + p.stderr
+
+    def test_除外設定が無ければ通す(self):
+        rc, out = self.check({'package.json': json.dumps({'name': 'x', 'pnpm': {'overrides': {}}})})
+        self.assertEqual(rc, 0, out)
+
+    def test_package_json_が無くても通す(self):
+        rc, out = self.check({})
+        self.assertEqual(rc, 0, out)
+
+    def test_package_json_の_ignoreGhsas_は落とす(self):
+        rc, out = self.check({'package.json': json.dumps({'pnpm': {'auditConfig': {'ignoreGhsas': [BRACES]}}})})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('ignoreGhsas', out)
+        self.assertIn('audit-allowlist', out)
+
+    def test_package_json_の_ignoreCves_は落とす(self):
+        rc, out = self.check({'package.json': json.dumps({'pnpm': {'auditConfig': {'ignoreCves': ['CVE-2026-0001']}}})})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('ignoreCves', out)
+
+    def test_pnpm_workspace_yaml_の除外設定は落とす(self):
+        rc, out = self.check({'package.json': '{}',
+                              'pnpm-workspace.yaml': 'packages:\n  - "."\nauditConfig:\n  ignoreGhsas:\n    - GHSA-vfj7-8cjw-p6xm\n'})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('auditConfig.ignoreGhsas', out)  # PyYAML が無いときの別の理由の失敗で通らないよう、検出したキー名まで見る
+
+    def test_pnpm_workspace_yaml_のフロー形式も落とす(self):
+        rc, out = self.check({'pnpm-workspace.yaml': 'packages: ["."]\nauditConfig: {ignoreGhsas: [GHSA-vfj7-8cjw-p6xm]}\n'})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('ignoreGhsas', out)
+
+    def test_pnpm_workspace_yaml_の引用符つきキーも落とす(self):
+        rc, out = self.check({'pnpm-workspace.yaml': 'auditConfig:\n  "ignoreCves":\n    - CVE-2026-0001\n'})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('ignoreCves', out)
+
+    def test_pnpm_workspace_yaml_の空の除外設定は通す(self):
+        rc, out = self.check({'pnpm-workspace.yaml': 'auditConfig:\n  ignoreGhsas: []\n'})
+        self.assertEqual(rc, 0, out)
+
+    def test_pnpm_workspace_yaml_の環境変数を展開するキーは落とす(self):
+        # pnpm 11 は最上位のキーの ${VAR} を展開する。展開後に auditConfig になる書き方ですり抜けさせない
+        rc, out = self.check({'pnpm-workspace.yaml': '"${AUDIT_KEY}":\n  ignoreGhsas:\n    - GHSA-vfj7-8cjw-p6xm\n'})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('${', out)
+
+    def test_pnpm_workspace_yaml_が壊れていたら落とす(self):
+        rc, out = self.check({'pnpm-workspace.yaml': 'auditConfig: {ignoreGhsas: [\n'})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('YAML として読めません', out)
+
+    def test_pnpm_workspace_yaml_の重複キーは落とす(self):
+        # PyYAML は重複キーを後の値で黙って上書きする。前の値に除外設定を書いて検査をすり抜けさせない
+        rc, out = self.check({'pnpm-workspace.yaml': 'auditConfig: {ignoreGhsas: [GHSA-vfj7-8cjw-p6xm]}\nauditConfig: {}\n'})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('ignoreGhsas', out)
+
+    def test_pnpm_workspace_yaml_の2段の継承は通す(self):
+        # どの値が勝つかを計算しない。正しい 2 段のマージで落とさない
+        rc, out = self.check({'pnpm-workspace.yaml': 'x-base: &base {sharedWorkspaceLockfile: true}\n'
+                                                     'x-overrides: &overrides {<<: *base, sharedWorkspaceLockfile: false}\n'
+                                                     '<<: *overrides\n'})
+        self.assertEqual(rc, 0, out)
+
+    def test_pnpm_workspace_yaml_のマージキーを2回書いた除外設定も落とす(self):
+        # PyYAML と pnpm で勝つ値が食い違っても、書かれている除外設定はすべて見る
+        rc, out = self.check({'pnpm-workspace.yaml': 'x-a: &a {auditConfig: {ignoreGhsas: [GHSA-vfj7-8cjw-p6xm]}}\n'
+                                                     'x-b: &b {auditConfig: {}}\n'
+                                                     '<<: *a\n<<: *b\n'})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('ignoreGhsas', out)
+
+    def test_pnpm_workspace_yaml_のマージキーは通す(self):
+        # pnpm が読める正しい設定（<<: *anchor）を、重複キーの検査で落とさない
+        rc, out = self.check({'pnpm-workspace.yaml': 'x-common: &common\n  react: ^19\ncatalog:\n  <<: *common\n  vue: ^3\n'})
+        self.assertEqual(rc, 0, out)
+
+    def test_pnpm_workspace_yaml_のマージで持ち込んだ除外設定は落とす(self):
+        rc, out = self.check({'pnpm-workspace.yaml': 'x-base: &base\n  auditConfig:\n    ignoreGhsas: [GHSA-vfj7-8cjw-p6xm]\n<<: *base\n'})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('ignoreGhsas', out)
+
+    def test_pnpm_workspace_yaml_の_on_と_yes_は別のキーとして通す(self):
+        # PyYAML はどちらも真偽値 True に変えるが、pnpm は文字列として別々に読む
+        rc, out = self.check({'pnpm-workspace.yaml': 'catalog:\n  on: 1.0.0\n  yes: 2.0.0\n'})
+        self.assertEqual(rc, 0, out)
+
+    def test_auditConfig_の中の環境変数を展開するキーも落とす(self):
+        rc, out = self.check({'pnpm-workspace.yaml': 'auditConfig:\n  "${K}":\n    - GHSA-vfj7-8cjw-p6xm\n'})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('${', out)
+
+    def test_auditConfig_の外の同じ名前のキーは通す(self):
+        # 名前付きカタログが ignoreCves という名前でも、除外設定ではない
+        rc, out = self.check({'pnpm-workspace.yaml': 'catalogs:\n  ignoreCves:\n    lodash: ^4.17.21\n'})
+        self.assertEqual(rc, 0, out)
+
+    def test_アンカー経由で_auditConfig_に入れた除外設定は落とす(self):
+        rc, out = self.check({'pnpm-workspace.yaml': 'x-ign: &ign {ignoreGhsas: [GHSA-vfj7-8cjw-p6xm]}\nauditConfig: *ign\n'})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('ignoreGhsas', out)
+
+    def test_引用符つきの_null_は空として扱わない(self):
+        rc, out = self.check({'pnpm-workspace.yaml': "auditConfig:\n  ignoreGhsas: 'null'\n"})
+        self.assertEqual(rc, 1, out)
+
+    def test_入れ子が深すぎるファイルは理由を出して落とす(self):
+        rc, out = self.check({'pnpm-workspace.yaml': '[' * 5000 + ']' * 5000 + '\n'})
+        self.assertEqual(rc, 1, out)
+        self.assertNotIn('Traceback', out)
+        rc, out = self.check({'package.json': '[' * 100000 + ']' * 100000})
+        self.assertEqual(rc, 1, out)
+        self.assertNotIn('Traceback', out)
+
+    def test_pnpm_workspace_yaml_のスカラーでないキーは落とす(self):
+        # 配列のキー（? [ignoreGhsas]）を文字列にするパーサーでは除外設定になりうる。pnpm の設定として正しくないので落とす
+        rc, out = self.check({'pnpm-workspace.yaml': 'auditConfig:\n  ? [ignoreGhsas]\n  : [GHSA-vfj7-8cjw-p6xm]\n'})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('スカラーでないキー', out)
+
+    def test_pnpm_workspace_yaml_の綴りを変えたキーも落とす(self):
+        # 大文字小文字・ハイフン・下線の違いですり抜けさせない
+        rc, out = self.check({'pnpm-workspace.yaml': 'audit-config:\n  ignore-ghsas:\n    - GHSA-vfj7-8cjw-p6xm\n'})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('ignore-ghsas', out)
+
+    def test_package_json_の綴りを変えたキーも落とす(self):
+        rc, out = self.check({'package.json': json.dumps({'pnpm': {'AuditConfig': {'ignore_cves': ['CVE-2026-0001']}}})})
+        self.assertEqual(rc, 1, out)
+        self.assertIn('ignore_cves', out)
+
+    def test_package_json_が壊れていたら落とす(self):
+        rc, out = self.check({'package.json': '{ broken'})
+        self.assertEqual(rc, 1, out)
+
+
 class EmbeddedCopyTest(unittest.TestCase):
     """node-ci.yml に埋め込んだ判定スクリプトが scripts/audit-gate.py と同一であること。
 
@@ -343,6 +526,39 @@ class EmbeddedCopyTest(unittest.TestCase):
         with open(GATE, encoding='utf-8') as f:
             self.assertEqual(embedded, f.read(),
                              'scripts/audit-gate.py を直したら node-ci.yml の埋め込みも同じ内容にしてください')
+
+class WorkflowExpressionTest(unittest.TestCase):
+    """ワークフローの中の ${{ … }} が、GitHub Actions の式として読める形だけであること（2026-10-03 追加）。
+
+    run: の中の文字列（heredoc の中も含む）でも ${{ は式として評価される。読めない式が 1 つあると
+    ワークフロー全体が起動しなくなり、配布先のすべてのリポジトリで CI が止まる。
+    """
+    EXPR = re.compile(r"\$\{\{(.*?)\}\}")
+    ALLOWED = re.compile(r"^[\x20-\x7e]*[^\s][\x20-\x7e]*$")  # ASCII の印字可能文字だけで、空でない
+
+    def test_式として読めない_dollar_brace_brace_が無い(self):
+        # 配布するテンプレートも、配布先で同じ事故を起こすので対象にする
+        paths = [os.path.join(d, n) for d in (os.path.join(HERE, '..', '.github', 'workflows'),
+                                              os.path.join(HERE, '..', 'templates'),
+                                              os.path.join(HERE, '..', 'templates', 'skeleton'))
+                 if os.path.isdir(d) for n in sorted(os.listdir(d)) if n.endswith(('.yml', '.yaml'))]
+        self.assertTrue(any('templates' in p for p in paths), 'テンプレートが見つからない')
+        for path in paths:
+            name = os.path.relpath(path, os.path.join(HERE, '..'))
+            with open(path, encoding='utf-8') as f:
+                for no, line in enumerate(f, 1):
+                    # run: の中のシェルのコメントも Actions は評価するので、# で始まる行も飛ばさない
+                    if '${{' not in line:
+                        continue
+                    exprs = self.EXPR.findall(line)
+                    self.assertEqual(line.count('${{'), len(exprs), f'{name}:{no} 閉じていない ${{{{: {line.strip()}')
+                    for e in exprs:
+                        self.assertRegex(e, self.ALLOWED, f'{name}:{no} 式として読めない: {line.strip()}')
+
+    def test_埋め込みの判定スクリプトに_dollar_brace_brace_が無い(self):
+        with open(GATE, encoding='utf-8') as f:
+            self.assertNotIn('${{', f.read(), 'node-ci.yml に埋め込むと Actions の式として評価される')
+
 
 if __name__ == '__main__':
     unittest.main()

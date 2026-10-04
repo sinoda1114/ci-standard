@@ -6,11 +6,11 @@
 # 2026-09-22 の棚卸しで、14 リポジトリ中 8 つが赤のまま放置され、
 # うち 4 つは npm audit が critical/high を検出して落ちていた（Next.js の未認証 RCE を含む）。
 #
-# 毎朝、全リポジトリの既定ブランチの最新 CI 結論と未解決の脆弱性アラートを集め、
+# 毎朝、全リポジトリの既定ブランチの最新 CI 結論・未解決の脆弱性アラート・audit の例外リストの期限を集め、
 # 問題があれば ci-standard に Issue を 1 本立てる（同一タイトルのオープン Issue があれば更新）。
 #
 # 必要セットアップ: sweeper と同じ ADMIN_TOKEN（fine-grained PAT）に、次の読み取り権限を足す。
-#   Actions: read（CI の結論）/ Dependabot alerts: read（脆弱性アラート）
+#   Actions: read（CI の結論）/ Dependabot alerts: read（脆弱性アラート）/ Contents: read（例外リストの期限）
 # 権限が足りないと「確認できなかった」として Issue に載る（黙って OK にはしない）。
 
 name: health

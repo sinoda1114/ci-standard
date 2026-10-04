@@ -178,14 +178,15 @@ jobs:
 
       # 修正版が公開されていない脆弱性は、リポジトリの .github/audit-allowlist に理由と期限つきで書けば除外できる
       # （書式と判定は scripts/audit-gate.py）。ファイルが無いリポジトリは従来どおりの audit のまま。
+      # 期限は今日から 120 日以内に限り、critical は例外リストに書いても除外しない。
+      # pnpm の独自の除外設定（auditConfig.ignoreGhsas / ignoreCves）は、例外リストの有無にかかわらず落とす。
       # 判定スクリプトは、呼び出されたこのワークフローと版がずれないよう下に埋め込む（scripts/audit-gate.py と同一。
       # 一致は self-test の test_audit_gate.py が検査する）。
       - name: Audit (high以上を検出)
         env:
           PM: ${{ needs.detect.outputs.pm }}
         run: |
-          if [ -f .github/audit-allowlist ] && [ "$PM" != yarn ]; then
-            cat > "$RUNNER_TEMP/audit-gate.py" <<'AUDIT_GATE_PY'
+          cat > "$RUNNER_TEMP/audit-gate.py" <<'AUDIT_GATE_PY'
           #!/usr/bin/env python3
           """npm / pnpm audit の結果を、リポジトリの例外リスト（.github/audit-allowlist）と突き合わせて合否を出す。
 
@@ -193,10 +194,16 @@ jobs:
           high 以上で落とす方針はそのままにし、除外は理由と期限つきで記録に残す。
 
           使い方: npm audit --json | python3 audit-gate.py --pm npm --allowlist .github/audit-allowlist [--today YYYY-MM-DD]
+                 python3 audit-gate.py --pm pnpm --config-only --project-dir .   # pnpm の独自の除外設定だけを検査
 
           例外リストの書式（1 行 1 件。# で始まる行はコメント。理由の中の # はそのまま理由の一部）:
               GHSA-xxxx-xxxx-xxxx  YYYY-MM-DD  理由
             期限の日を過ぎた行は無効になり、CI を落とす（放置を防ぐため）。
+            期限は今日から MAX_EXPIRY_DAYS（120）日以内に限る。それより先の期限は書式エラーと同じく落とす（実質の無期限化を防ぐ）。
+            critical は例外リストに書いてあっても除外しない（必ず直す）。
+
+          pnpm の独自の除外設定（package.json の pnpm.auditConfig、pnpm-workspace.yaml の auditConfig にある
+          ignoreGhsas / ignoreCves）は、理由も期限もなく除外できてしまうので、見つけたら落とす（--config-only）。
 
           終了コード: 0 = 通す / 1 = 落とす（未登録の high 以上、期限切れ、書式エラー、audit の失敗や想定外の形の JSON）
           GHSA の ID を取り出せない high 以上の advisory は、例外リストで扱えないので常に落とす（fail-closed）。
@@ -205,12 +212,17 @@ jobs:
           import argparse
           import datetime
           import json
+          import os
           import re
           import sys
 
           BLOCKING = {'high', 'critical'}
           SEVERITIES = {'info', 'low', 'moderate', 'high', 'critical'}
           GHSA_RE = re.compile(r'GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}')
+          MAX_EXPIRY_DAYS = 120
+          PNPM_IGNORE_KEYS = ('ignoreGhsas', 'ignoreCves')
+
+
           def utc_today():
               """期限の判定に使う今日の日付（UTC）。TZ が設定されていても変わらない。"""
               return datetime.datetime.now(datetime.timezone.utc).date()
@@ -268,6 +280,105 @@ jobs:
                       continue
                   entries[m.group(1)] = (expiry, m.group(3))
               return entries, errors
+
+
+          def normalize_key(key):
+              """大文字小文字・ハイフン・下線の違いを無視して比べるための形にする（綴りを変えてのすり抜けを防ぐ）。"""
+              return key.lower().replace('-', '').replace('_', '') if isinstance(key, str) else None
+
+
+          def ignore_settings(section):
+              """auditConfig の中の空でない除外設定を「auditConfig.ignoreGhsas」の形で返す（書かれた綴りのまま）。"""
+              wanted = {normalize_key(k) for k in PNPM_IGNORE_KEYS}
+              found = []
+              for key, cfg in section.items():
+                  if normalize_key(key) != 'auditconfig' or not isinstance(cfg, dict):
+                      continue
+                  found += [f'{key}.{k}' for k, v in cfg.items() if normalize_key(k) in wanted and v]
+                  # 展開後の名前は CI の環境で変わるので、${…} を含むキーは除外設定かどうか確かめられない
+                  found += [str(key) + '.' + k + '（${…} の展開を含むキーは検査できないため使えません）'
+                            for k in cfg if isinstance(k, str) and '${' in k]
+              return found
+
+
+          def yaml_ignore_settings(yaml, root):
+              """YAML のノードを全部たどり、空でない除外設定と ${…} を含むキーがある場所を返す。
+
+              PyYAML と pnpm は、重複キーやマージキー（<<）でどの値が勝つかが食い違うことがある。
+              勝つ値を計算せず、ファイルに書かれているものを全部見る（どの値が勝っても見落とさない）。
+              """
+              wanted = {normalize_key(k) for k in PNPM_IGNORE_KEYS}
+              found, seen = [], set()
+
+              def has_content(node):
+                  if isinstance(node, (yaml.SequenceNode, yaml.MappingNode)):
+                      return bool(node.value)
+                  return node.tag != 'tag:yaml.org,2002:null'  # 引用符つきの 'null' や '~' は文字列なので空ではない
+
+              def walk(node, path, in_audit):
+                  # 同じノードでも auditConfig の下かどうかで見方が変わる（アンカーを別名で auditConfig に入れる書き方）
+                  if (id(node), in_audit) in seen:  # 循環も含めて、同じ見方では一度だけたどる
+                      return
+                  seen.add((id(node), in_audit))
+                  if isinstance(node, yaml.SequenceNode):
+                      for item in node.value:
+                          walk(item, path, in_audit)
+                  elif isinstance(node, yaml.MappingNode):
+                      for key_node, value_node in node.value:
+                          if not isinstance(key_node, yaml.ScalarNode):
+                              # 配列などのキーを文字列にするパーサーでは、除外設定の名前になりうる。pnpm の設定として正しくないので落とす
+                              found.append('.'.join(path + ['?']) + '（スカラーでないキーは使えません）')
+                              walk(key_node, path + ['?'], in_audit)
+                              walk(value_node, path + ['?'], in_audit)
+                              continue
+                          key = key_node.value
+                          name = path + [key]
+                          # 除外設定として効くのは auditConfig の下だけ（catalogs などの同じ名前のキーは別物）
+                          if in_audit and normalize_key(key) in wanted and has_content(value_node):
+                              found.append('.'.join(name))
+                          # pnpm 11 は ${VAR} を展開する。展開後の名前は CI の環境で変わるので、展開を含むキーは落とす
+                          if '${' in key:
+                              found.append('.'.join(name) + '（${…} の展開を含むキーは検査できないため使えません）')
+                          walk(value_node, name, in_audit or normalize_key(key) == 'auditconfig')
+
+              if root is not None:
+                  walk(root, [], False)
+              return found
+
+
+          def pnpm_config_errors(project_dir):
+              """pnpm の独自の除外設定を探し、見つかった場所の一覧を返す（無ければ空）。"""
+              errors = []
+              pkg = os.path.join(project_dir, 'package.json')
+              if os.path.exists(pkg):
+                  try:
+                      with open(pkg, encoding='utf-8-sig') as f:
+                          data = json.load(f)
+                  except (OSError, ValueError, RecursionError) as e:  # RecursionError は入れ子が深すぎるとき
+                      return [f'package.json を読めません（{type(e).__name__}）。除外設定の有無を確かめられないため通しません']
+                  pnpm = data.get('pnpm') if isinstance(data, dict) else None
+                  if isinstance(pnpm, dict):
+                      errors += ['package.json の pnpm.' + name for name in ignore_settings(pnpm)]
+              ws = os.path.join(project_dir, 'pnpm-workspace.yaml')
+              if os.path.exists(ws):
+                  try:
+                      with open(ws, encoding='utf-8-sig') as f:
+                          body = f.read()
+                  except (OSError, UnicodeDecodeError) as e:
+                      return errors + [f'pnpm-workspace.yaml を読めません（{type(e).__name__}）。除外設定の有無を確かめられないため通しません']
+                  try:
+                      import yaml  # GitHub のランナー（ubuntu）には入っている
+                  except ImportError:
+                      # 名前の検索で代わりにするとエスケープ表記ですり抜けられるので、検査できないとして落とす
+                      return errors + ['pnpm-workspace.yaml を検査するための YAML パーサー（PyYAML）がありません。除外設定の有無を確かめられないため通しません']
+                  try:
+                      root = yaml.compose(body, Loader=yaml.SafeLoader)  # 値は組み立てず、書かれたままの形で見る
+                      found = yaml_ignore_settings(yaml, root)
+                  except (yaml.YAMLError, RecursionError) as e:  # RecursionError は入れ子が深すぎるとき
+                      detail = type(e).__name__ + (': ' + e.problem if getattr(e, 'problem', None) else '')
+                      return errors + [f'pnpm-workspace.yaml を YAML として読めません（{detail}）。除外設定の有無を確かめられないため通しません']
+                  errors += ['pnpm-workspace.yaml の ' + name for name in found]
+              return errors
 
 
           def shape_error(report, pm):
@@ -361,11 +472,21 @@ jobs:
           def main():
               ap = argparse.ArgumentParser()
               ap.add_argument('--pm', choices=['npm', 'pnpm'], default='npm')
-              ap.add_argument('--allowlist', required=True)
+              ap.add_argument('--allowlist')
+              ap.add_argument('--config-only', action='store_true', help='pnpm の独自の除外設定だけを検査する（audit の JSON は読まない）')
+              ap.add_argument('--project-dir', default='.', help='--config-only で検査するディレクトリ')
               ap.add_argument('--today', type=datetime.date.fromisoformat, default=None,
                               help='判定日 YYYY-MM-DD（省略時は UTC の今日）。日付でない値は使い方のエラーになる')
               a = ap.parse_args()
               today = a.today or utc_today()
+              if a.config_only:
+                  found_cfg = pnpm_config_errors(a.project_dir) if a.pm == 'pnpm' else []
+                  for c in found_cfg:
+                      emit('error', f'pnpm の独自の除外設定は使えません: {c}（理由と期限つきで .github/audit-allowlist に移してください）')
+                  print(f'audit-gate: pnpm の除外設定 {len(found_cfg)} 件 → {"失敗" if found_cfg else "通過"}')
+                  return 1 if found_cfg else 0
+              if not a.allowlist:
+                  ap.error('--allowlist が必要です（--config-only のときを除く）')
 
               try:
                   report = json.load(sys.stdin)
@@ -383,11 +504,18 @@ jobs:
                   emit('error', f'audit の結果を解釈できません（{type(e).__name__}: {e}）')
                   return 1
 
-              blocking, expired, allowed = [], [], 0
+              limit = today + datetime.timedelta(days=MAX_EXPIRY_DAYS)
+              for ghsa, (expiry, _) in sorted(allow.items()):
+                  if expiry > limit:
+                      errors.append(f'例外の期限が先すぎます（今日から {MAX_EXPIRY_DAYS} 日以内、{limit} までにしてください）: {ghsa} 期限 {expiry}')
+
+              blocking, critical, expired, allowed = [], [], [], 0
               for ghsa, (sev, pkgs) in sorted(found.items()):
                   pkg = ', '.join(sorted(pkgs))
                   if ghsa not in allow:
                       blocking.append(f'{ghsa} ({sev}, {pkg})')
+                  elif sev == 'critical':
+                      critical.append(f'{ghsa} ({sev}, {pkg})')
                   elif allow[ghsa][0] < today:
                       expired.append(f'{ghsa} ({sev}, {pkg}) 期限 {allow[ghsa][0]}')
                   else:
@@ -403,25 +531,38 @@ jobs:
                   emit('error', e)
               for b in blocking:
                   emit('error', f'high 以上の脆弱性（例外リストに無し）: {b}')
+              for c in critical:
+                  emit('error', f'critical は例外リストに書いてあっても除外しません（必ず直してください）: {c}')
               for n in no_id:
                   emit('error', f'high 以上の脆弱性（GHSA の ID が無いため例外リストで除外できません）: {n}')
               for b in broken:
                   emit('error', f'audit の結果の構造が不正です（high 以上が隠れている可能性があるため通しません）: {b}')
               for x in expired:
                   emit('error', f'例外の期限切れ: {x}（修正版を確認し、行を消すか期限を延ばしてください）')
-              ok = not (errors or blocking or expired or no_id or broken)
-              print(f'audit-gate: high以上 {sum(len(p) for _, p in found.values()) + len(no_id)} 件 / 除外 {allowed} 件 / 未登録 {len(blocking)} 件 / '
+              ok = not (errors or blocking or critical or expired or no_id or broken)
+              print(f'audit-gate: high以上 {sum(len(p) for _, p in found.values()) + len(no_id)} 件 / 除外 {allowed} 件 / 未登録 {len(blocking)} 件 / critical {len(critical)} 件 / '
                     f'ID なし {len(no_id)} 件 / 構造エラー {len(broken)} 件 / 期限切れ {len(expired)} 件 → {"通過" if ok else "失敗"}')
               return 0 if ok else 1
 
           if __name__ == '__main__':
               sys.exit(main())
           AUDIT_GATE_PY
+          # pnpm の独自の除外設定（auditConfig.ignoreGhsas / ignoreCves）は例外リストを素通りし、理由も期限も残らない。
+          # 例外リストの有無にかかわらず、見つけたら落とす（例外リストへ移す）
+          # 判定は python3 -I（隔離モード）で動かす。ci.env などの PYTHONPATH・sitecustomize で判定を無効にさせないため
+          if [ "$PM" = pnpm ]; then
+            # pnpm-workspace.yaml の検査には PyYAML が要る。-I は user site を読まないので、無ければ system に入れる
+            if [ -f pnpm-workspace.yaml ] && ! python3 -I -c 'import yaml' 2>/dev/null; then
+              { sudo apt-get update -qq && sudo apt-get install -y -qq python3-yaml; } || echo "::warning::python3-yaml を入れられませんでした（apt の出力は上。pnpm-workspace.yaml の検査は落ちます）"
+            fi
+            python3 -I "$RUNNER_TEMP/audit-gate.py" --pm pnpm --config-only --project-dir . || exit 1
+          fi
+          if [ -f .github/audit-allowlist ] && [ "$PM" != yarn ]; then
             # audit は脆弱性があると非 0 で終わるので、合否は判定スクリプトに任せる。audit 自体の失敗（{"error":…} や想定外の形）は判定側で落とす
             # pnpm は JSON の advisories 自体を audit-level で絞るので、リポジトリの設定で緩められないよう high を明示する
             if [ "$PM" = pnpm ]; then pnpm audit --json --audit-level high > "$RUNNER_TEMP/audit.json" || true
             else npm audit --json > "$RUNNER_TEMP/audit.json" || true; fi
-            python3 "$RUNNER_TEMP/audit-gate.py" --pm "$([ "$PM" = pnpm ] && echo pnpm || echo npm)" \
+            python3 -I "$RUNNER_TEMP/audit-gate.py" --pm "$([ "$PM" = pnpm ] && echo pnpm || echo npm)" \
               --allowlist .github/audit-allowlist < "$RUNNER_TEMP/audit.json"
             exit $?
           fi
