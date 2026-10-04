@@ -32,6 +32,32 @@ jobs:
         # 「壊れた入力を確実に落とす」ことをテストで担保する。
         run: python3 -m unittest discover -s scripts -p 'test_validate_triggers.py' -v
 
+      - name: ワークフローの文法と式の検査（actionlint）
+        # run: の中の ${{ … }} も Actions の式として評価される。読めない式が 1 つあると、ワークフロー全体が起動しない。
+        # 2026-10-04 に、判定スクリプトの f-string の ${{…}} で node-ci.yml を全リポジトリで止めかけた再発防止。
+        # 対象: このリポジトリのワークフロー（.yml・.yaml を actionlint が自動で探す）、配布するテンプレート、
+        #       sweep.sh がヒアドキュメントで組み立てて全リポジトリに配る ci.yml（node・python の両方）。
+        # shellcheck と pyflakes の検査は対象外にしている（目的はワークフローの文法と式）。
+        # 版を上げるときは、https://github.com/rhysd/actionlint/releases の actionlint_<版>_checksums.txt から
+        # linux_amd64.tar.gz の行の値を ACTIONLINT_SHA256 に写す（取得物を照合してから実行するため）。
+        env:
+          ACTIONLINT_VERSION: '1.7.12'
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          STANDARD_REPO: sinoda1114/ci-standard
+        run: |
+          tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/$tarball" "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
+          echo "${ACTIONLINT_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" actionlint
+          lint() { "$RUNNER_TEMP/actionlint" -shellcheck= -pyflakes= "$@"; }
+          lint
+          lint templates/*.yml
+          # sweep.sh の関数だけを取り出して、配る ci.yml を実際に組み立てる（sweep.sh 全体は走らせない）
+          eval "$(sed -n '/^standard_ci_body()/,/^}/p' scripts/sweep.sh)"
+          mkdir -p "$RUNNER_TEMP/dist/.github/workflows"
+          for kind in node python; do standard_ci_body "$kind" main > "$RUNNER_TEMP/dist/.github/workflows/ci-$kind.yml"; done
+          lint "$RUNNER_TEMP"/dist/.github/workflows/ci-*.yml
+
       - name: ワークフローのトリガー名検証
         # YAML として妥当でも、存在しないイベント名は GitHub が構文エラーにする。
         # 2026-09-21 に pull_request_review_thread を配布して全リポジトリを止めた再発防止。
