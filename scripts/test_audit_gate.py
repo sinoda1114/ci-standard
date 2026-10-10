@@ -510,6 +510,27 @@ class PnpmConfigTest(unittest.TestCase):
         self.assertEqual(rc, 1, out)
 
 
+class AuditOmitDevTest(unittest.TestCase):
+    """本番依存だけの監査は .github/audit-omit-dev があるときだけで、印が無い側のコマンドは残す。"""
+
+    def test_印が無い側のコマンドが残る(self):
+        with open(os.path.join(HERE, '..', '.github', 'workflows', 'node-ci.yml'), encoding='utf-8') as f:
+            text = f.read()
+        self.assertIn('if [ -f .github/audit-omit-dev ]; then', text)
+        self.assertIn('npm audit --omit=dev --json', text)
+        self.assertIn('npm audit --omit=dev --audit-level=high', text)
+        self.assertIn('pnpm audit --json --audit-level high --prod', text)
+        self.assertIn('pnpm audit --prod --audit-level high', text)
+        lines = [line.strip() for line in text.splitlines()]
+        self.assertEqual(lines.count('*)    npm audit --audit-level=high ;;'), 1)
+        self.assertEqual(lines.count('else npm audit --json > "$RUNNER_TEMP/audit.json" || true; fi'), 1)
+        self.assertEqual(lines.count('pnpm) pnpm audit --audit-level high ;;'), 1)
+        self.assertEqual(
+            lines.count('if [ "$PM" = pnpm ]; then pnpm audit --json --audit-level high > "$RUNNER_TEMP/audit.json" || true'),
+            1,
+        )
+
+
 class EmbeddedCopyTest(unittest.TestCase):
     """node-ci.yml に埋め込んだ判定スクリプトが scripts/audit-gate.py と同一であること。
 

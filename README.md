@@ -168,4 +168,5 @@ GHSA-vfj7-8cjw-p6xm    2026-12-31  braces。修正版なし（3.0.3 も影響範
 - 使われなくなった行は CI のログに通知が出る。
 - **守備範囲**: この仕組みが防ぐのは、理由も期限もない手軽な除外（AI エージェントや開発者が `ignoreGhsas` を足す、期限を何年も先にする、critical を外す等）と、その記録漏れ。呼び出し側のリポジトリを書ける人は自分の `ci.yml` から audit を外すこともできるので、意図的な回避（`.github/ci.env` の環境変数・`.pnpmfile.cjs`・前のステップでの細工など）は対象外とし、レビューで止める。`.npmrc` から pnpm が `auditConfig` を読むかは確かめておらず、検査の対象外。
 - ファイルが無いリポジトリは従来の `npm audit --audit-level=high` のまま。判定は `scripts/audit-gate.py`（テストは `scripts/test_audit_gate.py`）。
+- `.github/audit-omit-dev` があるリポジトリだけ、監査対象を本番依存に限る（npm は `npm audit --omit=dev`、pnpm は `pnpm audit --prod`）。high 以上で落とすことと、例外リストの判定は変えない。ファイルが無いリポジトリは dev 依存も監査する。
 - 判定スクリプトは、呼び出されたワークフローと版がずれないよう `node-ci.yml` に埋め込んである。`scripts/audit-gate.py` を直したら埋め込みも同じ内容にする（一致しないと self-test が落ちる）。
