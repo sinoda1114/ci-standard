@@ -178,6 +178,7 @@ jobs:
 
       # 修正版が公開されていない脆弱性は、リポジトリの .github/audit-allowlist に理由と期限つきで書けば除外できる
       # （書式と判定は scripts/audit-gate.py）。ファイルが無いリポジトリは従来どおりの audit のまま。
+      # .github/audit-omit-dev があるリポジトリだけ、npm は --omit=dev、pnpm は --prod で本番依存だけを見る。
       # 期限は今日から 120 日以内に限り、critical は例外リストに書いても除外しない。
       # pnpm の独自の除外設定（auditConfig.ignoreGhsas / ignoreCves）は、例外リストの有無にかかわらず落とす。
       # 判定スクリプトは、呼び出されたこのワークフローと版がずれないよう下に埋め込む（scripts/audit-gate.py と同一。
@@ -560,18 +561,33 @@ jobs:
           if [ -f .github/audit-allowlist ] && [ "$PM" != yarn ]; then
             # audit は脆弱性があると非 0 で終わるので、合否は判定スクリプトに任せる。audit 自体の失敗（{"error":…} や想定外の形）は判定側で落とす
             # pnpm は JSON の advisories 自体を audit-level で絞るので、リポジトリの設定で緩められないよう high を明示する
-            if [ "$PM" = pnpm ]; then pnpm audit --json --audit-level high > "$RUNNER_TEMP/audit.json" || true
-            else npm audit --json > "$RUNNER_TEMP/audit.json" || true; fi
+            # .github/audit-omit-dev があるときだけ本番依存に限る。high の閾値と例外リストの判定は変えない。
+            if [ -f .github/audit-omit-dev ]; then
+              if [ "$PM" = pnpm ]; then pnpm audit --json --audit-level high --prod > "$RUNNER_TEMP/audit.json" || true
+              else npm audit --omit=dev --json > "$RUNNER_TEMP/audit.json" || true; fi
+            else
+              if [ "$PM" = pnpm ]; then pnpm audit --json --audit-level high > "$RUNNER_TEMP/audit.json" || true
+              else npm audit --json > "$RUNNER_TEMP/audit.json" || true; fi
+            fi
             python3 -I "$RUNNER_TEMP/audit-gate.py" --pm "$([ "$PM" = pnpm ] && echo pnpm || echo npm)" \
               --allowlist .github/audit-allowlist < "$RUNNER_TEMP/audit.json"
             exit $?
           fi
-          case "$PM" in
-            pnpm) pnpm audit --audit-level high ;;
-            # yarn は classic/berry で audit の作法が違うため best-effort（CIを落とさない）
-            yarn) yarn npm audit --severity high || yarn audit --level high || true ;;
-            *)    npm audit --audit-level=high ;;
-          esac
+          if [ -f .github/audit-omit-dev ]; then
+            case "$PM" in
+              pnpm) pnpm audit --prod --audit-level high ;;
+              # yarn は classic/berry で audit の作法が違うため best-effort（CIを落とさない）
+              yarn) yarn npm audit --severity high || yarn audit --level high || true ;;
+              *)    npm audit --omit=dev --audit-level=high ;;
+            esac
+          else
+            case "$PM" in
+              pnpm) pnpm audit --audit-level high ;;
+              # yarn は classic/berry で audit の作法が違うため best-effort（CIを落とさない）
+              yarn) yarn npm audit --severity high || yarn audit --level high || true ;;
+              *)    npm audit --audit-level=high ;;
+            esac
+          fi
 
   # コード健全性ゲート（Fallow）: 未使用コード・重複・複雑度・アーキテクチャ境界の検出。
   # 既定は report-only（fail-on-issues: false）。強制したいリポジトリは .github/fallow-strict を置く。
