@@ -47,8 +47,8 @@ SUPERSEDED_LABEL="sweeper-superseded"    # 同じ印のラベル版（本文は 
 # 印の仕組みを入れた日時（ci-standard #8 のマージ）。これより前に閉じた sweeper PR は、sweeper 自身の置き換えでも
 # 印が無く人の却下と区別できないので、却下として数えない
 REJECT_SINCE="2026-09-21T11:02:07Z"
-# 除外: 標準リポ自身 / チーム開発 / 空チュートリアル
-EXCLUDE="ci-standard teamdev-2023-apr-team1 desktop-tutorial flue-test2"
+# 除外: 標準リポ自身 / チーム開発 / 空チュートリアル / /ai-review の台帳（Issue だけの Private。CI を配ると分数を消費する）
+EXCLUDE="ci-standard teamdev-2023-apr-team1 desktop-tutorial flue-test2 ai-review-ledger"
 ERRLOG=$(mktemp)
 REPROTECT_FAILED_FLAG=$(mktemp)   # 再保護に失敗したリポジトリ名を書く（末尾で非ゼロ終了させる）
 GH_STDERR=$(mktemp)               # gh の stderr を JSON と混ぜないための受け皿

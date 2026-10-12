@@ -66,6 +66,8 @@ jobs:
       - name: audit の例外リスト判定の単体テスト
         run: python3 -m unittest discover -s scripts -p 'test_audit_gate.py' -v
 
+      - name: leak-metrics 単体テスト（窓・結び付け・2 段の判定・台帳の読み書き）
+        run: python3 -m unittest discover -s scripts/leak-metrics -v
       - name: pr-triage 単体テスト
         run: python3 -m unittest discover -s scripts/pr-triage -v
       - name: sweep.sh スモーク（gh スタブ。bash -n では未定義変数などの実行時エラーを検出できない）
