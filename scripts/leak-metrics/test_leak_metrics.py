@@ -478,6 +478,20 @@ class Robustness(unittest.TestCase):
         rec = lm.judge(out[0], api=lambda m, p: self.fail("材料が欠けたまま判定した"), has_key=True)
         self.assertEqual(rec["verdict"], "unjudged")
 
+    def test_incomplete_without_suspects_is_not_settled_as_no_suspect(self):
+        c = {"key": "o/r@r1", "repo": "o/r", "kind": "revert", "sha": "r1", "message": "Revert", "diff": "",
+             "suspects": [], "incomplete": "revert 元の PR を取得できない"}
+        self.assertEqual(lm.judge(c, api=lambda m, p: self.fail("呼ばれた"), has_key=True)["verdict"], "unjudged")
+
+    def test_suspects_are_not_shared_between_candidates(self):
+        prs = [pr(10, "2026-10-01T00:00:00Z", ["src/a.js"])]
+        cs = [commit("f1", "2026-10-05T00:00:00Z", "fix: a", ["src/a.js"]),
+              commit("f2", "2026-10-06T00:00:00Z", "fix: b", ["src/a.js"])]
+        out = lm.fix_candidates("o/r", cs, prs)
+        out[0]["suspects"][0]["diff"] = "x"
+        self.assertNotIn("diff", out[1]["suspects"][0])
+        self.assertNotIn("diff", prs[0])
+
     def test_suspect_diff_too_large_is_judged_with_file_list(self):
         saved = lm.gh
         try:

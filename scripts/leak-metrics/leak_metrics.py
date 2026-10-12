@@ -78,7 +78,7 @@ def fix_candidates(repo, commits, prs, revert_pr=None):
                 age = when - _ts(p["merged_at"])
                 if dt.timedelta(0) < age <= dt.timedelta(days=WINDOW_DAYS) and files & set(p.get("files") or []):
                     suspects.append(p)
-        suspects = sorted(suspects, key=lambda p: p["merged_at"], reverse=True)[:MAX_SUSPECTS]
+        suspects = [dict(p) for p in sorted(suspects, key=lambda p: p["merged_at"], reverse=True)[:MAX_SUSPECTS]]  # 候補ごとに別の写し
         out.append({"key": "%s@%s" % (repo, c["sha"]), "repo": repo, "kind": kind, "sha": c["sha"],
                     "date": c["date"], "message": c["message"].splitlines()[0][:200],
                     "diff": c.get("diff", ""), "suspects": suspects, **({"incomplete": incomplete} if incomplete else {})})
@@ -164,14 +164,14 @@ def base_record(c, why=""):
 
 def judge(c, api, has_key):
     rec = base_record(c)
+    if c.get("incomplete"):  # 材料が欠けたまま判定しない。候補が無くても確定させない（次回に取り直す）
+        rec["rationale"] = "材料が欠けている: %s" % c["incomplete"]
+        return rec
     if not c["suspects"]:
         rec["verdict"] = "no-suspect"
         return rec
     if not has_key:
         rec["rationale"] = "API キーが無い"
-        return rec
-    if c.get("incomplete"):  # 材料が欠けたまま判定しない（次回に取り直す）
-        rec["rationale"] = "材料が欠けている: %s" % c["incomplete"]
         return rec
     prompt = build_prompt(c)
     final = None
@@ -434,9 +434,12 @@ def collect(owner, exclude):
                 ps = json.loads(gh("api", "repos/%s/commits/%s/pulls" % (name, sha)))
                 return ps[0]["number"] if ps else None
             fc = fix_candidates(name, commits, prs, revert_pr=revert_pr)
+            diffs = {}  # 同じ PR の差分は 1 回だけ取る（失敗も同じ結果を、その PR を候補に持つ全員に返す）
             for c in fc:  # 原因の候補の差分は、判定に使うものだけ取る
                 for s in c["suspects"]:
-                    s["diff"], why = suspect_diff(name, s)
+                    if s["number"] not in diffs:
+                        diffs[s["number"]] = suspect_diff(name, s)
+                    s["diff"], why = diffs[s["number"]]
                     if why:
                         c["incomplete"] = why
             issues = [i for i in _paged("repos/%s/issues?state=all&labels=type:fix&since=%s&per_page=100" % (name, since_fix))
