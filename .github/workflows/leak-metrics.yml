@@ -7,7 +7,8 @@
 # 本体: scripts/leak-metrics/leak_metrics.py（テスト: test_leak_metrics.py）
 #
 # 必要な secret:
-#   ADMIN_TOKEN               sweeper と共用の fine-grained PAT（全リポジトリの読み取りと、台帳への Issue の起票）
+#   LEAK_METRICS_TOKEN        推奨。専用の fine-grained PAT（全リポジトリの Contents・Pull requests・Issues の読み取りと、
+#                             台帳だけ Issues の書き込み）。無ければ sweeper と共用の ADMIN_TOKEN を使う（権限が大きすぎるので移行を推奨）
 #   LEAK_JUDGE_ANTHROPIC_KEY  判定に使う Anthropic API キー。無ければ全件を「未判定」として記録し、次回に再判定する
 # 料金の上限: 1 回の判定は最大 60 件（leak_metrics.py の MAX_PER_RUN）。このリポジトリは Public なので Actions の分数は消費しない。
 name: leak-metrics
@@ -33,13 +34,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: ADMIN_TOKEN の存在確認
+      - name: トークンの存在確認
         env:
-          GH_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+          GH_TOKEN: ${{ secrets.LEAK_METRICS_TOKEN || secrets.ADMIN_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.LEAK_JUDGE_ANTHROPIC_KEY }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
-            echo "::error::Actions secret ADMIN_TOKEN が未設定です"
+            echo "::error::Actions secret LEAK_METRICS_TOKEN（または ADMIN_TOKEN）が未設定です"
             exit 1
           fi
           if [ -z "$ANTHROPIC_API_KEY" ]; then
@@ -49,6 +50,6 @@ jobs:
       - name: 漏れを集めて判定し、台帳に残す
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+          GH_TOKEN: ${{ secrets.LEAK_METRICS_TOKEN || secrets.ADMIN_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.LEAK_JUDGE_ANTHROPIC_KEY }}
         run: python3 -I scripts/leak-metrics/leak_metrics.py run --owner sinoda1114 --ledger sinoda1114/ai-review-ledger --exclude ci-standard | tee -a "$GITHUB_STEP_SUMMARY"
