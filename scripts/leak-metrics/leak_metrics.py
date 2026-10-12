@@ -148,10 +148,10 @@ def build_prompt(c):
             "- security: 脆弱性（注入・認可・秘密情報の漏えいなど）の修正なら true。\n\n" % c["kind"])
     fix = "## 修正: %s\n```diff\n%s\n```\n\n## 原因の候補\n" % (str(c["message"])[:200], (c.get("diff") or "")[:MAX_FIX_DIFF_CHARS])
     sus_list = c["suspects"][:MAX_SUSPECTS]
-    wrap = ["### PR #%s: %s\n```diff\n%%s\n```" % (s["number"], str(s.get("title", ""))[:200]) for s in sus_list]
-    room = MAX_PROMPT_CHARS - len(head) - len(fix) - sum(len(w) - 2 for w in wrap) - len(wrap)  # 枠と改行の分を正確に引く
+    wrap = [("### PR #%s: %s\n```diff\n" % (s["number"], str(s.get("title", ""))[:200]), "\n```") for s in sus_list]
+    room = MAX_PROMPT_CHARS - len(head) - len(fix) - sum(len(a) + len(b) for a, b in wrap) - len(wrap)  # 枠と改行の分を正確に引く
     per = max(0, room // max(1, len(sus_list)))
-    sus = [w % (s.get("diff") or "")[:per] for w, s in zip(wrap, sus_list)]
+    sus = [a + (s.get("diff") or "")[:per] + b for (a, b), s in zip(wrap, sus_list)]  # 題名の % を書式として読まない
     return (head + fix + "\n".join(sus))[:MAX_PROMPT_CHARS]
 
 
@@ -593,6 +593,9 @@ def run(a):
         r["attempts"] = int(old.get("attempts") or 0) + (1 if r["verdict"] == "unjudged" else 0)
         if r.get("serious"):
             r["notified"] = bool(old.get("notified"))
+        for k in ("month", "part"):  # 判定し直しても、入っている本から動かさない
+            if old.get(k):
+                r[k] = old[k]
         known[r["key"]] = r
     print("候補 %d / 今回判定 %d / 重大 %d / 未判定 %d / 取得失敗 %d" % (
         len(cands), len(new), sum(1 for r in new if r["serious"]),

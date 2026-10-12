@@ -571,6 +571,26 @@ class Round2(unittest.TestCase):
         self.assertTrue(lm.build_prompt(c).endswith("```"))
 
 
+class Round2b(Run):
+    def test_rejudged_record_stays_in_its_part(self):
+        mk = lambda i, v: {"key": "o/r@%07x" % i, "repo": "o/r", "kind": "fix", "sha": "%07x" % i,
+                           "date": "2026-10-01T00:00:00Z", "message": "fix: " + "あ" * 190, "verdict": v,
+                           "serious": False, "rationale": "い" * 500, "suspects": [10]}
+        fake = FakeGitHub()
+        lm.gh = fake
+        lm.save_months("o/ledger", {r["key"]: r for r in [mk(i, "judged") for i in range(150)] + [mk(150, "unjudged")]},
+                       {}, {"2026-10"}, self.now)
+        before = {k: r["part"] for k, r in lm.load_ledger(list(fake.issues.values()))[0].items()}
+        self.go(fake, [cand("o/r@%07x" % 150, "2026-10-01T00:00:00Z")])
+        after = {k: r["part"] for k, r in lm.load_ledger(list(fake.issues.values()))[0].items()}
+        self.assertEqual(before, after)
+
+    def test_percent_in_pr_title_is_not_a_format(self):
+        c = {"kind": "fix", "message": "fix: 100%", "diff": "+x",
+             "suspects": [{"number": 1, "title": "feat: 100% coverage %s %d", "diff": "+y"}]}
+        self.assertIn("100% coverage %s %d", lm.build_prompt(c))
+
+
 class RefetchRevert(Run):
     def test_revert_whose_original_pr_was_unknown_is_looked_up_again(self):
         old = {"key": "o/r@abcdef8", "repo": "o/r", "kind": "revert", "sha": "abcdef8", "date": "2026-08-01T00:00:00Z",
