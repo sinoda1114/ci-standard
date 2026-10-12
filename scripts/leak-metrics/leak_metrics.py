@@ -147,11 +147,16 @@ def build_prompt(c):
     return body[:MAX_PROMPT_CHARS]
 
 
-def judge(c, api, has_key):
+def base_record(c, why=""):
     rec = {k: c.get(k) for k in ("key", "repo", "kind", "sha", "date", "message")}
     rec["suspects"] = [s["number"] for s in c["suspects"]]
     rec.update({"verdict": "unjudged", "serious": False, "severity": None, "security": None,
-                "caused_by_pr": None, "rationale": "", "models": []})
+                "caused_by_pr": None, "rationale": why, "models": []})
+    return rec
+
+
+def judge(c, api, has_key):
+    rec = base_record(c)
     if not c["suspects"]:
         rec["verdict"] = "no-suspect"
         return rec
@@ -266,6 +271,60 @@ def cap(todo):
     return todo[:MAX_PER_RUN]
 
 
+def prioritize(todo, known):
+    """試した回数が少ないもの・古いものから選ぶ（毎回同じ先頭の候補だけが枠を使い続けないように）"""
+    tries = {r["key"]: int(r.get("attempts") or 0) for r in known}
+    return sorted(todo, key=lambda c: (tries.get(c["key"], 0), c.get("date") or "", c["key"]))
+
+
+def month_of(rec, now):
+    """記録を入れる月。日付が未来なら今の月にする（未来の月の台帳を作らない）"""
+    d = str(rec.get("date") or "")[:7]
+    cur = now.strftime("%Y-%m")
+    return d if re.fullmatch(r"\d{4}-\d{2}", d) and d <= cur else cur
+
+
+LEDGER_TITLE_RE = re.compile(r"^\[漏れの記録\] (\d{4}-\d{2})(?: \((\d+)\))?$")
+
+
+def ledger_title(month, part):
+    return "[漏れの記録] %s" % month + (" (%d)" % part if part > 1 else "")
+
+
+def load_ledger(issues):
+    """台帳リポジトリの Issue（number・title・body）から、全部の月の記録と、月ごとの台帳 Issue を読む。
+    同じ月・同じ番の Issue が 2 本あっても（過去の重複）、両方の記録を読む（判定済みを優先）。
+    戻り値: (key → 記録, 月 → {番: Issue 番号}) 。読めない台帳があれば LedgerError"""
+    recs, slots = {}, {}
+    rank = {"judged": 0, "no-suspect": 0, "unjudged": 1}
+    for i in sorted(issues, key=lambda i: i["number"]):
+        m = LEDGER_TITLE_RE.match(i.get("title") or "")
+        if not m:
+            continue
+        month, part = m.group(1), int(m.group(2) or 1)
+        slots.setdefault(month, {}).setdefault(part, i["number"])
+        for r in parse_month(i.get("body") or ""):
+            old = recs.get(r["key"])
+            if old is None or rank.get(r.get("verdict"), 2) < rank.get(old.get("verdict"), 2):
+                recs[r["key"]] = r
+    return recs, slots
+
+
+def leak_mark(key):
+    return "<!-- ai-review-leak:%s -->" % key
+
+
+def marked_keys(issues):
+    """[漏れ] Issue の本文の最終行の目印だけを読む（本文の途中に書かれた目印は、AI の出力などから入りうるので信じない）"""
+    keys = set()
+    for i in issues:
+        last = (i.get("body") or "").rstrip("\n").split("\n")[-1]
+        m = re.fullmatch(r"<!-- ai-review-leak:(\S+) -->", last)
+        if m:
+            keys.add(m.group(1))
+    return keys
+
+
 def serious_issue(r):
     title = ("[漏れ] %s: %s" % (r["repo"], re.sub(r"[\r\n]", " ", r.get("message") or "")))[:200]
     why = re.sub(r"`", "'", str(r.get("rationale") or ""))[:MAX_RATIONALE_CHARS]
@@ -277,11 +336,15 @@ def serious_issue(r):
         "- 判定の理由（AI の出力。そのまま載せる）:", "", "```text", why, "```",
         "- 判定したモデル: %s" % ", ".join(r.get("models") or []), "",
         "push 前の /ai-review で止められたはずかを確かめ、必要なら設計を見直してください。", "",
-        "<!-- ai-review-leak:%s -->" % r["key"]])
+        leak_mark(r["key"])])
     return title, body
 
 
 # ------------------------------------------------------------ 外部との入出力
+
+def utcnow():
+    return dt.datetime.now(dt.timezone.utc)
+
 
 def gh(*args, input_text=None):
     r = subprocess.run(["gh", *args], capture_output=True, text=True, input=input_text)
@@ -309,7 +372,7 @@ def anthropic_api(model, prompt):
 
 
 def collect(owner, exclude):
-    now = dt.datetime.now(dt.timezone.utc)
+    now = utcnow()
     since_fix = (now - dt.timedelta(days=WINDOW_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
     since_pr = now - dt.timedelta(days=WINDOW_DAYS * 2)
     repos = json.loads(gh("repo", "list", owner, "--limit", "200", "--no-archived", "--source",
@@ -333,7 +396,8 @@ def collect(owner, exclude):
                     continue
                 detail = json.loads(gh("api", "repos/%s/commits/%s" % (name, c["sha"])))
                 own = [p["number"] for p in json.loads(gh("api", "repos/%s/commits/%s/pulls" % (name, c["sha"])))]
-                commits.append({"sha": c["sha"], "date": c["commit"]["committer"]["date"], "message": msg,
+                date = min(c["commit"]["committer"]["date"], now.strftime("%Y-%m-%dT%H:%M:%SZ"))  # 未来の日時は今に丸める
+                commits.append({"sha": c["sha"], "date": date, "message": msg,
                                 "files": [f["filename"] for f in detail.get("files", [])], "prs": own,
                                 "diff": "\n".join(f.get("patch", "") for f in detail.get("files", []))})
 
@@ -354,43 +418,128 @@ def collect(owner, exclude):
     return cands, errors
 
 
-def month_issue(ledger, month):
-    title = "[漏れの記録] %s" % month
-    found = json.loads(gh("issue", "list", "-R", ledger, "--state", "all", "--limit", "100",
-                          "--search", "in:title \"%s\"" % title, "--json", "number,title,body"))
-    for i in found:
-        if i["title"] == title:
-            return i["number"], i["body"]
-    return None, ""
+def valid_record(r, owner, exclude):
+    """台帳の記録を、取り直しの前に確かめる（台帳は人が編集できるので、取得先を記録の値に任せない）"""
+    repo = r.get("repo")
+    if not isinstance(repo, str) or not re.fullmatch(r"%s/[A-Za-z0-9._-]+" % re.escape(owner), repo):
+        return False
+    if repo.split("/")[1] in exclude:
+        return False
+    sus = r.get("suspects")
+    if not isinstance(sus, list) or len(sus) > MAX_SUSPECTS or not all(type(n) is int and n > 0 for n in sus):
+        return False
+    if r.get("kind") in ("fix", "revert"):
+        sha = r.get("sha")
+        return isinstance(sha, str) and bool(re.fullmatch(r"[0-9a-f]{7,40}", sha)) and r.get("key") == "%s@%s" % (repo, sha)
+    if r.get("kind") == "issue":
+        return isinstance(r.get("key"), str) and bool(re.fullmatch(r"%s#\d+" % re.escape(repo), r["key"]))
+    return False
+
+
+def refetch(stale, owner, exclude, errors):
+    """窓から外れた未判定の記録を、判定できる形に取り直す（試した回数の少ない順に、1 回の上限まで）"""
+    out = []
+    for r in sorted(stale, key=lambda r: (int(r.get("attempts") or 0), r.get("date") or ""))[:MAX_PER_RUN]:
+        if not valid_record(r, owner, exclude):
+            errors.append("台帳の記録が不正なので取り直さない: %s" % str(r.get("key"))[:100])
+            continue
+        repo = r["repo"]
+        try:
+            if r["kind"] == "issue":
+                i = json.loads(gh("api", "repos/%s/issues/%s" % (repo, r["key"].rsplit("#", 1)[1])))
+                diff = (i.get("body") or "")[:8000]
+                sus = [{"number": n, "title": json.loads(gh("api", "repos/%s/pulls/%d" % (repo, n)))["title"], "diff": ""}
+                       for n in r["suspects"]]
+            else:
+                d = json.loads(gh("api", "repos/%s/commits/%s" % (repo, r["sha"])))
+                diff = "\n".join(f.get("patch", "") for f in d.get("files", []))
+                sus = [{"number": n, "title": json.loads(gh("api", "repos/%s/pulls/%d" % (repo, n)))["title"],
+                        "diff": gh("pr", "diff", str(n), "-R", repo)} for n in r["suspects"]]
+        except Exception as e:  # 取り直せなければ未判定のまま残す
+            errors.append("%s: 取り直しに失敗: %s" % (r["key"], str(e)[:200]))
+            continue
+        out.append({k: r.get(k) for k in ("key", "repo", "kind", "sha", "date", "message")} | {"diff": diff, "suspects": sus})
+    return out
+
+
+def list_issues(ledger, *extra):
+    """台帳リポジトリの Issue の一覧（検索 API は索引が遅れるので使わない）"""
+    return json.loads(gh("issue", "list", "-R", ledger, "--state", "all", "--limit", "1000", *extra,
+                         "--json", "number,title,body"))
+
+
+def save_months(ledger, records, slots, months, now):
+    """変わった月の台帳を書き直す。本文の上限を超える月は複数の Issue に分ける"""
+    for month in sorted(months):
+        recs = [r for r in records.values() if month_of(r, now) == month]
+        for part, text in enumerate(render_month_parts(recs, month), 1):
+            num = slots.get(month, {}).get(part)
+            if num:
+                gh("issue", "edit", str(num), "-R", ledger, "--body-file", "-", input_text=text)
+            else:
+                url = gh("issue", "create", "-R", ledger, "--title", ledger_title(month, part), "--body-file", "-",
+                         input_text=text).strip()
+                slots.setdefault(month, {})[part] = int(url.rsplit("/", 1)[-1])
+
+
+def notify(ledger, records, errors):
+    """重大で、まだ [漏れ] Issue を立てていない記録について起票する。立て終えたものだけ notified にする。
+    失敗したものは notified にしないので、次回に起票し直す（目印で二重の起票を防ぐ）。変わった月を返す"""
+    pending_r = [r for r in records.values() if r.get("serious") and not r.get("notified")]
+    if not pending_r:
+        return []
+    try:
+        gh("label", "create", "type:fix", "-R", ledger, "--force")
+        done = marked_keys(list_issues(ledger, "--label", "type:fix"))
+    except Exception as e:  # 一覧が取れないと二重に起票しうるので、今回は起票しない
+        errors.append("[漏れ] Issue の確認に失敗: %s" % str(e)[:200])
+        return []
+    changed = []
+    for r in pending_r:
+        try:
+            if r["key"] not in done:
+                title, body = serious_issue(r)
+                gh("issue", "create", "-R", ledger, "--title", title, "--label", "type:fix", "--body-file", "-",
+                   input_text=body)
+            r["notified"] = True
+            changed.append(r)
+        except Exception as e:  # 1 件の失敗で残りを止めない
+            errors.append("[漏れ] Issue の起票に失敗（次回に再試行）: %s: %s" % (r["key"], str(e)[:200]))
+    return changed
 
 
 def run(a):
-    month = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m")
+    now = utcnow()
     exclude = set(a.exclude.split(",")) | {a.ledger.split("/")[1]}
+    known, slots = load_ledger(list_issues(a.ledger))  # 読めない台帳があれば止める（上書きで消さない）
     cands, errors = collect(a.owner, exclude)
-    number, body = month_issue(a.ledger, month)
-    known = parse_month(body)
-    todo = cap(pending(cands, known))
+    stale = [r for r in known.values() if r.get("verdict") == "unjudged" and r["key"] not in {c["key"] for c in cands}]
+    cands += refetch(stale, a.owner, exclude, errors)  # 窓から外れた未判定も判定し直す
+    todo = prioritize(pending(cands, list(known.values())), list(known.values()))
     has_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
-    new = [judge(c, anthropic_api, has_key) for c in todo]
-    records = merge(known, new)
+    new = [judge(c, anthropic_api, has_key) for c in todo[:MAX_PER_RUN]]
+    for c in todo[MAX_PER_RUN:]:  # 上限で見送った分も未判定として残す（次回以降、試した回数の少ない順に選ぶ）
+        if c["key"] not in known:
+            new.append(base_record(c, "1 回の上限で見送り"))
+    for r in new:
+        old = known.get(r["key"]) or {}
+        r["attempts"] = int(old.get("attempts") or 0) + (1 if r["verdict"] == "unjudged" else 0)
+        if r.get("serious"):
+            r["notified"] = bool(old.get("notified"))
+        known[r["key"]] = r
     print("候補 %d / 今回判定 %d / 重大 %d / 未判定 %d / 取得失敗 %d" % (
         len(cands), len(new), sum(1 for r in new if r["serious"]),
         sum(1 for r in new if r["verdict"] == "unjudged"), len(errors)))
+    if a.dry_run:
+        for e in errors:
+            print("取得失敗: " + e, file=sys.stderr)
+        return 0
+    save_months(a.ledger, known, slots, {month_of(r, now) for r in new}, now)  # 起票の前に判定を保存する
+    notified = notify(a.ledger, known, errors)
+    if notified:  # 起票できたものだけ notified を保存する（失敗したものは次回に起票し直す）
+        save_months(a.ledger, known, slots, {month_of(r, now) for r in notified}, now)
     for e in errors:
         print("取得失敗: " + e, file=sys.stderr)
-    if a.dry_run:
-        return 0
-    text = render_month(records, month)
-    if number:
-        gh("issue", "edit", str(number), "-R", a.ledger, "--body-file", "-", input_text=text)
-    else:
-        gh("issue", "create", "-R", a.ledger, "--title", "[漏れの記録] %s" % month, "--body-file", "-", input_text=text)
-    for r in new:
-        if r["serious"]:
-            title, ibody = serious_issue(r)
-            gh("issue", "create", "-R", a.ledger, "--title", title, "--label", "type:fix", "--body-file", "-",
-               input_text=ibody)
     return 1 if errors and not cands else 0
 
 

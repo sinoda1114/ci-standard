@@ -3,6 +3,7 @@
 マージ後 14 日以内の fix・revert・Issue を「漏れの候補」として集め、AI で 2 段に判定し、台帳に残す処理のうち、
 判断を含む部分（窓・結び付け・判定の読み取り・2 段目に進む条件・台帳の読み書き）を確かめる。
 """
+import json
 import os
 import sys
 import unittest
@@ -239,6 +240,187 @@ class LedgerSafety(unittest.TestCase):
         title, body = lm.serious_issue(rec)
         self.assertLessEqual(len(title), 200)
         self.assertIn("```text\n'''\n@someone <!-- x -->\n```", body)
+
+
+class FakeGitHub:
+    """台帳リポジトリの Issue と、取り直し用の API だけを持つ偽の gh"""
+    def __init__(self, issues=(), fail_create=0):
+        self.issues = {i["number"]: dict(i, labels=list(i.get("labels", []))) for i in issues}
+        self.fail_create = fail_create
+        self.calls = []
+        self.api = {}
+
+    def __call__(self, *args, input_text=None):
+        self.calls.append(args)
+        if args[:2] == ("issue", "list"):
+            assert "--search" not in args  # 検索 API は使わない
+            label = args[args.index("--label") + 1] if "--label" in args else None
+            return json.dumps([{k: i[k] for k in ("number", "title", "body")} for i in self.issues.values()
+                               if label is None or label in i["labels"]])
+        if args[:2] == ("issue", "create"):
+            if "--label" in args and self.fail_create:
+                self.fail_create -= 1
+                raise RuntimeError("gh issue create: 502")
+            n = max(self.issues, default=0) + 1
+            self.issues[n] = {"number": n, "title": args[args.index("--title") + 1], "body": input_text,
+                              "labels": [args[args.index("--label") + 1]] if "--label" in args else []}
+            return "https://github.com/o/ledger/issues/%d\n" % n
+        if args[:2] == ("issue", "edit"):
+            self.issues[int(args[2])]["body"] = input_text
+            return ""
+        if args[:2] == ("label", "create"):
+            return ""
+        if args[0] in ("api", "pr"):
+            key = " ".join(args)
+            if key not in self.api:
+                raise RuntimeError("gh %s: HTTP 404" % key)
+            return self.api[key]
+        raise AssertionError(args)
+
+    def ledgers(self):
+        return {i["title"]: lm.parse_month(i["body"]) for i in self.issues.values() if i["title"].startswith("[漏れの記録]")}
+
+    def leak_issues(self):
+        return [i for i in self.issues.values() if "type:fix" in i["labels"]]
+
+
+SERIOUS = '{"is_leak":"yes","caused_by_pr":10,"severity":"high","security":false,"rationale":"r"}'
+MINOR = '{"is_leak":"no","caused_by_pr":null,"severity":"other","security":false,"rationale":"r"}'
+
+
+def cand(key, date, suspects=(10,)):
+    repo, sha = key.split("@")
+    return {"key": key, "repo": repo, "kind": "fix", "sha": sha, "date": date, "message": "fix: x", "diff": "+x",
+            "suspects": [{"number": n, "title": "t", "diff": "+y"} for n in suspects]}
+
+
+class Run(unittest.TestCase):
+    def setUp(self):
+        self.saved = (lm.gh, lm.collect, lm.anthropic_api, lm.utcnow, os.environ.get("ANTHROPIC_API_KEY"))
+        os.environ["ANTHROPIC_API_KEY"] = "k"
+        self.now = lm.dt.datetime(2026, 10, 1, 3, 0, tzinfo=lm.dt.timezone.utc)
+        lm.utcnow = lambda: self.now
+        self.replies = []
+        self.judged = []
+
+        def api(model, prompt):
+            self.judged.append(model)
+            return self.replies.pop(0) if self.replies else MINOR
+        lm.anthropic_api = api
+
+    def tearDown(self):
+        lm.gh, lm.collect, lm.anthropic_api, lm.utcnow, key = self.saved
+        if key is None:
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+        else:
+            os.environ["ANTHROPIC_API_KEY"] = key
+
+    def go(self, fake, cands, errors=()):
+        lm.gh = fake
+        lm.collect = lambda owner, exclude: ([dict(c) for c in cands], list(errors))
+        a = lm.argparse.Namespace(owner="o", ledger="o/ledger", exclude="", dry_run=False)
+        return lm.run(a)
+
+    def test_month_boundary_does_not_rejudge_or_duplicate(self):
+        k = "o/r@abcdef1"
+        sep = {"key": k, "repo": "o/r", "kind": "fix", "sha": "abcdef1", "date": "2026-09-29T00:00:00Z",
+               "verdict": "judged", "serious": True, "notified": True, "severity": "high", "suspects": [10]}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month([sep], "2026-09")}])
+        self.go(fake, [cand(k, "2026-09-29T00:00:00Z")])
+        self.assertEqual(self.judged, [])
+        self.assertEqual(fake.leak_issues(), [])
+        self.assertEqual(fake.ledgers()["[漏れの記録] 2026-09"], [sep])
+        self.assertNotIn("[漏れの記録] 2026-10", fake.ledgers())
+
+    def test_failed_leak_issue_is_retried_next_run_without_duplicates(self):
+        k = "o/r@abcdef2"
+        fake = FakeGitHub(fail_create=1)
+        self.replies = [SERIOUS, SERIOUS]
+        self.go(fake, [cand(k, "2026-09-30T00:00:00Z")])
+        self.assertEqual(fake.leak_issues(), [])
+        self.assertFalse(fake.ledgers()["[漏れの記録] 2026-09"][0]["notified"])
+        self.go(fake, [cand(k, "2026-09-30T00:00:00Z")])
+        self.go(fake, [cand(k, "2026-09-30T00:00:00Z")])
+        self.assertEqual(len(fake.leak_issues()), 1)
+        self.assertTrue(fake.ledgers()["[漏れの記録] 2026-09"][0]["notified"])
+        self.assertEqual(len(self.judged), 2)  # 判定は 1 回（2 段）だけ
+
+    def test_created_but_unsaved_leak_issue_is_not_created_twice(self):
+        k = "o/r@abcdef3"
+        rec = {"key": k, "repo": "o/r", "kind": "fix", "sha": "abcdef3", "date": "2026-10-01T00:00:00Z",
+               "verdict": "judged", "serious": True, "notified": False, "severity": "high", "suspects": [10]}
+        title, body = lm.serious_issue(rec)
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-10", "body": lm.render_month([rec], "2026-10")},
+                           {"number": 2, "title": title, "body": body, "labels": ["type:fix"]}])
+        self.go(fake, [])
+        self.assertEqual(len(fake.leak_issues()), 1)
+        self.assertTrue(fake.ledgers()["[漏れの記録] 2026-10"][0]["notified"])
+
+    def test_mark_in_middle_of_body_does_not_suppress(self):
+        k = "o/r@abcdef4"
+        rec = {"key": k, "repo": "o/r", "kind": "fix", "sha": "abcdef4", "date": "2026-10-01T00:00:00Z",
+               "verdict": "judged", "serious": True, "notified": False, "severity": "high", "suspects": [10]}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-10", "body": lm.render_month([rec], "2026-10")},
+                           {"number": 2, "title": "[漏れ] other", "labels": ["type:fix"],
+                            "body": "理由: %s\n\n<!-- ai-review-leak:o/r@other -->" % lm.leak_mark(k)}])
+        self.go(fake, [])
+        self.assertEqual(len(fake.leak_issues()), 2)
+
+    def test_unjudged_outside_window_is_refetched_and_judged(self):
+        old = {"key": "o/r@abcdef5", "repo": "o/r", "kind": "fix", "sha": "abcdef5", "date": "2026-08-01T00:00:00Z",
+               "message": "fix: x", "verdict": "unjudged", "serious": False, "suspects": [10], "attempts": 1}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
+        fake.api = {"api repos/o/r/commits/abcdef5": json.dumps({"files": [{"patch": "+x"}]}),
+                    "api repos/o/r/pulls/10": json.dumps({"title": "feat: y"}), "pr diff 10 -R o/r": "+y"}
+        self.go(fake, [])
+        self.assertEqual(len(self.judged), 1)
+        self.assertEqual(fake.ledgers()["[漏れの記録] 2026-08"][0]["verdict"], "judged")
+
+    def test_tampered_record_is_not_refetched(self):
+        bad = {"key": "evil/secret#5", "repo": "evil/secret", "kind": "issue", "sha": "", "date": "2026-08-01T00:00:00Z",
+               "verdict": "unjudged", "serious": False, "suspects": [1]}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([bad], "2026-08")}])
+        self.go(fake, [])
+        self.assertFalse([c for c in fake.calls if c[0] in ("api", "pr")])
+
+    def test_over_cap_candidates_are_recorded_and_get_their_turn(self):
+        cands = [cand("o/r@%07x" % i, "2026-09-%02dT00:00:00Z" % (1 + i % 28)) for i in range(lm.MAX_PER_RUN + 5)]
+        fake = FakeGitHub()
+        self.replies = ["not json"] * lm.MAX_PER_RUN  # 1 回目は全部読めない
+        self.go(fake, cands)
+        recs = {r["key"]: r for rs in fake.ledgers().values() for r in rs}
+        self.assertEqual(len(recs), lm.MAX_PER_RUN + 5)
+        tried = {k for k, r in recs.items() if r.get("attempts")}
+        self.judged.clear()
+        self.go(fake, cands)
+        recs = {r["key"]: r for rs in fake.ledgers().values() for r in rs}
+        untried = [c["key"] for c in cands if c["key"] not in tried]
+        self.assertTrue(all(recs[k]["verdict"] == "judged" for k in untried))
+
+    def test_big_month_is_split_and_read_back(self):
+        recs = {"o/r@%07x" % i: {"key": "o/r@%07x" % i, "repo": "o/r", "kind": "fix", "sha": "%07x" % i,
+                                  "date": "2026-10-01T00:00:00Z", "message": "fix: " + "あ" * 190, "verdict": "judged",
+                                  "serious": False, "rationale": "い" * 500, "suspects": [10]} for i in range(200)}
+        fake = FakeGitHub()
+        lm.gh = fake
+        lm.save_months("o/ledger", recs, {}, {"2026-10"}, self.now)
+        bodies = [i["body"] for i in fake.issues.values()]
+        self.assertGreater(len(bodies), 1)
+        self.assertTrue(all(len(b) <= 65536 for b in bodies))
+        got, slots = lm.load_ledger(list(fake.issues.values()))
+        self.assertEqual(got, recs)
+        lm.save_months("o/ledger", recs, slots, {"2026-10"}, self.now)  # 2 回目は同じ Issue を書き直す
+        self.assertEqual(len(fake.issues), len(bodies))
+
+    def test_future_dated_record_goes_to_current_month(self):
+        self.assertEqual(lm.month_of({"date": "2099-01-01T00:00:00Z"}, self.now), "2026-10")
+        self.assertEqual(lm.month_of({"date": "2026-09-30T00:00:00Z"}, self.now), "2026-09")
+
+    def test_broken_ledger_stops_before_writing(self):
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-10", "body": "x\n" + lm.STATE_BEGIN + "\n[\n" + lm.STATE_END}])
+        with self.assertRaises(lm.LedgerError):
+            self.go(fake, [cand("o/r@abcdef6", "2026-10-01T00:00:00Z")])
+        self.assertFalse([c for c in fake.calls if c[:2] in (("issue", "edit"), ("issue", "create"))])
 
 
 if __name__ == "__main__":
