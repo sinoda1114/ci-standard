@@ -252,11 +252,11 @@ class FakeGitHub:
 
     def __call__(self, *args, input_text=None):
         self.calls.append(args)
-        if args[:2] == ("issue", "list"):
-            assert "--search" not in args  # 検索 API は使わない
-            label = args[args.index("--label") + 1] if "--label" in args else None
-            return json.dumps([{k: i[k] for k in ("number", "title", "body")} for i in self.issues.values()
-                               if label is None or label in i["labels"]])
+        if args[:3] == ("api", "--paginate", "--slurp") and args[3].startswith("repos/o/ledger/issues?"):
+            label = args[3].split("labels=")[1] if "labels=" in args[3] else None
+            items = [{k: i[k] for k in ("number", "title", "body")} for i in self.issues.values()
+                     if label is None or label in i["labels"]]
+            return json.dumps([items[n:n + 100] for n in range(0, len(items), 100)] or [[]])
         if args[:2] == ("issue", "create"):
             if "--label" in args and self.fail_create:
                 self.fail_create -= 1
@@ -381,7 +381,7 @@ class Run(unittest.TestCase):
                "verdict": "unjudged", "serious": False, "suspects": [1]}
         fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([bad], "2026-08")}])
         self.go(fake, [])
-        self.assertFalse([c for c in fake.calls if c[0] in ("api", "pr")])
+        self.assertFalse([c for c in fake.calls if c[0] == "pr" or (c[0] == "api" and c[1] != "--paginate")])
 
     def test_over_cap_candidates_are_recorded_and_get_their_turn(self):
         cands = [cand("o/r@%07x" % i, "2026-09-%02dT00:00:00Z" % (1 + i % 28)) for i in range(lm.MAX_PER_RUN + 5)]
@@ -396,6 +396,38 @@ class Run(unittest.TestCase):
         recs = {r["key"]: r for rs in fake.ledgers().values() for r in rs}
         untried = [c["key"] for c in cands if c["key"] not in tried]
         self.assertTrue(all(recs[k]["verdict"] == "judged" for k in untried))
+
+    def test_failed_refetch_counts_as_a_try(self):
+        olds = [{"key": "o/r@%07x" % i, "repo": "o/r", "kind": "fix", "sha": "%07x" % i, "date": "2026-08-01T00:00:00Z",
+                 "message": "fix: x", "verdict": "unjudged", "serious": False, "suspects": [10]} for i in range(lm.MAX_PER_RUN + 3)]
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month(olds, "2026-08")}])
+        self.go(fake, [])  # 取り直しはすべて失敗する（偽の API に応答が無い）
+        tried = {r["key"] for r in fake.ledgers()["[漏れの記録] 2026-08"] if r.get("attempts")}
+        self.assertEqual(len(tried), lm.MAX_PER_RUN)
+        fake.calls.clear()
+        self.go(fake, [])
+        asked = {c[1].split("/commits/")[1] for c in fake.calls if c[0] == "api" and "/commits/" in c[1]}
+        self.assertTrue({k.split("@")[1] for k in {r["key"] for r in olds} - tried} <= asked)
+
+    def test_many_serious_records_stay_within_body_limit(self):
+        recs = {"o/r@%07x" % i: {"key": "o/r@%07x" % i, "repo": "o/r", "kind": "fix", "sha": "%07x" % i,
+                                  "date": "2026-10-01T00:00:00Z", "message": "fix: " + "あ" * 190, "verdict": "judged",
+                                  "serious": True, "notified": True, "severity": "high", "rationale": "い" * 500,
+                                  "suspects": [10]} for i in range(300)}
+        fake = FakeGitHub()
+        lm.gh = fake
+        lm.save_months("o/ledger", recs, {}, {"2026-10"}, self.now)
+        self.assertTrue(all(len(i["body"]) <= 65536 for i in fake.issues.values()))
+        self.assertEqual(lm.load_ledger(list(fake.issues.values()))[0], recs)
+
+    def test_ledger_listing_is_not_truncated(self):
+        k = "o/r@abcdef7"
+        sep = {"key": k, "repo": "o/r", "kind": "fix", "sha": "abcdef7", "date": "2026-09-29T00:00:00Z",
+               "verdict": "judged", "serious": False, "suspects": [10]}
+        noise = [{"number": n, "title": "other %d" % n, "body": ""} for n in range(1, 1200)]
+        fake = FakeGitHub(noise + [{"number": 1200, "title": "[漏れの記録] 2026-09", "body": lm.render_month([sep], "2026-09")}])
+        self.go(fake, [cand(k, "2026-09-29T00:00:00Z")])
+        self.assertEqual(self.judged, [])
 
     def test_big_month_is_split_and_read_back(self):
         recs = {"o/r@%07x" % i: {"key": "o/r@%07x" % i, "repo": "o/r", "kind": "fix", "sha": "%07x" % i,

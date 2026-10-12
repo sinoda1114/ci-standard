@@ -34,6 +34,7 @@ STATE_BEGIN = "<!-- leak-metrics-state"
 STATE_END = "leak-metrics-state -->"
 MAX_BODY_CHARS = 60000      # 台帳 Issue 1 本の本文の上限（GitHub の上限 65,536 文字より小さく取る）
 MAX_RATIONALE_CHARS = 500
+MAX_SERIOUS_LISTED = 50     # 台帳の 1 本目に一覧で載せる重大の件数（残りは件数だけ。全件は状態に入っている）
 
 
 # ------------------------------------------------------------ 純粋な判断（テスト対象）
@@ -217,7 +218,9 @@ def render_month(records, month, part=1, parts=1, summary_of=None):
         if serious:
             lines += ["## 重大・セキュリティ", ""]
             lines += ["- %s %s（%s）" % (md_text(r["key"]), md_text(r.get("message")), md_text(r.get("severity")))
-                      for r in serious]
+                      for r in serious[:MAX_SERIOUS_LISTED]]
+            if len(serious) > MAX_SERIOUS_LISTED:
+                lines.append("- ほか %d 件" % (len(serious) - MAX_SERIOUS_LISTED))
             lines.append("")
     lines += ["自動で更新します（ci-standard の leak-metrics）。手で編集しないでください。", "",
               STATE_BEGIN, state_json(records), STATE_END]
@@ -226,9 +229,11 @@ def render_month(records, month, part=1, parts=1, summary_of=None):
 
 def render_month_parts(records, month):
     """本文が上限を超えないように、記録を複数の台帳 Issue に分ける（1 本目・2 本目…の本文の配列）"""
+    head = len(render_month([], month, 1, 2, summary_of=records)) - len(render_month([], month, 2, 2))  # 1 本目の集計の長さ
     chunks, cur = [], []
     for r in records:
-        if cur and len(render_month(cur + [r], month, 2, 2)) > MAX_BODY_CHARS - 4000:  # 1 本目の集計の分を空けておく
+        room = MAX_BODY_CHARS - (head if not chunks else 0)
+        if cur and len(render_month(cur + [r], month, 2, 2)) > room:
             chunks.append(cur)
             cur = []
         cur.append(r)
@@ -437,11 +442,13 @@ def valid_record(r, owner, exclude):
 
 
 def refetch(stale, owner, exclude, errors):
-    """窓から外れた未判定の記録を、判定できる形に取り直す（試した回数の少ない順に、1 回の上限まで）"""
-    out = []
+    """窓から外れた未判定の記録を、判定できる形に取り直す（試した回数の少ない順に、1 回の上限まで）。
+    戻り値: (取り直せた候補, 取り直せなかった記録の key)。取り直せなかったものも「試した」に数える"""
+    out, failed = [], []
     for r in sorted(stale, key=lambda r: (int(r.get("attempts") or 0), r.get("date") or ""))[:MAX_PER_RUN]:
         if not valid_record(r, owner, exclude):
             errors.append("台帳の記録が不正なので取り直さない: %s" % str(r.get("key"))[:100])
+            failed.append(r["key"])
             continue
         repo = r["repo"]
         try:
@@ -457,15 +464,17 @@ def refetch(stale, owner, exclude, errors):
                         "diff": gh("pr", "diff", str(n), "-R", repo)} for n in r["suspects"]]
         except Exception as e:  # 取り直せなければ未判定のまま残す
             errors.append("%s: 取り直しに失敗: %s" % (r["key"], str(e)[:200]))
+            failed.append(r["key"])
             continue
         out.append({k: r.get(k) for k in ("key", "repo", "kind", "sha", "date", "message")} | {"diff": diff, "suspects": sus})
-    return out
+    return out, failed
 
 
-def list_issues(ledger, *extra):
-    """台帳リポジトリの Issue の一覧（検索 API は索引が遅れるので使わない）"""
-    return json.loads(gh("issue", "list", "-R", ledger, "--state", "all", "--limit", "1000", *extra,
-                         "--json", "number,title,body"))
+def list_issues(ledger, label=None):
+    """台帳リポジトリの Issue の全件（検索 API は索引が遅れるので使わない。件数で打ち切らない）"""
+    path = "repos/%s/issues?state=all&per_page=100" % ledger + ("&labels=%s" % label if label else "")
+    return [{"number": i["number"], "title": i.get("title") or "", "body": i.get("body") or ""}
+            for i in _paged(path) if "pull_request" not in i]
 
 
 def save_months(ledger, records, slots, months, now):
@@ -490,7 +499,7 @@ def notify(ledger, records, errors):
         return []
     try:
         gh("label", "create", "type:fix", "-R", ledger, "--force")
-        done = marked_keys(list_issues(ledger, "--label", "type:fix"))
+        done = marked_keys(list_issues(ledger, "type:fix"))
     except Exception as e:  # 一覧が取れないと二重に起票しうるので、今回は起票しない
         errors.append("[漏れ] Issue の確認に失敗: %s" % str(e)[:200])
         return []
@@ -514,7 +523,10 @@ def run(a):
     known, slots = load_ledger(list_issues(a.ledger))  # 読めない台帳があれば止める（上書きで消さない）
     cands, errors = collect(a.owner, exclude)
     stale = [r for r in known.values() if r.get("verdict") == "unjudged" and r["key"] not in {c["key"] for c in cands}]
-    cands += refetch(stale, a.owner, exclude, errors)  # 窓から外れた未判定も判定し直す
+    again, failed = refetch(stale, a.owner, exclude, errors)  # 窓から外れた未判定も判定し直す
+    cands += again
+    for k in failed:  # 取り直せなかったものも試した回数に数え、次回は他の記録に順番を回す
+        known[k] = dict(known[k], attempts=int(known[k].get("attempts") or 0) + 1)
     todo = prioritize(pending(cands, list(known.values())), list(known.values()))
     has_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
     new = [judge(c, anthropic_api, has_key) for c in todo[:MAX_PER_RUN]]
@@ -534,7 +546,8 @@ def run(a):
         for e in errors:
             print("取得失敗: " + e, file=sys.stderr)
         return 0
-    save_months(a.ledger, known, slots, {month_of(r, now) for r in new}, now)  # 起票の前に判定を保存する
+    changed = {month_of(r, now) for r in new} | {month_of(known[k], now) for k in failed}
+    save_months(a.ledger, known, slots, changed, now)  # 起票の前に判定を保存する
     notified = notify(a.ledger, known, errors)
     if notified:  # 起票できたものだけ notified を保存する（失敗したものは次回に起票し直す）
         save_months(a.ledger, known, slots, {month_of(r, now) for r in notified}, now)
