@@ -2,7 +2,7 @@
 #
 # 毎日、全リポジトリの既定ブランチに入った fix・revert（直近 14 日）と type:fix の Issue を集め、
 # 直前にマージされた PR が入れた不具合かを AI で 2 段に判定し、台帳リポジトリ（Private）の Issue に残す。
-#   1 段目 claude-haiku-5-5（全件）→ 重大・セキュリティ・不明だけ 2 段目 claude-opus-5-5
+#   1 段目 claude-sonnet-5-5（全件）→ 重大・セキュリティ・不明だけ 2 段目 claude-opus-5-5
 #   重大・セキュリティの漏れは、台帳に [漏れ] の Issue（type:fix）を別に立てる。
 # 本体: scripts/leak-metrics/leak_metrics.py（テスト: test_leak_metrics.py）
 #

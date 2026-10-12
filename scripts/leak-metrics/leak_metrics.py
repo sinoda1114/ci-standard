@@ -29,9 +29,9 @@ import urllib.parse
 import urllib.request
 
 WINDOW_DAYS = 14
-# Claude API のモデル ID（2026-10-12 に公式のモデル一覧 platform.claude.com/docs/en/about-claude/models/overview で確認。
-# claude-haiku-5-5 は Haiku 5.5 の ID として存在する）
-STAGE1_MODEL = "claude-haiku-5-5"
+# Claude API のモデル ID。1 段目は Sonnet 5.5（2026-10-12 にユーザーが選択。Haiku 5.5 より月の料金は上がるが、
+# レビュアーの知識で確かめられる ID にした）
+STAGE1_MODEL = "claude-sonnet-5-5"
 STAGE2_MODEL = "claude-opus-5-5"
 MAX_PER_RUN = 60            # 1 回の実行で判定する上限（料金の上限を決める）
 MAX_PROMPT_CHARS = 60000    # 1 件の判定に渡す文字数の上限
@@ -81,7 +81,10 @@ def fix_candidates(repo, commits, prs, revert_pr=None):
         kind = "revert" if target or c["message"].lower().startswith("revert") else "fix"
         suspects = []
         if target and revert_pr:
-            n = revert_pr(target)
+            try:
+                n = revert_pr(target)
+            except Exception:  # 取れなければファイルの重なりで探す（リポジトリ全体を落とさない）
+                n = None
             suspects = [p for p in prs if p["number"] == n]
         if not suspects:
             files = set(c.get("files") or [])
@@ -113,7 +116,7 @@ def issue_candidates(repo, issues, prs):
         out.append({"key": "%s#%d" % (repo, i["number"]), "repo": repo, "kind": "issue", "sha": "",
                     "number": i["number"], "date": i["created_at"], "message": i["title"][:200],
                     "diff": (i.get("body") or "")[:8000],
-                    "suspects": [{"number": p["number"], "title": p["title"], "diff": ""} for p in sus]})
+                    "suspects": [{"number": p["number"], "title": p["title"]} for p in sus]})
     return out
 
 
@@ -149,7 +152,7 @@ def needs_stage2(j):
 
 
 def _untrusted(label, text, limit):
-    text = (text or "")[:limit].replace("</untrusted", "<\\/untrusted")
+    text = re.sub(r"(?i)</untrusted", "<\\/untrusted", (text or "")[:limit])
     return '<untrusted kind="%s">\n%s\n</untrusted>' % (label, text)
 
 
@@ -254,6 +257,22 @@ def cap(todo):
     return todo[:MAX_PER_RUN]
 
 
+def split_cap(todo):
+    """上限までを今回判定し、超えた分は未判定として記録する（次回に再判定。窓から外れても取り直す）"""
+    later = []
+    for c in todo[MAX_PER_RUN:]:
+        rec = {k: c.get(k) for k in ("key", "repo", "kind", "sha", "number", "date", "message")}
+        rec.update({"suspects": [s["number"] for s in c.get("suspects") or []], "verdict": "unjudged",
+                    "serious": False, "rationale": "1 回の上限を超えたため次回に判定"})
+        later.append(rec)
+    return todo[:MAX_PER_RUN], later
+
+
+def extract_marks(text):
+    """通知済みの印（行頭の <!-- ai-review-leak:<key> -->）だけを拾う"""
+    return set(re.findall(r"(?m)^<!-- " + re.escape(NOTIFY_MARK) + r"(\S+) -->$", text or ""))
+
+
 def to_notify(records):
     return [r for r in records if r.get("serious") and not r.get("notified")]
 
@@ -273,8 +292,8 @@ def summary_body(month, records, errors):
 
 
 def serious_issue(r):
-    title = ("[漏れ] %s: %s" % (r["repo"], r.get("message", "")))[:200]
-    rationale = (r.get("rationale") or "").replace("```", "'''")
+    title = ("[漏れ] %s: %s" % (r["repo"], (r.get("message") or "").replace("<", "＜")))[:200]
+    rationale = (r.get("rationale") or "").replace("```", "'''").replace("<", "＜").replace(">", "＞")
     body = "\n".join([
         "マージ後 %d 日以内に、重大またはセキュリティの修正が入りました。" % WINDOW_DAYS, "",
         "- 修正: %s %s（%s）" % (r["repo"], r.get("sha") or r["key"], r.get("kind")),
@@ -391,7 +410,7 @@ def fill_suspect_diffs(c, cache):
 
 def ledger_issues(ledger):
     """台帳の Issue（月の記録と [漏れ]）を、本文つきで返す"""
-    return json.loads(gh("issue", "list", "-R", ledger, "--state", "all", "--limit", "500",
+    return json.loads(gh("issue", "list", "-R", ledger, "--state", "all", "--limit", "5000",
                          "--json", "number,title,body"))
 
 
@@ -415,22 +434,25 @@ def run(a):
         print("台帳が Private ではないため、書き込まずに終了します", file=sys.stderr)
         return 2
     now = dt.datetime.now(dt.timezone.utc)
-    months = [(now.replace(day=1) - dt.timedelta(days=1)).strftime("%Y-%m"), now.strftime("%Y-%m")]
+    this_month = now.strftime("%Y-%m")
     issues = ledger_issues(a.ledger)
     known = []
-    for m in months:
-        n = month_number(issues, m)
-        if n:
-            known = merge(known, read_state(a.ledger, n))
+    # すべての月の記録を読む（窓の外・前々月以前の未判定も再判定するため）
+    for i in sorted(issues, key=lambda i: i["number"]):
+        if re.fullmatch(r"\[漏れの記録\] \d{4}-\d{2}", i["title"]):
+            known = merge(known, read_state(a.ledger, i["number"]))
     exclude = {x for x in a.exclude.split(",") if x} | {a.ledger.split("/")[1]}
     cands, errors = collect(a.owner, exclude)
     todo, refetch = pending(cands, known)
     for r in refetch:
+        # 台帳の状態はコメントで書き換えられうるので、自分のリポジトリの記録だけを取り直す
+        if not str(r.get("repo", "")).startswith(a.owner + "/") or r["repo"].split("/")[1] in exclude:
+            continue
         try:
             todo.append(refetch_candidate(r))
         except Exception as e:
             errors.append("%s の取り直し: %s" % (r["key"], str(e)[:200]))
-    todo = cap(todo)
+    todo, later = split_cap(todo)
     has_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
     cache = {}
     new = []
@@ -438,30 +460,45 @@ def run(a):
         if has_key:
             fill_suspect_diffs(c, cache)
         new.append(compact(judge(c, anthropic_api, has_key)))
+    new += [compact(r) for r in later]
     records = merge(known, new)
     print("候補 %d / 今回判定 %d / 未判定 %d / 取得失敗 %d（詳細は台帳）" % (
-        len(cands), len(new), sum(1 for r in new if r["verdict"] == "unjudged"), len(errors)))
+        len(cands), len(todo), sum(1 for r in new if r["verdict"] == "unjudged"), len(errors)))
     if errors:
         print("::warning::%d 件のリポジトリまたは記録で取得に失敗しました（詳細は台帳）" % len(errors))
     if a.dry_run:
         return 0
-    # 通知: 起票が成功してから通知済みにする。同じ印の Issue があれば起票しない
-    marked = {m for i in issues for m in re.findall(re.escape(NOTIFY_MARK) + r"(\S+) -->", i.get("body") or "")}
+    # 通知: 起票が成功してから通知済みにする。同じ印の Issue があれば起票しない。
+    # 起票の失敗では止めない（その記録は未通知のまま残し、次回にやり直す）
+    marked = set()
+    for i in issues:
+        marked |= extract_marks(i.get("body") or "")
+    pending_notify = to_notify(records)
+    if pending_notify:
+        try:
+            gh("label", "create", "type:fix", "-R", a.ledger, "--color", "d73a4a", "--description", "バグ修正", "--force")
+        except RuntimeError as e:
+            errors.append("台帳のラベル: %s" % str(e)[:200])
     notified = []
-    for r in to_notify(records):
-        if r["key"] not in marked:
-            title, body = serious_issue(r)
-            gh("issue", "create", "-R", a.ledger, "--title", title, "--label", "type:fix", "--body-file", "-",
-               input_text=body)
-        notified.append(dict(r, notified=True))
+    for r in pending_notify:
+        try:
+            if r["key"] not in marked:
+                title, body = serious_issue(r)
+                gh("issue", "create", "-R", a.ledger, "--title", title, "--label", "type:fix", "--body-file", "-",
+                   input_text=body)
+            notified.append(dict(r, notified=True))
+        except RuntimeError as e:
+            errors.append("%s の通知: %s" % (r["key"], str(e)[:200]))
     changed = merge(new, notified)
     by_month = {}
     for r in changed:
         by_month.setdefault(month_of(r), []).append(r)
+    if errors:
+        by_month.setdefault(this_month, [])  # 変化が無い回も、取得失敗の詳細は台帳に残す
     for m, recs in sorted(by_month.items()):
         n = month_number(issues, m)
         month_all = [r for r in merge(records, notified) if month_of(r) == m]
-        body = summary_body(m, month_all, errors)
+        body = summary_body(m, month_all, errors if m == this_month else [])
         if n:
             gh("issue", "edit", str(n), "-R", a.ledger, "--body-file", "-", input_text=body)
         else:
@@ -469,7 +506,8 @@ def run(a):
                      input_text=body).strip()
             n = int(url.rstrip("/").rsplit("/", 1)[1])
             issues.append({"number": n, "title": "[漏れの記録] %s" % m, "body": body})
-        gh("issue", "comment", str(n), "-R", a.ledger, "--body-file", "-", input_text=render_state(recs))
+        if recs:
+            gh("issue", "comment", str(n), "-R", a.ledger, "--body-file", "-", input_text=render_state(recs))
     return 1 if errors and not cands else 0
 
 
