@@ -299,8 +299,11 @@ class Run(unittest.TestCase):
         self.replies = []
         self.judged = []
 
+        self.prompts = []
+
         def api(model, prompt):
             self.judged.append(model)
+            self.prompts.append(prompt)
             return self.replies.pop(0) if self.replies else MINOR
         lm.anthropic_api = api
 
@@ -367,7 +370,8 @@ class Run(unittest.TestCase):
                "message": "fix: x", "verdict": "unjudged", "serious": False, "suspects": [10], "attempts": 1}
         fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
         fake.api = {"api repos/o/r/commits/abcdef5": json.dumps({"files": [{"patch": "+x"}]}),
-                    "api repos/o/r/pulls/10": json.dumps({"title": "feat: y"}), "pr diff 10 -R o/r": "+y"}
+                    "api repos/o/r/pulls/10": json.dumps({"title": "feat: y"}), "pr diff 10 -R o/r": "+y",
+                    "api --paginate --slurp repos/o/r/pulls/10/files?per_page=100": json.dumps([[{"filename": "a"}]])}
         self.go(fake, [])
         self.assertEqual(len(self.judged), 1)
         self.assertEqual(fake.ledgers()["[漏れの記録] 2026-08"][0]["verdict"], "judged")
@@ -572,7 +576,7 @@ class Round2(unittest.TestCase):
 
 
 class Round2b(Run):
-    def test_rejudged_record_stays_in_its_part(self):
+    def test_rejudged_record_is_not_lost_and_moves_only_backward(self):
         mk = lambda i, v: {"key": "o/r@%07x" % i, "repo": "o/r", "kind": "fix", "sha": "%07x" % i,
                            "date": "2026-10-01T00:00:00Z", "message": "fix: " + "あ" * 190, "verdict": v,
                            "serious": False, "rationale": "い" * 500, "suspects": [10]}
@@ -583,7 +587,29 @@ class Round2b(Run):
         before = {k: r["part"] for k, r in lm.load_ledger(list(fake.issues.values()))[0].items()}
         self.go(fake, [cand("o/r@%07x" % 150, "2026-10-01T00:00:00Z")])
         after = {k: r["part"] for k, r in lm.load_ledger(list(fake.issues.values()))[0].items()}
-        self.assertEqual(before, after)
+        self.assertEqual(set(before), set(after))  # 消えない
+        self.assertTrue(all(after[k] >= before[k] for k in before))  # 移るなら、後ろの本へだけ
+
+    def test_grown_record_moves_back_without_loss_and_bodies_fit(self):
+        mk = lambda i: {"key": "o/r@%07x" % i, "repo": "o/r", "kind": "fix", "sha": "%07x" % i,
+                        "date": "2026-10-01T00:00:00Z", "message": "fix: " + "あ" * 190, "verdict": "unjudged",
+                        "serious": False, "rationale": "", "suspects": [10]}
+        fake = FakeGitHub()
+        lm.gh = fake
+        lm.save_months("o/ledger", {r["key"]: r for r in map(mk, range(200))}, {}, {"2026-10"}, self.now)
+        got, slots = lm.load_ledger(list(fake.issues.values()))
+        for r in got.values():  # 全件が判定されて大きくなる
+            r.update(verdict="judged", rationale="い" * 500)
+        lm.save_months("o/ledger", got, slots, {"2026-10"}, self.now)
+        self.assertTrue(all(len(i["body"]) <= 65536 for i in fake.issues.values()))
+        self.assertEqual(set(lm.load_ledger(list(fake.issues.values()))[0]), set(got))
+
+    def test_crlf_and_bad_types(self):
+        body = lm.render_month([{"key": "a", "verdict": "judged"}], "2026-10").replace("\n", "\r\n")
+        self.assertEqual(lm.parse_month(body), [{"key": "a", "verdict": "judged"}])
+        for bad in [{"key": "a", "attempts": "x"}, {"key": "a", "suspects": ["1"]}, {"key": "a", "part": True}]:
+            with self.assertRaises(lm.LedgerError):
+                lm.parse_month(lm.render_month([bad], "2026-10"))
 
     def test_percent_in_pr_title_is_not_a_format(self):
         c = {"kind": "fix", "message": "fix: 100%", "diff": "+x",
@@ -599,7 +625,8 @@ class RefetchRevert(Run):
         fake.api = {"api repos/o/r/commits/abcdef8": json.dumps({"commit": {"message": 'Revert "x"\n\nThis reverts commit 1234567.'},
                                                                  "files": [{"patch": "-x"}]}),
                     "api repos/o/r/commits/1234567/pulls": json.dumps([{"number": 10}]),
-                    "api repos/o/r/pulls/10": json.dumps({"title": "feat: x"})}
+                    "api repos/o/r/pulls/10": json.dumps({"title": "feat: x"}),
+                    "api --paginate --slurp repos/o/r/pulls/10/files?per_page=100": json.dumps([[{"filename": "src/big.js"}]])}
 
         def pr_diff(*args, input_text=None):
             if args[:2] == ("pr", "diff"):
@@ -611,6 +638,7 @@ class RefetchRevert(Run):
         rec = fake.ledgers()["[漏れの記録] 2026-08"][0]
         self.assertEqual(rec["verdict"], "judged")
         self.assertEqual(rec["suspects"], [10])
+        self.assertTrue(any("src/big.js" in p for p in self.prompts))
 
 
 if __name__ == "__main__":

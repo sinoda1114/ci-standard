@@ -237,24 +237,34 @@ def render_month(records, month, part=1, parts=1, summary_of=None):
     return "\n".join(lines)
 
 
+def fits(recs, month, part, summary_of):
+    room = MAX_BODY_CHARS - (SUMMARY_RESERVE if part == 1 else 0)  # 1 本目の集計は SUMMARY_RESERVE で見込む
+    return len(render_month(recs, month, 2, 2)) <= room
+
+
 def place(records, month):
-    """月の記録を本（1 本目・2 本目…）に分ける。既に本に入っている記録は動かさない（書き込みの途中で失敗しても、
-    他の本の記録が消えないように）。新しい記録は最後の本に入れ、上限を超えるなら次の本を作る。戻り値: 番 → 記録の配列"""
+    """月の記録を本（1 本目・2 本目…）に分ける。戻り値: 番 → 記録の配列。
+    既に本に入っている記録は、その本が上限に収まる限り動かさない。新しい記録は最後の本に入れ、あふれたら次の本を作る。
+    判定し直しで記録が大きくなって本があふれたときは、あふれた分を後ろの本へ移す。移す先はいつも番の大きい本なので、
+    番の大きい本から順に書けば（save_months）、途中で書き込みが失敗しても、記録はどこかの本に必ず残る"""
     parts = {}
     for r in records:
         if r.get("part"):
             parts.setdefault(int(r["part"]), []).append(r)
-    last = max(parts, default=1)
-    parts.setdefault(last, [])
-    for r in records:
-        if r.get("part"):
-            continue
-        room = MAX_BODY_CHARS - (SUMMARY_RESERVE if last == 1 else 0)
-        if parts[last] and len(render_month(parts[last] + [r], month, 2, 2)) > room:
+    parts.setdefault(max(parts, default=1), [])
+    moving = [r for r in records if not r.get("part")]
+    for n in sorted(parts):  # あふれた本からは、後ろの記録を移す
+        while len(parts[n]) > 1 and not fits(parts[n], month, n, records):
+            moving.insert(0, parts[n].pop())
+    last = max(parts)
+    for r in moving:
+        if parts[last] and not fits(parts[last] + [r], month, last, records):
             last += 1
             parts[last] = []
         parts[last].append(r)
-        r["month"], r["part"] = month, last
+    for n, rs in parts.items():
+        for r in rs:
+            r["month"], r["part"] = month, n
     return parts
 
 
@@ -265,16 +275,30 @@ def parse_month(body):
     LedgerError（空として読むと、次の書き込みで記録を消すので止める）"""
     if not (body or "").strip():
         return []
-    lines = body.rstrip("\n").split("\n")
+    lines = body.replace("\r\n", "\n").rstrip("\n").split("\n")  # ブラウザで保存すると CRLF になる
     if len(lines) < 3 or lines[-3] != STATE_BEGIN or lines[-1] != STATE_END:
         raise LedgerError("状態が本文の最後の 3 行にない")
     try:
         d = json.loads(lines[-2])
     except ValueError as e:
         raise LedgerError("状態の JSON を読めない: %s" % e)
-    if not isinstance(d, list) or not all(isinstance(r, dict) and isinstance(r.get("key"), str) for r in d):
+    if not isinstance(d, list) or not all(valid_shape(r) for r in d):
         raise LedgerError("状態の形が違う")
     return d
+
+
+def valid_shape(r):
+    """台帳の 1 件の記録の型（人の編集で壊れていたら、別の例外で落ちる前に LedgerError にする）"""
+    if not isinstance(r, dict) or not isinstance(r.get("key"), str):
+        return False
+    types = {"repo": str, "kind": str, "sha": str, "date": str, "message": str, "verdict": str, "rationale": str,
+             "month": str, "severity": str, "is_leak": str, "serious": bool, "notified": bool, "security": bool,
+             "attempts": int, "part": int, "caused_by_pr": int, "suspects": list, "models": list}
+    for k, t in types.items():
+        v = r.get(k)
+        if v is not None and not (isinstance(v, t) and not (t is int and isinstance(v, bool))):
+            return False
+    return all(type(n) is int for n in r.get("suspects") or [])
 
 
 def pending(candidates, known):
@@ -503,13 +527,15 @@ def refetch(stale, owner, exclude, errors):
                 diff = "\n".join(f.get("patch", "") for f in d.get("files", []))
                 nums = list(r["suspects"])
                 target = revert_target((d.get("commit") or {}).get("message", ""))
-                if not nums and target:  # revert 元の取得に失敗していた記録は、元の PR を探し直す
+                if target:  # revert は元の PR を探し直す（前回は取得に失敗して、ファイルの重なりで代えていたかもしれない）
                     ps = json.loads(gh("api", "repos/%s/commits/%s/pulls" % (repo, target)))
-                    nums = [ps[0]["number"]] if ps and type(ps[0].get("number")) is int else []
+                    if ps and type(ps[0].get("number")) is int:
+                        nums = [ps[0]["number"]]
                 sus = []
                 for n in nums:
                     p = json.loads(gh("api", "repos/%s/pulls/%d" % (repo, n)))
-                    s_ = {"number": n, "title": p.get("title", ""), "files": []}
+                    s_ = {"number": n, "title": p.get("title", ""),
+                          "files": [f["filename"] for f in _paged("repos/%s/pulls/%d/files?per_page=100" % (repo, n))]}
                     s_["diff"], why = suspect_diff(repo, s_)
                     if why:
                         raise RuntimeError(why)
@@ -535,7 +561,7 @@ def save_months(ledger, records, slots, months, now):
         recs = [r for r in records.values() if month_of(r, now) == month]
         parts = place(recs, month)
         n = max(parts)
-        for part in sorted(parts):
+        for part in sorted(parts, reverse=True):  # 移す先（番の大きい本）を先に書く（place の説明）
             text = render_month(parts[part], month, part, n, summary_of=recs)
             num = slots.get(month, {}).get(part)
             if num:
