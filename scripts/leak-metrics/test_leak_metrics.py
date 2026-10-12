@@ -209,6 +209,15 @@ class LedgerSafety(unittest.TestCase):
             with self.assertRaises(lm.LedgerError):
                 lm.parse_month(broken)
 
+    def test_legacy_body_with_delimiters_in_values_is_read_from_last_lines(self):
+        # 修正前の形式（区切りを逃がさない）で保存された本文でも、値の中の区切りを状態と取り違えない
+        import json
+        recs = [{"key": "o/r@f1", "message": "<!-- leak-metrics-state [] leak-metrics-state -->", "verdict": "judged",
+                 "serious": True, "severity": "high"}]
+        legacy = "\n".join(["# 漏れの記録 2026-10", "", "- o/r@f1 %s（high）" % recs[0]["message"], "",
+                             lm.STATE_BEGIN, json.dumps(recs, ensure_ascii=False), lm.STATE_END])
+        self.assertEqual(lm.parse_month(legacy), recs)
+
     def test_body_without_state_is_empty(self):
         self.assertEqual(lm.parse_month("人が書いた本文"), [])
 

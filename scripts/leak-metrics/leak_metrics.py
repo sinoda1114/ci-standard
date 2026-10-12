@@ -233,15 +233,16 @@ def render_month_parts(records, month):
 
 
 def parse_month(body):
-    """台帳 Issue の本文から状態を読む。状態の区切りが無ければ空。区切りがあるのに読めなければ LedgerError"""
+    """台帳 Issue の本文から状態を読む。状態は必ず本文の最後の 3 行（開始の区切り・1 行の JSON・終わりの区切り）にある。
+    JSON は改行を含まないので、値の中に区切りの文字列があっても（旧形式の台帳でも）、そこを状態と取り違えない。
+    状態の区切りが無ければ空。区切りがあるのに最後の 3 行の形でない、または読めなければ LedgerError"""
     if not body or STATE_BEGIN not in body:
         return []
-    raw = body.rsplit(STATE_BEGIN, 1)[1]
-    if STATE_END not in raw:
-        raise LedgerError("状態の終わりの区切りが無い")
-    raw = raw.split(STATE_END, 1)[0]
+    lines = body.rstrip("\n").split("\n")
+    if len(lines) < 3 or lines[-3] != STATE_BEGIN or lines[-1] != STATE_END:
+        raise LedgerError("状態が本文の最後の 3 行にない")
     try:
-        d = json.loads(raw)
+        d = json.loads(lines[-2])
     except ValueError as e:
         raise LedgerError("状態の JSON を読めない: %s" % e)
     if not isinstance(d, list) or not all(isinstance(r, dict) and isinstance(r.get("key"), str) for r in d):
