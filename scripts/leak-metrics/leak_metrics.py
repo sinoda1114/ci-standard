@@ -35,7 +35,8 @@ STATE_BEGIN = "<!-- leak-metrics-state"
 STATE_END = "leak-metrics-state -->"
 MAX_BODY_CHARS = 60000      # 台帳 Issue 1 本の本文の上限（GitHub の上限 65,536 文字より小さく取る）
 MAX_RATIONALE_CHARS = 500
-MAX_SERIOUS_LISTED = 50     # 台帳の 1 本目に一覧で載せる重大の件数（残りは件数だけ。全件は状態に入っている）
+MAX_SERIOUS_LISTED = 20     # 台帳の 1 本目に一覧で載せる重大の件数（残りは件数だけ。全件は状態に入っている）
+SUMMARY_RESERVE = 12000     # 1 本目に集計と重大の一覧を載せるために空けておく文字数（一覧は 1 行 約 450 文字 × 20 件まで）
 
 
 # ------------------------------------------------------------ 純粋な判断（テスト対象）
@@ -147,10 +148,10 @@ def build_prompt(c):
             "- security: 脆弱性（注入・認可・秘密情報の漏えいなど）の修正なら true。\n\n" % c["kind"])
     fix = "## 修正: %s\n```diff\n%s\n```\n\n## 原因の候補\n" % (str(c["message"])[:200], (c.get("diff") or "")[:MAX_FIX_DIFF_CHARS])
     sus_list = c["suspects"][:MAX_SUSPECTS]
-    room = MAX_PROMPT_CHARS - len(head) - len(fix) - 200 * max(1, len(sus_list))
+    wrap = ["### PR #%s: %s\n```diff\n%%s\n```" % (s["number"], str(s.get("title", ""))[:200]) for s in sus_list]
+    room = MAX_PROMPT_CHARS - len(head) - len(fix) - sum(len(w) - 2 for w in wrap) - len(wrap)  # 枠と改行の分を正確に引く
     per = max(0, room // max(1, len(sus_list)))
-    sus = ["### PR #%s: %s\n```diff\n%s\n```" % (s["number"], str(s.get("title", ""))[:200], (s.get("diff") or "")[:per])
-           for s in sus_list]
+    sus = [w % (s.get("diff") or "")[:per] for w, s in zip(wrap, sus_list)]
     return (head + fix + "\n".join(sus))[:MAX_PROMPT_CHARS]
 
 
@@ -236,26 +237,33 @@ def render_month(records, month, part=1, parts=1, summary_of=None):
     return "\n".join(lines)
 
 
-def render_month_parts(records, month):
-    """本文が上限を超えないように、記録を複数の台帳 Issue に分ける（1 本目・2 本目…の本文の配列）"""
-    head = len(render_month([], month, 1, 2, summary_of=records)) - len(render_month([], month, 2, 2))  # 1 本目の集計の長さ
-    chunks, cur = [], []
+def place(records, month):
+    """月の記録を本（1 本目・2 本目…）に分ける。既に本に入っている記録は動かさない（書き込みの途中で失敗しても、
+    他の本の記録が消えないように）。新しい記録は最後の本に入れ、上限を超えるなら次の本を作る。戻り値: 番 → 記録の配列"""
+    parts = {}
     for r in records:
-        room = MAX_BODY_CHARS - (head if not chunks else 0)
-        if cur and len(render_month(cur + [r], month, 2, 2)) > room:
-            chunks.append(cur)
-            cur = []
-        cur.append(r)
-    chunks.append(cur)
-    n = len(chunks)
-    return [render_month(c, month, i + 1, n, summary_of=records) for i, c in enumerate(chunks)]
+        if r.get("part"):
+            parts.setdefault(int(r["part"]), []).append(r)
+    last = max(parts, default=1)
+    parts.setdefault(last, [])
+    for r in records:
+        if r.get("part"):
+            continue
+        room = MAX_BODY_CHARS - (SUMMARY_RESERVE if last == 1 else 0)
+        if parts[last] and len(render_month(parts[last] + [r], month, 2, 2)) > room:
+            last += 1
+            parts[last] = []
+        parts[last].append(r)
+        r["month"], r["part"] = month, last
+    return parts
 
 
 def parse_month(body):
     """台帳 Issue の本文から状態を読む。状態は必ず本文の最後の 3 行（開始の区切り・1 行の JSON・終わりの区切り）にある。
     JSON は改行を含まないので、値の中に区切りの文字列があっても（旧形式の台帳でも）、そこを状態と取り違えない。
-    状態の区切りが無ければ空。区切りがあるのに最後の 3 行の形でない、または読めなければ LedgerError"""
-    if not body or STATE_BEGIN not in body:
+    本文が空なら空。台帳 Issue なのに最後の 3 行が状態の形でない（区切りが壊れた・消えた）、または読めなければ
+    LedgerError（空として読むと、次の書き込みで記録を消すので止める）"""
+    if not (body or "").strip():
         return []
     lines = body.rstrip("\n").split("\n")
     if len(lines) < 3 or lines[-3] != STATE_BEGIN or lines[-1] != STATE_END:
@@ -292,7 +300,9 @@ def prioritize(todo, known):
 
 
 def month_of(rec, now):
-    """記録を入れる月。日付が未来なら今の月にする（未来の月の台帳を作らない）"""
+    """記録を入れる月。一度入った月（month）からは動かさない。初めての記録は日付の月で、未来なら今の月"""
+    if re.fullmatch(r"\d{4}-\d{2}", str(rec.get("month") or "")):
+        return rec["month"]
     d = str(rec.get("date") or "")[:7]
     cur = now.strftime("%Y-%m")
     return d if re.fullmatch(r"\d{4}-\d{2}", d) and d <= cur else cur
@@ -318,6 +328,7 @@ def load_ledger(issues):
         month, part = m.group(1), int(m.group(2) or 1)
         slots.setdefault(month, {}).setdefault(part, i["number"])
         for r in parse_month(i.get("body") or ""):
+            r = dict(r, month=month, part=part)  # 入っている本を覚え、書き直しでも動かさない
             old = recs.get(r["key"])
             if old is None or rank.get(r.get("verdict"), 2) < rank.get(old.get("verdict"), 2):
                 recs[r["key"]] = r
@@ -391,7 +402,7 @@ def suspect_diff(repo, s):
     try:
         return gh("pr", "diff", str(s["number"]), "-R", repo)[:MAX_PROMPT_CHARS], ""
     except Exception as e:
-        if "406" in str(e) or "too large" in str(e).lower():
+        if re.search(r"\bHTTP 406\b", str(e)) or "too large" in str(e).lower():
             return "（差分が大きすぎて取得できない。変更ファイル: %s）" % ", ".join((s.get("files") or [])[:50]), ""
         return "", "PR #%s の差分を取得できない: %s" % (s["number"], str(e)[:150])
 
@@ -455,7 +466,8 @@ def collect(owner, exclude):
 def valid_record(r, owner, exclude):
     """台帳の記録を、取り直しの前に確かめる（台帳は人が編集できるので、取得先を記録の値に任せない）"""
     repo = r.get("repo")
-    if not isinstance(repo, str) or not re.fullmatch(r"%s/[A-Za-z0-9._-]+" % re.escape(owner), repo):
+    if not isinstance(repo, str) or not re.fullmatch(r"%s/[A-Za-z0-9._-]+" % re.escape(owner), repo) \
+            or repo.split("/")[1] in (".", ".."):
         return False
     if repo.split("/")[1] in exclude:
         return False
@@ -489,8 +501,19 @@ def refetch(stale, owner, exclude, errors):
             else:
                 d = json.loads(gh("api", "repos/%s/commits/%s" % (repo, r["sha"])))
                 diff = "\n".join(f.get("patch", "") for f in d.get("files", []))
-                sus = [{"number": n, "title": json.loads(gh("api", "repos/%s/pulls/%d" % (repo, n)))["title"],
-                        "diff": gh("pr", "diff", str(n), "-R", repo)} for n in r["suspects"]]
+                nums = list(r["suspects"])
+                target = revert_target((d.get("commit") or {}).get("message", ""))
+                if not nums and target:  # revert 元の取得に失敗していた記録は、元の PR を探し直す
+                    ps = json.loads(gh("api", "repos/%s/commits/%s/pulls" % (repo, target)))
+                    nums = [ps[0]["number"]] if ps and type(ps[0].get("number")) is int else []
+                sus = []
+                for n in nums:
+                    p = json.loads(gh("api", "repos/%s/pulls/%d" % (repo, n)))
+                    s_ = {"number": n, "title": p.get("title", ""), "files": []}
+                    s_["diff"], why = suspect_diff(repo, s_)
+                    if why:
+                        raise RuntimeError(why)
+                    sus.append(s_)
         except Exception as e:  # 取り直せなければ未判定のまま残す
             errors.append("%s: 取り直しに失敗: %s" % (r["key"], str(e)[:200]))
             failed.append(r["key"])
@@ -507,10 +530,13 @@ def list_issues(ledger, label=None):
 
 
 def save_months(ledger, records, slots, months, now):
-    """変わった月の台帳を書き直す。本文の上限を超える月は複数の Issue に分ける"""
+    """変わった月の台帳を書き直す。記録は入っている本から動かさず、新しい記録は最後の本（あふれたら次の本）に入れる"""
     for month in sorted(months):
         recs = [r for r in records.values() if month_of(r, now) == month]
-        for part, text in enumerate(render_month_parts(recs, month), 1):
+        parts = place(recs, month)
+        n = max(parts)
+        for part in sorted(parts):
+            text = render_month(parts[part], month, part, n, summary_of=recs)
             num = slots.get(month, {}).get(part)
             if num:
                 gh("issue", "edit", str(num), "-R", ledger, "--body-file", "-", input_text=text)
@@ -528,7 +554,7 @@ def notify(ledger, records, errors):
         return []
     try:
         gh("label", "create", "type:fix", "-R", ledger, "--force")
-        done = marked_keys(list_issues(ledger, "type:fix"))
+        done = marked_keys(list_issues(ledger))  # ラベルを外された [漏れ] Issue も見る
     except Exception as e:  # 一覧が取れないと二重に起票しうるので、今回は起票しない
         errors.append("[漏れ] Issue の確認に失敗: %s" % str(e)[:200])
         return []

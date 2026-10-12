@@ -159,7 +159,6 @@ class Ledger(unittest.TestCase):
 
     def test_parse_empty_or_foreign_body(self):
         self.assertEqual(lm.parse_month(""), [])
-        self.assertEqual(lm.parse_month("人が書いた本文"), [])
 
     def test_unjudged_is_retried_judged_is_skipped(self):
         known = [{"key": "a", "verdict": "judged"}, {"key": "b", "verdict": "unjudged"}, {"key": "c", "verdict": "no-suspect"}]
@@ -218,9 +217,6 @@ class LedgerSafety(unittest.TestCase):
         legacy = "\n".join(["# 漏れの記録 2026-10", "", "- o/r@f1 %s（high）" % recs[0]["message"], "",
                              lm.STATE_BEGIN, json.dumps(recs, ensure_ascii=False), lm.STATE_END])
         self.assertEqual(lm.parse_month(legacy), recs)
-
-    def test_body_without_state_is_empty(self):
-        self.assertEqual(lm.parse_month("人が書いた本文"), [])
 
     def test_caused_by_pr_is_normalized_and_limited_to_suspects(self):
         for v, want in [(10, 10), ("10", 10), ("#10", 10), ("PR 10", None), (True, None), (-1, None), (None, None)]:
@@ -509,6 +505,92 @@ class Robustness(unittest.TestCase):
             self.assertTrue(why)
         finally:
             lm.gh = saved
+
+
+class Round2(unittest.TestCase):
+    def test_damaged_or_missing_state_stops(self):
+        good = lm.render_month([{"key": "a", "verdict": "judged"}], "2026-10")
+        for broken in [good.replace(lm.STATE_BEGIN, "<!-- leak-metrics-stat"), "人が書いた本文"]:
+            with self.assertRaises(lm.LedgerError):
+                lm.parse_month(broken)
+        self.assertEqual(lm.parse_month(""), [])
+
+    def test_records_stay_in_their_part_when_a_later_write_fails(self):
+        now = lm.dt.datetime(2026, 10, 1, tzinfo=lm.dt.timezone.utc)
+        mk = lambda i: {"key": "o/r@%07x" % i, "repo": "o/r", "kind": "fix", "sha": "%07x" % i,
+                        "date": "2026-10-01T00:00:00Z", "message": "fix: " + "あ" * 190, "verdict": "unjudged",
+                        "serious": False, "rationale": "い" * 500, "suspects": [10]}
+        saved = lm.gh
+        try:
+            fake = FakeGitHub()
+            lm.gh = fake
+            recs = {r["key"]: r for r in map(mk, range(150))}
+            lm.save_months("o/ledger", recs, {}, {"2026-10"}, now)
+            got, slots = lm.load_ledger(list(fake.issues.values()))
+            before = {k: r["part"] for k, r in got.items()}
+            for k in list(got)[:40]:  # 記録が少し大きくなっても、本は動かない
+                got[k] = dict(got[k], attempts=3, rationale="う" * 500)
+            got.update({r["key"]: r for r in map(mk, range(150, 170))})
+
+            class Fail2(FakeGitHub):
+                pass
+            edits = []
+
+            def flaky(*args, input_text=None):
+                if args[:2] == ("issue", "edit") and edits:
+                    raise RuntimeError("502")
+                if args[:2] == ("issue", "edit"):
+                    edits.append(args)
+                return fake(*args, input_text=input_text)
+            lm.gh = flaky
+            with self.assertRaises(RuntimeError):
+                lm.save_months("o/ledger", got, slots, {"2026-10"}, now)
+            after, _ = lm.load_ledger(list(fake.issues.values()))
+            self.assertTrue(set(before) <= set(after))  # 書き込みが途中で失敗しても、元の記録は 1 件も消えない
+            self.assertTrue(all(len(i["body"]) <= 65536 for i in fake.issues.values()))
+        finally:
+            lm.gh = saved
+
+    def test_406_is_matched_exactly(self):
+        saved = lm.gh
+        try:
+            def e(*a, **k):
+                raise RuntimeError("gh pr diff 1406 -R o/r: HTTP 502")
+            lm.gh = e
+            self.assertTrue(lm.suspect_diff("o/r", {"number": 1406})[1])
+        finally:
+            lm.gh = saved
+
+    def test_dot_repo_names_are_rejected(self):
+        r = {"key": "o/..@abcdef1", "repo": "o/..", "kind": "fix", "sha": "abcdef1", "suspects": []}
+        self.assertFalse(lm.valid_record(r, "o", set()))
+
+    def test_last_suspect_keeps_closing_fence(self):
+        c = {"kind": "fix", "message": "fix: x", "diff": "+x\n" * 100000,
+             "suspects": [{"number": n, "title": "t" * 300, "diff": "+y\n" * 50000} for n in range(1, 6)]}
+        self.assertTrue(lm.build_prompt(c).endswith("```"))
+
+
+class RefetchRevert(Run):
+    def test_revert_whose_original_pr_was_unknown_is_looked_up_again(self):
+        old = {"key": "o/r@abcdef8", "repo": "o/r", "kind": "revert", "sha": "abcdef8", "date": "2026-08-01T00:00:00Z",
+               "message": "Revert", "verdict": "unjudged", "serious": False, "suspects": []}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
+        fake.api = {"api repos/o/r/commits/abcdef8": json.dumps({"commit": {"message": 'Revert "x"\n\nThis reverts commit 1234567.'},
+                                                                 "files": [{"patch": "-x"}]}),
+                    "api repos/o/r/commits/1234567/pulls": json.dumps([{"number": 10}]),
+                    "api repos/o/r/pulls/10": json.dumps({"title": "feat: x"})}
+
+        def pr_diff(*args, input_text=None):
+            if args[:2] == ("pr", "diff"):
+                raise RuntimeError("gh pr diff 10: HTTP 406 diff too large")
+            return fake(*args, input_text=input_text)
+        lm.gh = pr_diff
+        lm.collect = lambda owner, exclude: ([], [])
+        lm.run(lm.argparse.Namespace(owner="o", ledger="o/ledger", exclude="", dry_run=False))
+        rec = fake.ledgers()["[漏れの記録] 2026-08"][0]
+        self.assertEqual(rec["verdict"], "judged")
+        self.assertEqual(rec["suspects"], [10])
 
 
 if __name__ == "__main__":
