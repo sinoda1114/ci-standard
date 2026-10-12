@@ -607,7 +607,7 @@ class Round2b(Run):
     def test_crlf_and_bad_types(self):
         body = lm.render_month([{"key": "a", "verdict": "judged"}], "2026-10").replace("\n", "\r\n")
         self.assertEqual(lm.parse_month(body), [{"key": "a", "verdict": "judged"}])
-        for bad in [{"key": "a", "attempts": "x"}, {"key": "a", "suspects": ["1"]}, {"key": "a", "part": True}]:
+        for bad in [{"key": "a", "attempts": "x"}, {"key": "a", "suspects": ["1"]}, {"key": "a", "part": True}, {"key": "a", "models": [123]}]:
             with self.assertRaises(lm.LedgerError):
                 lm.parse_month(lm.render_month([bad], "2026-10"))
 

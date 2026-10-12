@@ -298,7 +298,7 @@ def valid_shape(r):
         v = r.get(k)
         if v is not None and not (isinstance(v, t) and not (t is int and isinstance(v, bool))):
             return False
-    return all(type(n) is int for n in r.get("suspects") or [])
+    return all(type(n) is int for n in r.get("suspects") or []) and all(isinstance(m, str) for m in r.get("models") or [])
 
 
 def pending(candidates, known):
