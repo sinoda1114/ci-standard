@@ -455,5 +455,47 @@ class Run(unittest.TestCase):
         self.assertFalse([c for c in fake.calls if c[:2] in (("issue", "edit"), ("issue", "create"))])
 
 
+class Robustness(unittest.TestCase):
+    def test_huge_fix_diff_keeps_suspects_section(self):
+        c = {"kind": "fix", "message": "fix: x", "diff": "+x\n" * 100000,
+             "suspects": [{"number": n, "title": "t%d" % n, "diff": "+y\n" * 50000} for n in range(1, 6)]}
+        p = lm.build_prompt(c)
+        self.assertLessEqual(len(p), lm.MAX_PROMPT_CHARS)
+        for n in range(1, 6):
+            self.assertIn("### PR #%d" % n, p)
+
+    def test_revert_lookup_failure_marks_only_that_candidate(self):
+        prs = [pr(10, "2026-10-01T00:00:00Z", ["src/a.js"])]
+        cs = [commit("r1", "2026-10-05T00:00:00Z", 'Revert "x"\n\nThis reverts commit abcdef1.', ["src/a.js"]),
+              commit("f1", "2026-10-05T00:00:00Z", "fix: a", ["src/a.js"])]
+
+        def boom(sha):
+            raise RuntimeError("HTTP 502")
+        out = lm.fix_candidates("o/r", cs, prs, revert_pr=boom)
+        self.assertEqual(len(out), 2)
+        self.assertIn("incomplete", out[0])
+        self.assertNotIn("incomplete", out[1])
+        rec = lm.judge(out[0], api=lambda m, p: self.fail("材料が欠けたまま判定した"), has_key=True)
+        self.assertEqual(rec["verdict"], "unjudged")
+
+    def test_suspect_diff_too_large_is_judged_with_file_list(self):
+        saved = lm.gh
+        try:
+            def too_large(*a, **k):
+                raise RuntimeError("gh pr diff: HTTP 406: diff too large")
+            lm.gh = too_large
+            d, why = lm.suspect_diff("o/r", {"number": 10, "files": ["src/a.js"]})
+            self.assertEqual(why, "")
+            self.assertIn("src/a.js", d)
+
+            def flaky(*a, **k):
+                raise RuntimeError("gh pr diff: HTTP 502")
+            lm.gh = flaky
+            d, why = lm.suspect_diff("o/r", {"number": 10})
+            self.assertTrue(why)
+        finally:
+            lm.gh = saved
+
+
 if __name__ == "__main__":
     unittest.main()

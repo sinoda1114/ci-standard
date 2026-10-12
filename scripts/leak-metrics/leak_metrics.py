@@ -24,7 +24,8 @@ WINDOW_DAYS = 14
 STAGE1_MODEL = "claude-haiku-5-5"
 STAGE2_MODEL = "claude-opus-5-5"
 MAX_PER_RUN = 60            # 1 回の実行で判定する上限（料金の上限を決める）
-MAX_PROMPT_CHARS = 60000    # 1 件の判定に渡す差分の上限（文字）
+MAX_PROMPT_CHARS = 60000    # 1 件の判定に渡すプロンプトの上限（文字）
+MAX_FIX_DIFF_CHARS = 25000  # そのうち修正の差分に使う分。残りを原因の候補で分ける（候補の節が切り詰めで消えないように）
 MAX_SUSPECTS = 5
 SEVERITIES = ("critical", "high", "other")
 LEAK_VALUES = ("yes", "no", "unclear")
@@ -61,9 +62,12 @@ def fix_candidates(repo, commits, prs, revert_pr=None):
         when = _ts(c["date"])
         target = revert_target(c["message"])
         kind = "revert" if target or c["message"].lower().startswith("revert") else "fix"
-        suspects = []
+        suspects, incomplete = [], ""
         if target and revert_pr:
-            n = revert_pr(target)
+            try:
+                n = revert_pr(target)
+            except Exception as e:  # 取れなければ、この候補だけを次回に回す（リポジトリ全体を落とさない）
+                n, incomplete = None, "revert 元の PR を取得できない: %s" % str(e)[:150]
             suspects = [p for p in prs if p["number"] == n]
         if not suspects:
             files = set(c.get("files") or [])
@@ -77,7 +81,7 @@ def fix_candidates(repo, commits, prs, revert_pr=None):
         suspects = sorted(suspects, key=lambda p: p["merged_at"], reverse=True)[:MAX_SUSPECTS]
         out.append({"key": "%s@%s" % (repo, c["sha"]), "repo": repo, "kind": kind, "sha": c["sha"],
                     "date": c["date"], "message": c["message"].splitlines()[0][:200],
-                    "diff": c.get("diff", ""), "suspects": suspects})
+                    "diff": c.get("diff", ""), "suspects": suspects, **({"incomplete": incomplete} if incomplete else {})})
     return out
 
 
@@ -132,20 +136,22 @@ def needs_stage2(j):
 
 
 def build_prompt(c):
-    sus = []
-    for s in c["suspects"]:
-        sus.append("### PR #%s: %s\n```diff\n%s\n```" % (s["number"], s.get("title", ""), (s.get("diff") or "")[:15000]))
-    body = ("次の修正（%s）が、直前にマージされた PR が入れた不具合を直したものかを判定してください。\n"
+    """修正の差分と原因の候補に別々の予算を持たせる（末尾で一括に切ると、候補の節が丸ごと消えることがある）"""
+    head = ("次の修正（%s）が、直前にマージされた PR が入れた不具合を直したものかを判定してください。\n"
             "判定は次の JSON 1 つだけで返してください。\n"
             '{"is_leak": "yes|no|unclear", "caused_by_pr": <PR 番号か null>, '
             '"severity": "critical|high|other", "security": true|false, "rationale": "<1 文>"}\n'
             "- is_leak: 候補の PR が入れた不具合を直したものなら yes。仕様変更・機能追加・候補と無関係なら no。\n"
             "- severity: critical はデータ消失・認証の迂回・任意コード実行などの大事故、high は利用者に明確な害がある不具合、"
             "other はそれ以外（見た目・軽微な性能など）。\n"
-            "- security: 脆弱性（注入・認可・秘密情報の漏えいなど）の修正なら true。\n\n"
-            "## 修正: %s\n```diff\n%s\n```\n\n## 原因の候補\n%s\n"
-            % (c["kind"], c["message"], c.get("diff", ""), "\n".join(sus)))
-    return body[:MAX_PROMPT_CHARS]
+            "- security: 脆弱性（注入・認可・秘密情報の漏えいなど）の修正なら true。\n\n" % c["kind"])
+    fix = "## 修正: %s\n```diff\n%s\n```\n\n## 原因の候補\n" % (str(c["message"])[:200], (c.get("diff") or "")[:MAX_FIX_DIFF_CHARS])
+    sus_list = c["suspects"][:MAX_SUSPECTS]
+    room = MAX_PROMPT_CHARS - len(head) - len(fix) - 200 * max(1, len(sus_list))
+    per = max(0, room // max(1, len(sus_list)))
+    sus = ["### PR #%s: %s\n```diff\n%s\n```" % (s["number"], str(s.get("title", ""))[:200], (s.get("diff") or "")[:per])
+           for s in sus_list]
+    return (head + fix + "\n".join(sus))[:MAX_PROMPT_CHARS]
 
 
 def base_record(c, why=""):
@@ -163,6 +169,9 @@ def judge(c, api, has_key):
         return rec
     if not has_key:
         rec["rationale"] = "API キーが無い"
+        return rec
+    if c.get("incomplete"):  # 材料が欠けたまま判定しない（次回に取り直す）
+        rec["rationale"] = "材料が欠けている: %s" % c["incomplete"]
         return rec
     prompt = build_prompt(c)
     final = None
@@ -376,6 +385,17 @@ def anthropic_api(model, prompt):
     return "".join(b.get("text", "") for b in d.get("content", []) if b.get("type") == "text")
 
 
+def suspect_diff(repo, s):
+    """原因の候補の PR の差分。(差分, 欠けた理由)。大きすぎて取れない（HTTP 406）ものは、取り直しても同じなので
+    変更ファイルの一覧で代えて判定を続ける。一時的な失敗は欠けた理由を返す（その候補は次回に判定し直す）"""
+    try:
+        return gh("pr", "diff", str(s["number"]), "-R", repo)[:MAX_PROMPT_CHARS], ""
+    except Exception as e:
+        if "406" in str(e) or "too large" in str(e).lower():
+            return "（差分が大きすぎて取得できない。変更ファイル: %s）" % ", ".join((s.get("files") or [])[:50]), ""
+        return "", "PR #%s の差分を取得できない: %s" % (s["number"], str(e)[:150])
+
+
 def collect(owner, exclude):
     now = utcnow()
     since_fix = (now - dt.timedelta(days=WINDOW_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -390,7 +410,7 @@ def collect(owner, exclude):
         branch = r["defaultBranchRef"]["name"]
         try:
             prs = []
-            for p in _paged("repos/%s/pulls?state=closed&base=%s&sort=updated&direction=desc&per_page=50" % (name, branch))[:100]:
+            for p in _paged("repos/%s/pulls?state=closed&base=%s&sort=updated&direction=desc&per_page=50" % (name, branch)):
                 if p.get("merged_at") and _ts(p["merged_at"]) >= since_pr:
                     files = [f["filename"] for f in _paged("repos/%s/pulls/%d/files?per_page=100" % (name, p["number"]))]
                     prs.append({"number": p["number"], "merged_at": p["merged_at"], "title": p["title"], "files": files})
@@ -399,8 +419,12 @@ def collect(owner, exclude):
                 msg = c["commit"]["message"]
                 if not is_fix_message(msg):
                     continue
-                detail = json.loads(gh("api", "repos/%s/commits/%s" % (name, c["sha"])))
-                own = [p["number"] for p in json.loads(gh("api", "repos/%s/commits/%s/pulls" % (name, c["sha"])))]
+                try:  # 1 件の取得の失敗で、リポジトリの残りの候補を落とさない
+                    detail = json.loads(gh("api", "repos/%s/commits/%s" % (name, c["sha"])))
+                    own = [p["number"] for p in json.loads(gh("api", "repos/%s/commits/%s/pulls" % (name, c["sha"])))]
+                except Exception as e:
+                    errors.append("%s@%s: %s" % (name, c["sha"][:7], str(e)[:200]))
+                    continue
                 date = min(c["commit"]["committer"]["date"], now.strftime("%Y-%m-%dT%H:%M:%SZ"))  # 未来の日時は今に丸める
                 commits.append({"sha": c["sha"], "date": date, "message": msg,
                                 "files": [f["filename"] for f in detail.get("files", [])], "prs": own,
@@ -412,7 +436,9 @@ def collect(owner, exclude):
             fc = fix_candidates(name, commits, prs, revert_pr=revert_pr)
             for c in fc:  # 原因の候補の差分は、判定に使うものだけ取る
                 for s in c["suspects"]:
-                    s.setdefault("diff", gh("pr", "diff", str(s["number"]), "-R", name)[:15000])
+                    s["diff"], why = suspect_diff(name, s)
+                    if why:
+                        c["incomplete"] = why
             issues = [i for i in _paged("repos/%s/issues?state=all&labels=type:fix&since=%s&per_page=100" % (name, since_fix))
                       if "pull_request" not in i and _ts(i["created_at"]) >= now - dt.timedelta(days=WINDOW_DAYS)]
             cands += fc + issue_candidates(name, issues, prs)
