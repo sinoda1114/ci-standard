@@ -38,6 +38,8 @@ MAX_PROMPT_CHARS = 60000    # 1 件の判定に渡す文字数の上限
 FIX_DIFF_BUDGET = 30000     # そのうち修正の差分に使う分（残りを原因の候補で分ける）
 MIN_SUSPECT_BUDGET = 3000
 MAX_SUSPECTS = 5
+MAX_COMMENT_CHARS = 60000   # 状態コメント 1 件の上限（GitHub の本文の上限 65,536 字より小さく）
+JUDGE_SECONDS = 20 * 60     # 判定に使う時間の上限（job の 30 分に収める。残りは次回）
 SEVERITIES = ("critical", "high", "other")
 LEAK_VALUES = ("yes", "no", "unclear")
 TRUSTED_AUTHORS = ("OWNER", "MEMBER", "COLLABORATOR")
@@ -70,7 +72,11 @@ def month_of(rec):
     return rec["date"][:7]
 
 
-def fix_candidates(repo, commits, prs, revert_pr=None):
+def _in_window(when, p):
+    return bool(p.get("merged_at")) and dt.timedelta(0) < when - _ts(p["merged_at"]) <= dt.timedelta(days=WINDOW_DAYS)
+
+
+def fix_candidates(repo, commits, prs, revert_pr=None, fetch_pr=None):
     """fix・revert のコミットを候補にし、原因の候補（suspects）を付ける"""
     out = []
     for c in commits:
@@ -86,6 +92,13 @@ def fix_candidates(repo, commits, prs, revert_pr=None):
             except Exception:  # 取れなければファイルの重なりで探す（リポジトリ全体を落とさない）
                 n = None
             suspects = [p for p in prs if p["number"] == n]
+            if n and not suspects and fetch_pr:
+                try:
+                    got = fetch_pr(n)
+                except Exception:
+                    got = None
+                suspects = [got] if got else []
+            suspects = [p for p in suspects if _in_window(when, p)]
         if not suspects:
             files = set(c.get("files") or [])
             own = set(c.get("prs") or [])
@@ -187,6 +200,9 @@ def judge(c, api, has_key):
     if not has_key:
         rec["rationale"] = "API キーが無い"
         return rec
+    if c.get("fetch_failed"):
+        rec["rationale"] = "原因の候補の差分を取得できなかった（次回に再判定）"
+        return rec
     prompt = build_prompt(c)
     allowed = set(rec["suspects"])
     final = None
@@ -226,6 +242,19 @@ def render_state(records):
     return "%s\n%s\n%s" % (STATE_BEGIN, js, STATE_END)
 
 
+def render_states(records):
+    """上限（MAX_COMMENT_CHARS）以内の状態コメントに分ける"""
+    out, chunk = [], []
+    for rec in records:
+        if chunk and len(render_state(chunk + [rec])) > MAX_COMMENT_CHARS:
+            out.append(render_state(chunk))
+            chunk = []
+        chunk.append(rec)
+    if chunk:
+        out.append(render_state(chunk))
+    return out
+
+
 def parse_state(body):
     """状態のコメントを読む。状態でないコメントは []、状態なのに読めないものは ValueError（上書きを防ぐ）"""
     if not body or STATE_BEGIN not in body:
@@ -246,11 +275,31 @@ def merge(known, new):
 
 def pending(candidates, known):
     """判定する候補（窓の中）と、取り直して再判定する記録（窓の外の未判定）"""
-    done = {r["key"] for r in known if r.get("verdict") in ("judged", "no-suspect")}
+    done = {r["key"] for r in known if r.get("verdict") in ("judged", "no-suspect", "gone")}
     keys = {c["key"] for c in candidates}
     todo = [c for c in candidates if c["key"] not in done]
     refetch = [r for r in known if r.get("verdict") == "unjudged" and r["key"] not in keys]
     return todo, refetch
+
+
+def is_gone(err):
+    """取り直せない（リポジトリやコミットが消えた）ことを示す失敗か"""
+    return bool(re.search(r"HTTP (404|410|422)\b", str(err)))
+
+
+def valid_record(r, repos):
+    """台帳の状態から取り直してよい記録か（台帳のコメントは書き換えられうるので、値の形を確かめる）"""
+    if r.get("repo") not in repos or not re.fullmatch(r"[\w.-]+/[\w.-]+", str(r.get("repo"))):
+        return False
+    kind = r.get("kind")
+    sus = r.get("suspects") or []
+    if not all(isinstance(n, int) and not isinstance(n, bool) for n in sus):
+        return False
+    if kind in ("fix", "revert"):
+        return bool(re.fullmatch(r"[0-9a-f]{7,40}", str(r.get("sha") or "")))
+    if kind == "issue":
+        return isinstance(r.get("number"), int) and not isinstance(r.get("number"), bool)
+    return False
 
 
 def cap(todo):
@@ -332,7 +381,7 @@ def anthropic_api(model, prompt):
                          "messages": [{"role": "user", "content": prompt}]}).encode(),
         headers={"x-api-key": os.environ["ANTHROPIC_API_KEY"], "anthropic-version": "2023-06-01",
                  "content-type": "application/json"})
-    with urllib.request.urlopen(req, timeout=120) as r:
+    with urllib.request.urlopen(req, timeout=60) as r:
         d = json.load(r)
     return "".join(b.get("text", "") for b in d.get("content", []) if b.get("type") == "text")
 
@@ -352,7 +401,7 @@ def collect(owner, exclude):
     since_pr = now - dt.timedelta(days=WINDOW_DAYS * 2)
     repos = json.loads(gh("repo", "list", owner, "--limit", "200", "--no-archived", "--source",
                           "--json", "nameWithOwner,defaultBranchRef"))
-    cands, errors = [], []
+    cands, errors, names = [], [], set()
     for r in repos:
         name = r["nameWithOwner"]
         if name.split("/")[1] in exclude or not r.get("defaultBranchRef"):
@@ -374,12 +423,19 @@ def collect(owner, exclude):
                 return ps[0]["number"] if ps else None
             issues = [i for i in _paged("repos/%s/issues?state=all&labels=type:fix&since=%s&per_page=100" % (name, since_fix))
                       if "pull_request" not in i and _ts(i["created_at"]) >= now - dt.timedelta(days=WINDOW_DAYS)]
-            cands += fix_candidates(name, commits, prs, revert_pr=revert_pr) + issue_candidates(name, issues, prs)
+            def fetch_pr(n, name=name):
+                p = gh_api("repos/%s/pulls/%d" % (name, n))
+                if not p.get("merged_at"):
+                    return None
+                return {"number": n, "merged_at": p["merged_at"], "title": p["title"], "files": []}
+            cands += (fix_candidates(name, commits, prs, revert_pr=revert_pr, fetch_pr=fetch_pr)
+                      + issue_candidates(name, issues, prs))
+            names.add(name)
         except Exception as e:  # 1 リポジトリの失敗で全体を止めない。詳細は台帳（Private）にだけ書く
             if "HTTP 409" in str(e):  # 空のリポジトリ（コミットが無い）は対象外
                 continue
             errors.append("%s: %s" % (name, str(e)[:200]))
-    return cands, errors
+    return cands, errors, names
 
 
 def refetch_candidate(rec):
@@ -388,10 +444,11 @@ def refetch_candidate(rec):
     sus = [{"number": n, "title": gh_api("repos/%s/pulls/%d" % (name, n))["title"]} for n in rec.get("suspects") or []]
     if rec["kind"] == "issue":
         i = gh_api("repos/%s/issues/%d" % (name, rec["number"]))
-        diff = (i.get("body") or "")[:8000]
+        diff, msg = (i.get("body") or "")[:8000], i["title"]
     else:
-        diff = commit_detail(name, rec["sha"])["diff"]
-    return dict(rec, diff=diff, suspects=sus)
+        d = commit_detail(name, rec["sha"])
+        diff, msg = d["diff"], d["message"]
+    return dict(rec, diff=diff, suspects=sus, message=msg.splitlines()[0][:200])
 
 
 def fill_suspect_diffs(c, cache):
@@ -404,8 +461,12 @@ def fill_suspect_diffs(c, cache):
             try:
                 cache[k] = gh("pr", "diff", str(s["number"]), "-R", c["repo"])[:20000]
             except RuntimeError:
-                cache[k] = "（差分を取得できなかった。大きすぎる PR など）"
-        s["diff"] = cache[k]
+                cache[k] = None
+        if cache[k] is None:  # 取れなければ判定せず、未判定として次回に回す
+            c["fetch_failed"] = True
+            s["diff"] = ""
+        else:
+            s["diff"] = cache[k]
 
 
 def ledger_issues(ledger):
@@ -421,9 +482,12 @@ def month_number(issues, month):
     return None
 
 
-def read_state(ledger, number):
+def read_state(ledger, number, author):
+    """状態のコメントを読む。トークンの持ち主が書いたものだけ（他人が書いた偽の状態を使わない）"""
     out = []
     for c in _paged("repos/%s/issues/%d/comments?per_page=100" % (ledger, number)):
+        if (c.get("user") or {}).get("login") != author:
+            continue
         out = merge(out, parse_state(c.get("body", "")))  # 読めない状態は ValueError で止める
     return out
 
@@ -435,32 +499,42 @@ def run(a):
         return 2
     now = dt.datetime.now(dt.timezone.utc)
     this_month = now.strftime("%Y-%m")
+    started = dt.datetime.now(dt.timezone.utc)
+    author = gh_api("user")["login"]
     issues = ledger_issues(a.ledger)
     known = []
     # すべての月の記録を読む（窓の外・前々月以前の未判定も再判定するため）
     for i in sorted(issues, key=lambda i: i["number"]):
         if re.fullmatch(r"\[漏れの記録\] \d{4}-\d{2}", i["title"]):
-            known = merge(known, read_state(a.ledger, i["number"]))
+            known = merge(known, read_state(a.ledger, i["number"], author))
     exclude = {x for x in a.exclude.split(",") if x} | {a.ledger.split("/")[1]}
-    cands, errors = collect(a.owner, exclude)
+    cands, errors, names = collect(a.owner, exclude)
     todo, refetch = pending(cands, known)
+    gone = []
     for r in refetch:
-        # 台帳の状態はコメントで書き換えられうるので、自分のリポジトリの記録だけを取り直す
-        if not str(r.get("repo", "")).startswith(a.owner + "/") or r["repo"].split("/")[1] in exclude:
+        # 台帳の状態は書き換えられうるので、今回列挙したリポジトリの、形の正しい記録だけを取り直す
+        if not valid_record(r, names):
             continue
         try:
             todo.append(refetch_candidate(r))
         except Exception as e:
-            errors.append("%s の取り直し: %s" % (r["key"], str(e)[:200]))
+            if is_gone(e):  # リポジトリやコミットが消えた記録は閉じる（毎回の失敗にしない）
+                gone.append(dict(r, verdict="gone", rationale="取り直せない（%s）" % str(e)[:80]))
+            else:
+                errors.append("%s の取り直し: %s" % (r["key"], str(e)[:200]))
     todo, later = split_cap(todo)
     has_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
     cache = {}
     new = []
-    for c in todo:
+    for idx, c in enumerate(todo):
+        if (dt.datetime.now(dt.timezone.utc) - started).total_seconds() > JUDGE_SECONDS:
+            # 時間の上限を超えたら、残りは未判定として記録し次回に回す（job の時間切れで全部を失わない）
+            later = split_cap([{}] * MAX_PER_RUN + todo[idx:])[1] + later
+            break
         if has_key:
             fill_suspect_diffs(c, cache)
         new.append(compact(judge(c, anthropic_api, has_key)))
-    new += [compact(r) for r in later]
+    new += [compact(r) for r in later] + [compact(r) for r in gone]
     records = merge(known, new)
     print("候補 %d / 今回判定 %d / 未判定 %d / 取得失敗 %d（詳細は台帳）" % (
         len(cands), len(todo), sum(1 for r in new if r["verdict"] == "unjudged"), len(errors)))
@@ -506,8 +580,8 @@ def run(a):
                      input_text=body).strip()
             n = int(url.rstrip("/").rsplit("/", 1)[1])
             issues.append({"number": n, "title": "[漏れの記録] %s" % m, "body": body})
-        if recs:
-            gh("issue", "comment", str(n), "-R", a.ledger, "--body-file", "-", input_text=render_state(recs))
+        for body_part in render_states(recs):
+            gh("issue", "comment", str(n), "-R", a.ledger, "--body-file", "-", input_text=body_part)
     return 1 if errors and not cands else 0
 
 
