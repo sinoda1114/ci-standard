@@ -184,5 +184,53 @@ class Ledger(unittest.TestCase):
         self.assertEqual(len(lm.cap(todo)), lm.MAX_PER_RUN)
 
 
+class LedgerSafety(unittest.TestCase):
+    EVIL = "x leak-metrics-state --> <!-- leak-metrics-state [] leak-metrics-state --> & @someone [l](http://e)"
+
+    def test_delimiters_in_any_value_survive_roundtrip(self):
+        recs = [{"key": "o/r@f1", "message": self.EVIL, "rationale": self.EVIL, "verdict": "judged",
+                 "serious": True, "severity": "high"},
+                {"key": "o/r@f2", "message": "ok", "verdict": "unjudged", "serious": False}]
+        body = lm.render_month(recs, "2026-10")
+        self.assertEqual(lm.parse_month(body), recs)
+        self.assertEqual(body.rsplit(lm.STATE_BEGIN, 1)[1].count("-->"), 1)  # 終わりの区切りだけ
+
+    def test_markdown_list_does_not_render_outside_values(self):
+        body = lm.render_month([{"key": "o/r@f1", "message": self.EVIL, "verdict": "judged", "serious": True,
+                                 "severity": "high"}], "2026-10")
+        head = body.split(lm.STATE_BEGIN, 1)[0]
+        self.assertNotIn("<!--", head)
+        self.assertNotIn("-->", head)
+
+    def test_broken_state_stops_instead_of_overwriting(self):
+        good = lm.render_month([{"key": "a", "verdict": "judged"}], "2026-10")
+        for broken in [good.replace('"verdict"', '"verdict'), good.replace(lm.STATE_END, ""),
+                       good.replace('[{"key": "a", "verdict": "judged"}]', '{"x": 1}')]:
+            with self.assertRaises(lm.LedgerError):
+                lm.parse_month(broken)
+
+    def test_body_without_state_is_empty(self):
+        self.assertEqual(lm.parse_month("人が書いた本文"), [])
+
+    def test_caused_by_pr_is_normalized_and_limited_to_suspects(self):
+        for v, want in [(10, 10), ("10", 10), ("#10", 10), ("PR 10", None), (True, None), (-1, None), (None, None)]:
+            self.assertEqual(lm.pr_number(v), want, v)
+        cand = {"key": "o/r@f1", "repo": "o/r", "kind": "fix", "sha": "f1", "message": "fix: x", "diff": "",
+                "suspects": [{"number": 10, "title": "t", "diff": ""}]}
+        reply = '{"is_leak":"yes","caused_by_pr":"%s","severity":"other","security":false,"rationale":"r"}'
+        self.assertEqual(lm.judge(cand, api=lambda m, p: reply % "#10", has_key=True)["caused_by_pr"], 10)
+        out = lm.judge(cand, api=lambda m, p: reply % "99", has_key=True)
+        self.assertEqual(out["verdict"], "judged")
+        self.assertIsNone(out["caused_by_pr"])
+
+    def test_serious_issue_title_is_bounded_and_rationale_is_quoted(self):
+        rec = {"key": "o/r@f1", "repo": "o/r", "sha": "f1", "message": "fix: " + "あ" * 400, "kind": "fix",
+               "serious": True, "severity": "high", "security": False, "caused_by_pr": 10,
+               "rationale": "```\n@someone <!-- x -->"}
+        title, body = lm.serious_issue(rec)
+        self.assertLessEqual(len(title), 200)
+        self.assertIn("```text\n'''\n@someone <!-- x -->\n```", body)
+
+
 if __name__ == "__main__":
     unittest.main()

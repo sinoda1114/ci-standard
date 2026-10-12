@@ -32,6 +32,8 @@ FIX_RE = re.compile(r"^(fix|hotfix|revert)(\([^)]*\))?!?:|^Revert\b", re.I)
 REVERT_RE = re.compile(r"This reverts commit ([0-9a-f]{7,40})")
 STATE_BEGIN = "<!-- leak-metrics-state"
 STATE_END = "leak-metrics-state -->"
+MAX_BODY_CHARS = 60000      # 台帳 Issue 1 本の本文の上限（GitHub の上限 65,536 文字より小さく取る）
+MAX_RATIONALE_CHARS = 500
 
 
 # ------------------------------------------------------------ 純粋な判断（テスト対象）
@@ -107,8 +109,19 @@ def parse_judgement(text):
         return None
     if not isinstance(d.get("security"), bool) or "caused_by_pr" not in d:
         return None
-    d.setdefault("rationale", "")
+    d["caused_by_pr"] = pr_number(d.get("caused_by_pr"))
+    d["rationale"] = str(d.get("rationale") or "")[:MAX_RATIONALE_CHARS]
     return d
+
+
+def pr_number(v):
+    """AI が返した PR 番号を int か None にそろえる（"10"・"#10" は読む。それ以外は None）"""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v if v > 0 else None
+    m = re.fullmatch(r"\s*#?(\d{1,9})\s*", str(v)) if isinstance(v, str) else None
+    return int(m.group(1)) if m else None
 
 
 def needs_stage2(j):
@@ -160,41 +173,80 @@ def judge(c, api, has_key):
         final = j
         if model == STAGE1_MODEL and not needs_stage2(j):
             break
+    pr = final["caused_by_pr"] if final["caused_by_pr"] in rec["suspects"] else None  # 候補にない番号は書かない
     rec.update({"verdict": "judged", "severity": final["severity"], "security": final["security"],
-                "caused_by_pr": final["caused_by_pr"], "rationale": str(final["rationale"])[:500],
+                "caused_by_pr": pr, "rationale": final["rationale"],
                 "is_leak": final["is_leak"]})
     rec["serious"] = final["is_leak"] != "no" and (final["severity"] in ("critical", "high") or final["security"])
     return rec
 
 
-def render_month(records, month):
-    judged = [r for r in records if r.get("verdict") == "judged"]
-    leaks = [r for r in judged if r.get("is_leak") == "yes"]
-    serious = [r for r in records if r.get("serious")]
-    unj = [r for r in records if r.get("verdict") == "unjudged"]
-    lines = ["# 漏れの記録 %s" % month, "",
-             "| 項目 | 件数 |", "|---|---|",
-             "| 候補 | %d |" % len(records), "| 判定済み | %d |" % len(judged),
-             "| 漏れ（yes） | %d |" % len(leaks), "| 重大・セキュリティ | %d |" % len(serious),
-             "| 未判定（次回に再判定） | %d |" % len(unj), ""]
-    if serious:
-        lines += ["## 重大・セキュリティ", ""]
-        lines += ["- %s %s（%s）" % (r["key"], r.get("message", ""), r.get("severity")) for r in serious]
-        lines.append("")
+class LedgerError(ValueError):
+    """台帳の状態を読めない。空として上書きすると記録が消えるので、実行を止める"""
+
+
+def md_text(v):
+    """コミットの題名など外から来る文字列を、台帳の Markdown に安全に載せる（リンク・メンション・HTML を効かせない）"""
+    t = re.sub(r"[\r\n`]", " ", str(v or ""))[:200]
+    return "`%s`" % t.replace("<", "‹").replace(">", "›")
+
+
+def state_json(records):
+    """状態の JSON。< > & を \\u エスケープするので、どんな値を入れても区切り（<!-- / -->）にならない"""
+    return (json.dumps(records, ensure_ascii=False)
+            .replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026"))
+
+
+def render_month(records, month, part=1, parts=1, summary_of=None):
+    """台帳 Issue 1 本の本文。集計は 1 本目にだけ、月の全件（summary_of）について書く"""
+    lines = ["# 漏れの記録 %s%s" % (month, "（%d/%d）" % (part, parts) if parts > 1 else ""), ""]
+    if part == 1:
+        allr = summary_of if summary_of is not None else records
+        judged = [r for r in allr if r.get("verdict") == "judged"]
+        serious = [r for r in allr if r.get("serious")]
+        lines += ["| 項目 | 件数 |", "|---|---|",
+                  "| 候補 | %d |" % len(allr), "| 判定済み | %d |" % len(judged),
+                  "| 漏れ（yes） | %d |" % sum(1 for r in judged if r.get("is_leak") == "yes"),
+                  "| 重大・セキュリティ | %d |" % len(serious),
+                  "| 未判定（次回に再判定） | %d |" % sum(1 for r in allr if r.get("verdict") == "unjudged"), ""]
+        if serious:
+            lines += ["## 重大・セキュリティ", ""]
+            lines += ["- %s %s（%s）" % (md_text(r["key"]), md_text(r.get("message")), md_text(r.get("severity")))
+                      for r in serious]
+            lines.append("")
     lines += ["自動で更新します（ci-standard の leak-metrics）。手で編集しないでください。", "",
-              STATE_BEGIN, json.dumps(records, ensure_ascii=False), STATE_END]
+              STATE_BEGIN, state_json(records), STATE_END]
     return "\n".join(lines)
 
 
+def render_month_parts(records, month):
+    """本文が上限を超えないように、記録を複数の台帳 Issue に分ける（1 本目・2 本目…の本文の配列）"""
+    chunks, cur = [], []
+    for r in records:
+        if cur and len(render_month(cur + [r], month, 2, 2)) > MAX_BODY_CHARS - 4000:  # 1 本目の集計の分を空けておく
+            chunks.append(cur)
+            cur = []
+        cur.append(r)
+    chunks.append(cur)
+    n = len(chunks)
+    return [render_month(c, month, i + 1, n, summary_of=records) for i, c in enumerate(chunks)]
+
+
 def parse_month(body):
+    """台帳 Issue の本文から状態を読む。状態の区切りが無ければ空。区切りがあるのに読めなければ LedgerError"""
     if not body or STATE_BEGIN not in body:
         return []
+    raw = body.rsplit(STATE_BEGIN, 1)[1]
+    if STATE_END not in raw:
+        raise LedgerError("状態の終わりの区切りが無い")
+    raw = raw.split(STATE_END, 1)[0]
     try:
-        raw = body.split(STATE_BEGIN, 1)[1].split(STATE_END, 1)[0]
         d = json.loads(raw)
-    except (ValueError, IndexError):
-        return []
-    return d if isinstance(d, list) else []
+    except ValueError as e:
+        raise LedgerError("状態の JSON を読めない: %s" % e)
+    if not isinstance(d, list) or not all(isinstance(r, dict) and isinstance(r.get("key"), str) for r in d):
+        raise LedgerError("状態の形が違う")
+    return d
 
 
 def pending(candidates, known):
@@ -214,13 +266,14 @@ def cap(todo):
 
 
 def serious_issue(r):
-    title = "[漏れ] %s: %s" % (r["repo"], r.get("message", ""))[:200]
+    title = ("[漏れ] %s: %s" % (r["repo"], re.sub(r"[\r\n]", " ", r.get("message") or "")))[:200]
+    why = re.sub(r"`", "'", str(r.get("rationale") or ""))[:MAX_RATIONALE_CHARS]
     body = "\n".join([
         "マージ後 %d 日以内に、重大またはセキュリティの修正が入りました。" % WINDOW_DAYS, "",
         "- 修正: %s %s（%s）" % (r["repo"], r.get("sha") or r["key"], r.get("kind")),
         "- 原因と判定された PR: %s" % ("%s#%s" % (r["repo"], r["caused_by_pr"]) if r.get("caused_by_pr") else "不明"),
         "- 重大度: %s / セキュリティ: %s" % (r.get("severity"), r.get("security")),
-        "- 判定の理由: %s" % r.get("rationale", ""),
+        "- 判定の理由（AI の出力。そのまま載せる）:", "", "```text", why, "```",
         "- 判定したモデル: %s" % ", ".join(r.get("models") or []), "",
         "push 前の /ai-review で止められたはずかを確かめ、必要なら設計を見直してください。", "",
         "<!-- ai-review-leak:%s -->" % r["key"]])
