@@ -630,6 +630,24 @@ def notify(ledger, records, errors):
     return changed
 
 
+def report_errors(errors):
+    """取得失敗をログに出す。既定は種類（HTTP の番号）ごとの件数だけ（公開のログに private のリポジトリ名を出さない）。
+    手元で詳しく見るときは LEAK_METRICS_LOG_DETAILS=1"""
+    if not errors:
+        return
+    if os.environ.get("LEAK_METRICS_LOG_DETAILS") == "1":
+        for e in errors:
+            print("取得失敗: " + e, file=sys.stderr)
+        return
+    kinds = {}
+    for e in errors:
+        m = re.search(r"\bHTTP (\d{3})\b", e)
+        k = "HTTP %s" % m.group(1) if m else "そのほか"
+        kinds[k] = kinds.get(k, 0) + 1
+    print("取得失敗 %d 件（%s）。詳しくは手元で LEAK_METRICS_LOG_DETAILS=1 を付けて動かす"
+          % (len(errors), "、".join("%s: %d 件" % kv for kv in sorted(kinds.items()))), file=sys.stderr)
+
+
 def run(a):
     started = monotonic()
     now = utcnow()
@@ -667,20 +685,18 @@ def run(a):
             if old.get(k):
                 r[k] = old[k]
         known[r["key"]] = r
-    print("候補 %d / 今回判定 %d / 重大 %d / 未判定 %d / 取得失敗 %d" % (
-        len(cands), len(new), sum(1 for r in new if r["serious"]),
-        sum(1 for r in new if r["verdict"] == "unjudged"), len(errors)))
+    # このログは公開リポジトリの Actions に出るので、件数の合計だけを出す（重大の件数・リポジトリ名は台帳にだけ残す）
+    print("候補 %d / 今回判定 %d / 未判定 %d / 取得失敗 %d" % (
+        len(cands), len(new), sum(1 for r in new if r["verdict"] == "unjudged"), len(errors)))
     if a.dry_run:
-        for e in errors:
-            print("取得失敗: " + e, file=sys.stderr)
+        report_errors(errors)
         return 0
     changed = {month_of(r, now) for r in new} | {month_of(known[k], now) for k in failed}
     save_months(a.ledger, known, slots, changed, now)  # 起票の前に判定を保存する
     notified = notify(a.ledger, known, errors)
     if notified:  # 起票できたものだけ notified を保存する（失敗したものは次回に起票し直す）
         save_months(a.ledger, known, slots, {month_of(r, now) for r in notified}, now)
-    for e in errors:
-        print("取得失敗: " + e, file=sys.stderr)
+    report_errors(errors)
     # 取得に失敗したリポジトリ・記録があれば、保存と起票を済ませてから 0 以外で終える（ワークフローを赤くして気づけるように）
     return 1 if errors else 0
 

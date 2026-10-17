@@ -797,5 +797,34 @@ class Robust2(Run):
         self.assertTrue(fake.ledgers())  # 保存は済ませてから
 
 
+class PublicLog(Run):
+    """公開リポジトリの Actions のログに private の情報を出さない（1 周目の /ai-review の指摘 L5）"""
+    def capture(self, fake, cands, errors):
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.go(fake, cands, errors=errors)
+        return out.getvalue() + err.getvalue()
+
+    def test_log_has_no_repo_names_or_serious_counts(self):
+        os.environ.pop("LEAK_METRICS_LOG_DETAILS", None)
+        self.replies = [SERIOUS, SERIOUS]
+        log = self.capture(FakeGitHub(), [cand("o/secret-repo@abcde01", "2026-09-30T00:00:00Z")],
+                           ["o/private-thing: gh api repos/o/private-thing/pulls: HTTP 403 Forbidden"])
+        self.assertNotIn("private-thing", log)
+        self.assertNotIn("secret-repo", log)
+        self.assertNotIn("重大", log)
+        self.assertIn("HTTP 403", log)  # 種類だけは出す
+
+    def test_details_only_when_asked(self):
+        os.environ["LEAK_METRICS_LOG_DETAILS"] = "1"
+        try:
+            log = self.capture(FakeGitHub(), [], ["o/private-thing: HTTP 403"])
+        finally:
+            os.environ.pop("LEAK_METRICS_LOG_DETAILS", None)
+        self.assertIn("private-thing", log)
+
+
 if __name__ == "__main__":
     unittest.main()

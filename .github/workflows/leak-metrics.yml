@@ -10,6 +10,8 @@
 #   ADMIN_TOKEN               sweeper と共用の fine-grained PAT（全リポジトリの読み取りと、台帳への Issue の起票）
 #   LEAK_JUDGE_ANTHROPIC_KEY  判定に使う Anthropic API キー。無ければ全件を「未判定」として記録し、次回に再判定する
 # 料金の上限: 1 回の判定は最大 60 件（leak_metrics.py の MAX_PER_RUN）。このリポジトリは Public なので Actions の分数は消費しない。
+# ログ: このリポジトリは Public なので、ログと要約には件数の合計と、取得失敗の種類（HTTP の番号ごとの件数）だけを出す。
+#   private のリポジトリ名・重大の件数・エラーの文は台帳（Private）にだけ残す。手元で詳しく見るときは LEAK_METRICS_LOG_DETAILS=1
 name: leak-metrics
 
 on:
