@@ -1274,5 +1274,30 @@ class SecretsNotSent(unittest.TestCase):
         self.assertTrue(sent)
 
 
+class SecretsRound2(unittest.TestCase):
+    """全体のレビューの指摘 C1〜C3"""
+    def test_secret_across_the_old_cut_point_is_found(self):  # C1
+        body = "x" * 7985 + '"api_key": "abcdefgh12345678"'
+        c = lm.issue_candidates("o/r", [{"number": 5, "created_at": "2026-10-10T00:00:00Z", "title": "bug", "body": body}],
+                                [pr(10, "2026-10-05T00:00:00Z", ["a"])])[0]
+        out = lm.judge(c, api=lambda m, p: self.fail("送った"), has_key=True)
+        self.assertEqual(out["verdict"], "secret")
+
+    def test_secret_check_is_fast_on_long_lines(self):  # C2
+        import time
+        for s in ("A" * 200000, "token" * 40000, "x=" + "a" * 200000):
+            t0 = time.monotonic()
+            lm.has_secret(s)
+            lm.redact(s)
+            self.assertLess(time.monotonic() - t0, 1.0, s[:10])
+
+    def test_identifiers_are_not_secrets_but_keys_are(self):  # C3
+        self.assertFalse(lm.has_secret("+  token = getAuthorizationHeader(request)"))
+        self.assertFalse(lm.has_secret("+  password = passwordFromEnvironment"))
+        self.assertTrue(lm.has_secret("+  token = ab12cd34ef56gh78ij90"))
+        self.assertTrue(lm.has_secret('+  "api_key": "abcdefgh12345678"'))
+        self.assertNotIn("ab12cd34ef56gh78ij90", lm.redact("token = ab12cd34ef56gh78ij90"))
+
+
 if __name__ == "__main__":
     unittest.main()

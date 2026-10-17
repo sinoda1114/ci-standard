@@ -46,9 +46,12 @@ SECRET_RE = re.compile(
     r"|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}"  # GitHub classic / fine-grained
     r"|xox[abprs]-[A-Za-z0-9\-]{10,}"                     # Slack
     r"|apikey_[A-Za-z0-9_]{30,}"
-    # 代入（キーは引用符で囲まれていてもよい: "api_key": "値" など）
-    r"|(?i:['\"]?[\w.-]*(password|passwd|secret|api[_-]?key|token|credential)[\w.-]*['\"]?\s*[:=]\s*(['\"][^'\"]{8,}['\"]|[A-Za-z0-9_\-/+=]{16,}))"
     r")")
+# 代入の形（password = "…"・"api_key": "…" など）は 2 段で確かめる: キーワードを探し、その直後の決まった長さだけを調べる
+# （1 つの正規表現で書くと、長い英数字の行で二乗の時間になる）
+SECRET_KEY_RE = re.compile(r"(?i)(password|passwd|secret|api[_-]?key|token|credential)")
+SECRET_VALUE_RE = re.compile(r"""[\w.-]{0,40}['"]?\s*[:=]\s*(['"][^'"\n]{8,200}['"]|(?=[A-Za-z0-9_\-/+=]{0,200}\d)[A-Za-z0-9_\-/+=]{16,200})""")
+SECRET_WINDOW = 300
 SECRET_PATH_RE = re.compile(r"(^|/)(\.env[^/]*|[^/]*\.pem|[^/]*\.key|id_rsa[^/]*|id_ed25519[^/]*|credentials[^/]*|\.npmrc|\.netrc)$")
 # 差分の中のファイルのパスの行（空白を含むパスも、名前の変更の前後も見る）
 DIFF_PATH_LINE_RE = re.compile(r"(?m)^(?:diff --git |--- |\+\+\+ |rename (?:from|to) ).*$")
@@ -135,7 +138,7 @@ def issue_candidates(repo, issues, prs):
         sus = sorted(sus, key=lambda p: p["merged_at"], reverse=True)[:MAX_SUSPECTS]
         out.append({"key": "%s#%d" % (repo, i["number"]), "repo": repo, "kind": "issue", "sha": "",
                     "date": i["created_at"], "message": i["title"][:200],
-                    "diff": (i.get("body") or "")[:8000],
+                    "diff": i.get("body") or "",  # 切らずに持つ（秘密情報は全文で確かめ、プロンプトを作るときにだけ切る）
                     "suspects": [{"number": p["number"], "title": p["title"], "diff": ""} for p in sus]})
     return out
 
@@ -175,6 +178,15 @@ def needs_stage2(j):
     return j["is_leak"] == "unclear" or j["severity"] in ("critical", "high") or j["security"]
 
 
+def secret_assignments(text):
+    """代入の形の秘密情報の位置（始まり, 終わり）。引用符の無い値は数字を含むときだけ（関数名のような識別子を外す）"""
+    t = str(text or "")
+    for m in SECRET_KEY_RE.finditer(t):
+        v = SECRET_VALUE_RE.match(t, m.end(), min(len(t), m.end() + SECRET_WINDOW))
+        if v:
+            yield m.start(), v.end()
+
+
 def redact(text):
     """外部の API に送る文字列から秘密情報を伏せる。秘密情報のファイル（.env・鍵など）の差分は中身ごと送らない"""
     out = []
@@ -183,7 +195,11 @@ def redact(text):
         if head.startswith("diff --git ") and SECRET_NAME_RE.search(head):
             part = part.split("\n", 1)[0] + "\n（秘密情報のファイルなので、差分は送らない）\n"
         out.append(part)
-    return SECRET_RE.sub("（秘密情報を伏せた）", "".join(out))
+    t = SECRET_RE.sub("（秘密情報を伏せた）", "".join(out))
+    spans = list(secret_assignments(t))
+    for a, b in reversed(spans):
+        t = t[:a] + "（秘密情報を伏せた）" + t[b:]
+    return t
 
 
 def commit_diff(entries):
@@ -205,7 +221,7 @@ def has_secret(text):
     for m in DIFF_PATH_LINE_RE.finditer(t):
         if SECRET_NAME_RE.search(m.group(0)):
             return True
-    return bool(SECRET_RE.search(t))
+    return bool(SECRET_RE.search(t)) or next(secret_assignments(t), None) is not None
 
 
 def secret_files(files):
@@ -544,7 +560,7 @@ def suspect_diff(repo, s):
     """原因の候補の PR の差分。(差分, 欠けた理由)。大きすぎて取れない（HTTP 406）ものは、取り直しても同じなので
     変更ファイルの一覧で代えて判定を続ける。一時的な失敗は欠けた理由を返す（その候補は次回に判定し直す）"""
     try:
-        return gh("pr", "diff", str(s["number"]), "-R", repo)[:MAX_PROMPT_CHARS], ""
+        return gh("pr", "diff", str(s["number"]), "-R", repo), ""  # 切らずに返す（秘密情報は全文で確かめ、プロンプトを作るときにだけ切る）
     except Exception as e:
         if re.search(r"\bHTTP 406\b", str(e)) or "too large" in str(e).lower():
             return "（差分が大きすぎて取得できない。変更ファイル: %s）" % ", ".join((s.get("files") or [])[:50]), ""
@@ -723,7 +739,7 @@ def refetch(stale, owner, exclude, errors):
                 # 台帳の値を信じない: collect と同じく、PR ではない type:fix の Issue だけを取り直す
                 if "pull_request" in i or "type:fix" not in [l.get("name") for l in i.get("labels") or [] if isinstance(l, dict)]:
                     raise RuntimeError("台帳の記録が type:fix の Issue ではない")
-                diff = (i.get("body") or "")[:8000]
+                diff = i.get("body") or ""  # 切らずに持つ（秘密情報は全文で確かめる）
                 fetched_msg = i.get("title") or ""
                 sus = []
                 for n in r["suspects"]:  # 原因の候補は、既定ブランチに、Issue の作成の直前 14 日にマージされた PR だけ
