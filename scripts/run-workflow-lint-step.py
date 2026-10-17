@@ -114,10 +114,11 @@ def main():
 
     with tempfile.TemporaryDirectory() as broken:
         make_repo(broken, BROKEN_WORKFLOW)
-        rc, _ = run_step(env_vars, script, broken)
+        rc, out = run_step(env_vars, script, broken)
     print(f"壊れた見本: 終了コード {rc}（期待 1）")
-    if rc != 1:
-        sys.exit("::error::読めない式のある見本で workflow-lint のステップが終了コード 1 を返さなかった")
+    # 失敗の理由も見る（別の理由で 1 になっていても気付けるように）
+    if rc != 1 or 'undefined variable "x"' not in out:
+        sys.exit("::error::読めない式のある見本で、workflow-lint のステップが undefined variable で終了コード 1 にならなかった")
     print("workflow-lint のステップは期待どおり")
 
 

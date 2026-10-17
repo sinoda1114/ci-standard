@@ -35,10 +35,6 @@ jobs:
       - name: jactionlint の版とチェックサムが揃っているか
         run: bash scripts/check-jactionlint-pins.sh
 
-      - name: 配布する workflow-lint ジョブの本体を実際に走らせる
-        # node-ci.yml・python-ci.yml のステップを書かれたとおりに動かす（フラグや終了コードの扱いを誤ると、全リポジトリの ci / build が落ちるため）
-        run: python3 scripts/run-workflow-lint-step.py
-
       - name: ワークフローの文法と式の検査（jactionlint）
         # run: の中の ${{ … }} も Actions の式として評価される。読めない式が 1 つあると、ワークフロー全体が起動しない。
         # 2026-10-04 に、判定スクリプトの f-string の ${{…}} で node-ci.yml を全リポジトリで止めかけた再発防止。
@@ -55,16 +51,20 @@ jobs:
         # 配布元: jdx/jactionlint（mise の作者 jdx による actionlint のフォーク。MIT）。チェックサムの写しは
         # 「その時点の配布物と同じ」しか保証しないので、固定したハッシュの配布物が jdx/jactionlint の CI で
         # ビルドされたこと（GitHub artifact attestation）もここで毎回照合する。
+        # 照合は、このジョブで jactionlint を一度でも動かすより前に行う（先に動いた不正な配布物が GITHUB_PATH で
+        # gh を差し替えると照合を偽装できるため）。そのためこのステップは、配布するジョブ本体を動かすステップより前に置く。
+        # トークンは照合にだけ使い、jactionlint を動かす前に消す。
         env:
           JACTIONLINT_VERSION: '2.2.0'
           JACTIONLINT_SHA256: 8137d5bfe266dd5e48d2af2306827785ce07c6988e04b1c3d6ad4776e97d27d2
           STANDARD_REPO: sinoda1114/ci-standard
-          GH_TOKEN: ${{ github.token }}
+          ATTESTATION_TOKEN: ${{ github.token }}
         run: |
           tarball="jactionlint_${JACTIONLINT_VERSION}_linux_amd64.tar.gz"
           curl --retry 3 --retry-all-errors -sSfL -o "$RUNNER_TEMP/$tarball" "https://github.com/jdx/jactionlint/releases/download/v${JACTIONLINT_VERSION}/${tarball}"
           echo "${JACTIONLINT_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
-          gh attestation verify "$RUNNER_TEMP/$tarball" --repo jdx/jactionlint
+          GH_TOKEN="$ATTESTATION_TOKEN" gh attestation verify "$RUNNER_TEMP/$tarball" --repo jdx/jactionlint
+          unset ATTESTATION_TOKEN
           tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" jactionlint
           lint() { "$RUNNER_TEMP/jactionlint" --no-hints --no-online --profile correctness --shellcheck= --pyflakes= "$@"; }
           lint
@@ -74,6 +74,11 @@ jobs:
           mkdir -p "$RUNNER_TEMP/dist/.github/workflows"
           for kind in node python; do standard_ci_body "$kind" main > "$RUNNER_TEMP/dist/.github/workflows/ci-$kind.yml"; done
           lint "$RUNNER_TEMP"/dist/.github/workflows/ci-*.yml
+
+      - name: 配布する workflow-lint ジョブの本体を実際に走らせる
+        # 配布物の出所は直前のステップで照合済み（同じハッシュの配布物を取り直して動かす）。
+        # node-ci.yml・python-ci.yml のステップを書かれたとおりに動かす（フラグや終了コードの扱いを誤ると、全リポジトリの ci / build が落ちるため）
+        run: python3 scripts/run-workflow-lint-step.py
 
       - name: ワークフローのトリガー名検証
         # YAML として妥当でも、存在しないイベント名は GitHub が構文エラーにする。
