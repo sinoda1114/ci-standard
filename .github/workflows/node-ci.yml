@@ -103,6 +103,26 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # ワークフローの検査（jactionlint）。版とチェックサムは self-test.yml・python-ci.yml と揃える
+      # （scripts/check-jactionlint-pins.sh が見る）。版を上げる手順は self-test.yml のコメントを参照。
+      #   - 判定: correctness（構文・式・needs などの誤り）だけで落とす。読めない式が 1 つあるとワークフローごと起動しないため
+      #   - 助言: 既定プロファイル（SHA 固定・permissions などのセキュリティ・運用ルール）は警告の注釈を出すだけで落とさない
+      #   - shellcheck・pyflakes は使わない（目的はワークフローの文法と式）。GitHub への問い合わせもしない
+      - name: ワークフローの検査（jactionlint）
+        env:
+          JACTIONLINT_VERSION: '2.2.0'
+          JACTIONLINT_SHA256: 8137d5bfe266dd5e48d2af2306827785ce07c6988e04b1c3d6ad4776e97d27d2
+        run: |
+          tarball="jactionlint_${JACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/$tarball" "https://github.com/jdx/jactionlint/releases/download/v${JACTIONLINT_VERSION}/${tarball}"
+          echo "${JACTIONLINT_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" jactionlint
+          lint() { "$RUNNER_TEMP/jactionlint" --no-hints --no-color --no-online --shellcheck= --pyflakes= "$@"; }
+          # 標準 CI の呼び出し（ci-standard/...@main）は設計上 main を追うので、SHA 固定の警告から外す
+          lint --format github --ignore 'reusable workflow call "sinoda1114/ci-standard/[^"]*@main" must be pinned' \
+            | sed 's/^::error /::warning /' || true
+          lint --profile correctness
+
       # corepack で package.json の packageManager フィールドに従い pnpm/yarn を有効化
       - name: Enable corepack
         run: corepack enable
