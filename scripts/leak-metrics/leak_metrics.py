@@ -26,6 +26,7 @@ WINDOW_DAYS = 14
 STAGE1_MODEL = "claude-haiku-5-5"
 STAGE2_MODEL = "claude-opus-5-5"
 MAX_PER_RUN = 60            # 1 回の実行で判定する上限（料金の上限を決める）
+MAX_REPOS = 1000            # 集めるリポジトリの上限（超えたら取得失敗として知らせる）
 MAX_REFETCH_ERRORS = 3      # 取り直しの失敗を「取得失敗」に数える回数（以後は数えずに取り直しだけ続ける。毎日赤くし続けない）
 MAX_JUDGE_SECONDS = 20 * 60  # 判定に使う時間の上限。job の timeout-minutes（30）より前に保存まで終える
 MAX_PROMPT_CHARS = 60000    # 1 件の判定に渡すプロンプトの上限（文字）
@@ -35,7 +36,7 @@ SEVERITIES = ("critical", "high", "other")
 LEAK_VALUES = ("yes", "no", "unclear")
 FIX_RE = re.compile(r"^(fix|hotfix|revert)(\([^)]*\))?!?:|^Revert\b", re.I)
 REVERT_RE = re.compile(r"This reverts commit ([0-9a-f]{7,40})")
-REVERT_PR_RE = re.compile(r"^Reverts [\w.-]+/[\w.-]+#(\d+)\s*$", re.M)  # GitHub の Revert ボタンで作った PR の本文
+REVERT_PR_RE = re.compile(r"^Reverts ([\w.-]+/[\w.-]+)#(\d+)\s*$", re.M)  # GitHub の Revert ボタンで作った PR の本文
 STATE_BEGIN = "<!-- leak-metrics-state"
 STATE_END = "leak-metrics-state -->"
 MAX_BODY_CHARS = 60000      # 台帳 Issue 1 本の本文の上限（GitHub の上限 65,536 文字より小さく取る）
@@ -55,9 +56,10 @@ def revert_target(msg):
     return m.group(1) if m else None
 
 
-def revert_pr_number(msg):
+def revert_pr_number(msg, repo):
+    """本文の「Reverts owner/repo#N」の N。別のリポジトリの PR なら None（このリポジトリの PR と取り違えない）"""
     m = REVERT_PR_RE.search(msg or "")
-    return int(m.group(1)) if m else None
+    return int(m.group(2)) if m and m.group(1).lower() == str(repo).lower() else None
 
 
 def _ts(s):
@@ -72,7 +74,7 @@ def fix_candidates(repo, commits, prs, revert_pr=None):
             continue
         when = _ts(c["date"])
         target = revert_target(c["message"])
-        target_pr = revert_pr_number(c["message"])
+        target_pr = revert_pr_number(c["message"], repo)
         kind = "revert" if target or target_pr or c["message"].lower().startswith("revert") else "fix"
         suspects, incomplete, known = [], c.get("incomplete", ""), False
         if target_pr:  # 本文が「Reverts owner/repo#12」なら、元の PR の番号がそのまま分かる
@@ -260,7 +262,8 @@ def render_month(records, month, part=1, parts=1, summary_of=None):
 
 def fits(recs, month, part, summary_of):
     room = MAX_BODY_CHARS - (SUMMARY_RESERVE if part == 1 else 0)  # 1 本目の集計は SUMMARY_RESERVE で見込む
-    return len(render_month(recs, month, 2, 2)) <= room
+    # 保存するときに足される month・part の分も含めて測る（part は大きめの番号で見積もる）
+    return len(render_month([dict(r, month=month, part=999) for r in recs], month, 2, 2)) <= room
 
 
 def place(records, month):
@@ -388,7 +391,7 @@ def marked_keys(issues):
     """[漏れ] Issue の本文の最終行の目印だけを読む（本文の途中に書かれた目印は、AI の出力などから入りうるので信じない）"""
     keys = set()
     for i in issues:
-        last = (i.get("body") or "").rstrip("\n").split("\n")[-1]
+        last = (i.get("body") or "").replace("\r\n", "\n").rstrip("\n").split("\n")[-1]  # ブラウザで保存すると CRLF になる
         m = re.fullmatch(r"<!-- ai-review-leak:(\S+) -->", last)
         if m:
             keys.add(m.group(1))
@@ -460,9 +463,11 @@ def collect(owner, exclude):
     now = utcnow()
     since_fix = (now - dt.timedelta(days=WINDOW_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
     since_pr = now - dt.timedelta(days=WINDOW_DAYS * 2)
-    repos = json.loads(gh("repo", "list", owner, "--limit", "200", "--no-archived", "--source",
+    repos = json.loads(gh("repo", "list", owner, "--limit", str(MAX_REPOS), "--no-archived", "--source",
                           "--json", "nameWithOwner,defaultBranchRef"))
     cands, errors = [], []
+    if len(repos) >= MAX_REPOS:  # 上限で黙って打ち切らない
+        errors.append("リポジトリが %d 件以上あり、一覧を打ち切った（MAX_REPOS を上げる）" % MAX_REPOS)
     for r in repos:
         name = r["nameWithOwner"]
         if name.split("/")[1] in exclude or not r.get("defaultBranchRef"):
@@ -501,7 +506,10 @@ def collect(owner, exclude):
                     files_all = [f for page in _paged("repos/%s/commits/%s?per_page=100" % (name, c["sha"]))
                                  for f in (page.get("files") or [] if isinstance(page, dict) else [])]
                 except Exception as e:
+                    # 取れなくても台帳に未判定で残す（窓を出たあとも取り直せるように。材料が欠けているので判定はしない）
                     errors.append("%s@%s: %s" % (name, c["sha"][:7], str(e)[:200]))
+                    commits.append({"sha": c["sha"], "date": min(c["commit"]["committer"]["date"], nowz), "message": msg,
+                                    "files": [], "prs": [], "diff": "", "incomplete": "コミットの詳細を取得できない"})
                     continue
                 date = min(c["commit"]["committer"]["date"], nowz)  # 未来の日時は今に丸める
                 commits.append({"sha": c["sha"], "date": date, "message": msg,
@@ -566,11 +574,13 @@ def refetch(stale, owner, exclude, errors):
     """窓から外れた未判定の記録を、判定できる形に取り直す（試した回数の少ない順に、1 回の上限まで）。
     戻り値: (取り直せた候補, 取り直せなかった記録の key)。取り直せなかったものも「試した」に数える"""
     out, failed = [], []
-    for r in sorted(stale, key=lambda r: (int(r.get("attempts") or 0), r.get("date") or ""))[:MAX_PER_RUN]:
-        if isinstance(r.get("repo"), str) and r["repo"].split("/")[-1] in exclude:
-            continue  # 後から除外したリポジトリの記録は取り直さない（取得失敗にも数えない。記録はそのまま残す）
+    # 後から除外したリポジトリの記録は、上限を当てる前に除く（取り直さず、取得失敗にも数えない。記録はそのまま残す）
+    live = [r for r in stale if not (isinstance(r.get("repo"), str) and r["repo"].split("/")[-1] in exclude)]
+    for r in sorted(live, key=lambda r: (int(r.get("attempts") or 0), r.get("date") or ""))[:MAX_PER_RUN]:
+        counts = int(r.get("attempts") or 0) < MAX_REFETCH_ERRORS  # 失敗を取得失敗に数えるのは最初の MAX_REFETCH_ERRORS 回だけ
         if not valid_record(r, owner, exclude):
-            errors.append("台帳の記録が不正なので取り直さない: %s" % str(r.get("key"))[:100])
+            if counts:
+                errors.append("台帳の記録が不正なので取り直さない: %s" % str(r.get("key"))[:100])
             failed.append(r["key"])
             continue
         repo = r["repo"]
@@ -606,7 +616,7 @@ def refetch(stale, owner, exclude, errors):
                     pages = [x for x in _paged("repos/%s/commits/%s?per_page=100" % (repo, r["sha"])) if isinstance(x, dict)]
                     diff = "\n".join(f.get("patch", "") for x in pages for f in x.get("files") or [])
                     msg = ((pages[0] if pages else {}).get("commit") or {}).get("message", "")
-                target, target_pr = revert_target(msg), revert_pr_number(msg)
+                target, target_pr = revert_target(msg), revert_pr_number(msg, repo)
                 if target_pr:
                     nums = [target_pr]
                 elif target:  # revert は元の PR を探し直す（前回は取得に失敗して、ファイルの重なりで代えていたかもしれない）
@@ -626,7 +636,7 @@ def refetch(stale, owner, exclude, errors):
                         raise RuntimeError(why)
                     sus.append(s_)
         except Exception as e:  # 取り直せなければ未判定のまま残す
-            if int(r.get("attempts") or 0) + 1 < MAX_REFETCH_ERRORS:
+            if counts:
                 errors.append("%s: 取り直しに失敗: %s" % (r["key"], str(e)[:200]))
             failed.append(r["key"])
             continue

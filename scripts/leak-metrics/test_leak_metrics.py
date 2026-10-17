@@ -950,5 +950,72 @@ class PublicLog(Run):
         self.assertIn("private-thing", log)
 
 
+class Round3N(Run):
+    """3 周目の /ai-review の指摘 N1〜N8"""
+    def test_many_short_records_stay_within_body_limit(self):  # N1
+        recs = {"o/r#%d" % i: {"key": "o/r#%d" % i, "repo": "o/r", "kind": "issue", "sha": "", "date": "2026-10-01T00:00:00Z",
+                               "message": "x", "verdict": "unjudged", "serious": False, "suspects": []} for i in range(1200)}
+        fake = FakeGitHub()
+        lm.gh = fake
+        lm.save_months("o/ledger", recs, {}, {"2026-10"}, self.now)
+        self.assertTrue(all(len(i["body"]) <= 65536 for i in fake.issues.values()))
+
+    def test_excluded_records_do_not_take_the_refetch_slots(self):  # N2
+        olds = [{"key": "o/gone@%07x" % i, "repo": "o/gone", "kind": "fix", "sha": "%07x" % i, "date": "2026-08-01T00:00:00Z",
+                 "message": "fix", "verdict": "unjudged", "serious": False, "suspects": [1]} for i in range(lm.MAX_PER_RUN + 5)]
+        olds.append({"key": "o/r@abcde20", "repo": "o/r", "kind": "fix", "sha": "abcde20", "date": "2026-08-02T00:00:00Z",
+                     "message": "fix", "verdict": "unjudged", "serious": False, "suspects": [1]})
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month(olds, "2026-08")}])
+        lm.gh = fake
+        lm.collect = lambda owner, exclude: ([], [])
+        lm.run(lm.argparse.Namespace(owner="o", ledger="o/ledger", exclude="gone", dry_run=False))
+        self.assertTrue(any("abcde20" in c[-1] for c in fake.calls if c[0] == "api"))
+
+    def test_invalid_record_stops_failing_the_run_after_a_few_tries(self):  # N4
+        bad = {"key": "evil/x#1", "repo": "evil/x", "kind": "issue", "sha": "", "date": "2026-08-01T00:00:00Z",
+               "verdict": "unjudged", "serious": False, "suspects": [], "attempts": 3}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([bad], "2026-08")}])
+        self.assertEqual(self.go(fake, []), 0)
+
+    def test_refetch_errors_are_counted_exactly_max_times(self):  # N5
+        for att, want in [(2, 1), (3, 0)]:
+            old = {"key": "o/r@abcde21", "repo": "o/r", "kind": "fix", "sha": "abcde21", "date": "2026-08-01T00:00:00Z",
+                   "message": "fix", "verdict": "unjudged", "serious": False, "suspects": [1], "attempts": att}
+            fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
+            self.assertEqual(self.go(fake, []), want, att)
+
+    def test_crlf_marker_is_read(self):  # N6
+        self.assertEqual(lm.marked_keys([{"body": "x\r\n\r\n<!-- ai-review-leak:o/r@1 -->\r\n"}]), {"o/r@1"})
+
+    def test_reverts_of_another_repo_is_not_this_repos_pr(self):  # N7
+        prs = [pr(10, "2026-10-10T00:00:00Z", ["x.js"])]
+        c = commit("r9", "2026-10-15T00:00:00Z", 'Revert "x"\n\nReverts other/repo#10', ["src/a.js"])
+        self.assertEqual(lm.fix_candidates("o/r", [c], prs)[0]["suspects"], [])
+        c2 = commit("r8", "2026-10-15T00:00:00Z", 'Revert "x"\n\nReverts o/r#10', ["src/a.js"])
+        self.assertEqual([s["number"] for s in lm.fix_candidates("o/r", [c2], prs)[0]["suspects"]], [10])
+
+    def test_repo_list_is_not_cut_at_200(self):  # N3
+        calls = []
+
+        def gh(*args, input_text=None):
+            calls.append(args)
+            return "[]" if args[:2] == ("repo", "list") else "[[]]"
+        lm.gh = gh
+        lm.collect("o", set())
+        lim = [int(a[a.index("--limit") + 1]) for a in calls if a[:2] == ("repo", "list")][0]
+        self.assertGreaterEqual(lim, 1000)
+
+
+class Round3NCollect(Collect):
+    def test_direct_commit_whose_detail_fails_is_kept_unjudged(self):  # N8
+        r = self.base_routes([("f1", "fix: a")])
+        del r["repos/o/r/commits/f1?per_page=100"]
+        self.fake(r, fail=("repos/o/r/commits/f1?per_page",))
+        cands, errors = lm.collect("o", set())
+        self.assertEqual([c["key"] for c in cands], ["o/r@f1"])
+        self.assertIn("incomplete", cands[0])
+        self.assertTrue(errors)
+
+
 if __name__ == "__main__":
     unittest.main()
