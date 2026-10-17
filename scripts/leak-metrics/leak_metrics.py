@@ -50,8 +50,9 @@ SECRET_RE = re.compile(
 # 代入の形（password = "…"・"api_key": "…" など）は 2 段で確かめる: キーワードを探し、その直後の決まった長さだけを調べる
 # （1 つの正規表現で書くと、長い英数字の行で二乗の時間になる）
 SECRET_KEY_RE = re.compile(r"(?i)(password|passwd|secret|api[_-]?key|token|credential)")
-SECRET_VALUE_RE = re.compile(r"""[\w.-]{0,40}['"]?\s*[:=]\s*(['"][^'"\n]{8,200}['"]|(?=[A-Za-z0-9_\-/+=]{0,200}\d)[A-Za-z0-9_\-/+=]{16,200})""")
-SECRET_WINDOW = 300
+# 引用符の値は長さの上限を付けない（長い鍵も見逃さない）。引用符の無い値は、数字を含み、関数の呼び出しでないものだけ
+SECRET_VALUE_RE = re.compile(r"""[\w.-]{0,100}['"]?\s*[:=]\s*(['"][^'"\n]{8,}['"]|(?=[A-Za-z0-9_\-/+=]*\d)[A-Za-z0-9_\-/+=]{16,}(?![A-Za-z0-9_\-/+=])(?!\s*\())""")
+SECRET_KEYS_PER_LINE = 20  # 1 行の中で調べるキーワードの数（同じ行を何度も読み直して遅くならないように）
 SECRET_PATH_RE = re.compile(r"(^|/)(\.env[^/]*|[^/]*\.pem|[^/]*\.key|id_rsa[^/]*|id_ed25519[^/]*|credentials[^/]*|\.npmrc|\.netrc)$")
 # 差分の中のファイルのパスの行（空白を含むパスも、名前の変更の前後も見る）
 DIFF_PATH_LINE_RE = re.compile(r"(?m)^(?:diff --git |--- |\+\+\+ |rename (?:from|to) ).*$")
@@ -181,8 +182,16 @@ def needs_stage2(j):
 def secret_assignments(text):
     """代入の形の秘密情報の位置（始まり, 終わり）。引用符の無い値は数字を含むときだけ（関数名のような識別子を外す）"""
     t = str(text or "")
+    line_end, seen = -1, 0
     for m in SECRET_KEY_RE.finditer(t):
-        v = SECRET_VALUE_RE.match(t, m.end(), min(len(t), m.end() + SECRET_WINDOW))
+        if m.start() > line_end:  # 次の行に入った（行の終わりを覚えておき、探し直さない）
+            line_end = t.find("\n", m.start())
+            line_end = len(t) if line_end < 0 else line_end
+            seen = 0
+        seen += 1
+        if seen > SECRET_KEYS_PER_LINE:
+            continue
+        v = SECRET_VALUE_RE.match(t, m.end())
         if v:
             yield m.start(), v.end()
 

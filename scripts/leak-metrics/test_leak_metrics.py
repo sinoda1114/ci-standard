@@ -1297,6 +1297,8 @@ class SecretsRound2(unittest.TestCase):
         self.assertTrue(lm.has_secret("+  token = ab12cd34ef56gh78ij90"))
         self.assertTrue(lm.has_secret('+  "api_key": "abcdefgh12345678"'))
         self.assertNotIn("ab12cd34ef56gh78ij90", lm.redact("token = ab12cd34ef56gh78ij90"))
+        self.assertTrue(lm.has_secret('"api_key": "%s"' % ("k" * 202)))  # 長い値も見逃さない
+        self.assertFalse(lm.has_secret("+  token = getAuthorizationHeaderV2(request)"))  # 数字を含む関数名
 
 
 if __name__ == "__main__":
