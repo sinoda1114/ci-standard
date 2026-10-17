@@ -1413,6 +1413,44 @@ class Round4Collect(Collect):
         self.assertTrue(any("時間の上限" in e for e in errors))
         self.assertFalse([c for c in self.calls if "pulls/10/files" in " ".join(c)])
 
+    def test_real_gh_stops_after_the_deadline(self):  # どの経路の呼び出しも、期限を越えて続けない
+        saved = lm.subprocess.run
+        lm.subprocess.run = lambda *a, **k: self.fail("期限を越えて gh を呼んだ")
+        clock = iter([0])
+        saved_m = lm.monotonic
+        lm.monotonic = lambda: next(clock, 10 ** 6)
+        try:
+            with lm.time_budget(10):
+                with self.assertRaises(lm.TimeBudget):
+                    self.saved[0]("api", "x")
+        finally:
+            lm.subprocess.run, lm.monotonic = saved, saved_m
+        self.assertIsNone(lm._DEADLINE)
+
+    def test_rebuild_suspects_stops_at_the_deadline(self):
+        pages = {"n": 0}
+
+        def gh(*args, input_text=None):
+            pages["n"] += 1
+            if "repos/o/r/pulls?state=closed" in " ".join(args):
+                return json.dumps([{"number": i, "merged_at": "2026-10-15T00:00:00Z", "updated_at": "2026-10-19T00:00:00Z",
+                                    "title": "feat"} for i in range(50)])
+            if args[:2] == ("api", "repos/o/r"):
+                return json.dumps({"default_branch": "main"})
+            return "[[]]"
+        lm.gh = gh
+        clock = iter([0, 0, 0])
+        saved_m = lm.monotonic
+        lm.monotonic = lambda: next(clock, 10 ** 6)
+        lm._REPO_INFO.clear()
+        try:
+            with lm.time_budget(10):
+                with self.assertRaises(lm.TimeBudget):
+                    lm.rebuild_suspects("o/r", {"sha": "abcdef1", "date": "2026-10-18T00:00:00Z"}, ["a"], "fix: x")
+        finally:
+            lm.monotonic = saved_m
+        self.assertLess(pages["n"], 5)
+
     def test_gh_call_has_a_timeout(self):
         import subprocess
         saved = lm.subprocess.run
