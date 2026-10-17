@@ -7,7 +7,9 @@
 #   - e2e … playwright.config.* があればジョブごと実行（.github/ci-skip-e2e でオプトアウト可）
 #   - quality … Fallow（未使用コード/重複/複雑度）+ React Doctor（Reactアンチパターン）。
 #               既定 report-only/advisory、.github/fallow-strict を置くと両方が強制モードになる
-#   - package.json が無い場合（テンプレ直後の空リポジトリ）は全て skip して緑にする
+#   - workflow-lint … 呼び出し側のワークフローを jactionlint で検査。correctness の違反で ci / build を落とす
+#   - package.json が無い場合（テンプレ直後の空リポジトリ）は Node 用のステップを全て skip する
+#     （build ジョブ自体は走り、ワークフローの検査や detect が失敗すれば赤になる）
 #
 # リポジトリ固有のCI用環境変数（非シークレット）は .github/ci.env に KEY=VALUE で置く。
 #
