@@ -455,7 +455,9 @@ def recent_prs(repo, base, since):
     """閉じた PR を、更新日の新しい順にページごとに読み、ページの最後が since より古くなったら打ち切る
     （_paged は全履歴を読むので、履歴の多いリポジトリで毎日全部を取ってしまう）"""
     page = 1
-    while page <= 200:
+    while True:
+        if page > 200:  # 黙って打ち切らない（候補を欠いたまま進めない）
+            raise RuntimeError("閉じた PR が 200 ページを超えた（%s）" % repo)
         items = json.loads(gh("api", "repos/%s/pulls?state=closed&base=%s&sort=updated&direction=desc&per_page=50&page=%d"
                               % (repo, base, page)))
         items = [x for x in (items if isinstance(items, list) else []) if isinstance(x, dict)]
@@ -663,6 +665,9 @@ def refetch(stale, owner, exclude, errors):
                         pr_no = hit[0]["number"]
                 if pr_no:
                     pp = json.loads(gh("api", "repos/%s/pulls/%d" % (repo, pr_no)))
+                    if not pp.get("merged_at") or pp.get("merge_commit_sha") != r["sha"]:
+                        # 台帳の pr を信じない: マージされていて、マージのコミットが記録の SHA と同じ PR だけを取り直す
+                        raise RuntimeError("台帳の pr（#%s）が記録のコミットと合わない" % pr_no)
                     pf = [f["filename"] for f in _paged("repos/%s/pulls/%d/files?per_page=100" % (repo, pr_no))]
                     diff, why = suspect_diff(repo, {"number": pr_no, "files": pf})
                     if why:
@@ -691,12 +696,13 @@ def refetch(stale, owner, exclude, errors):
                 sus = []
                 for n in nums:
                     p = json.loads(gh("api", "repos/%s/pulls/%d" % (repo, n)))
-                    if target or target_pr:
-                        m = p.get("merged_at")
-                        if not (m and dt.timedelta(0) < _ts(r["date"]) - _ts(m) <= dt.timedelta(days=WINDOW_DAYS)):
-                            continue  # revert 元の PR が窓（直前 14 日）の外なら原因の候補にしない
-                        if ((p.get("base") or {}).get("ref") or info.get("default_branch")) != info.get("default_branch"):
-                            continue  # 既定ブランチ以外（release など）にマージされた PR は原因の候補にしない（collect とそろえる）
+                    # 台帳の suspects を信じない: collect と同じく、既定ブランチに、記録の日付の直前 14 日にマージされた PR だけ
+                    # （任意の未マージの PR の差分を AI に渡させない）
+                    m = p.get("merged_at")
+                    if not (m and dt.timedelta(0) < _ts(r["date"]) - _ts(m) <= dt.timedelta(days=WINDOW_DAYS)):
+                        continue
+                    if (p.get("base") or {}).get("ref") != info.get("default_branch"):
+                        continue
                     s_ = {"number": n, "title": p.get("title", ""),
                           "files": [f["filename"] for f in _paged("repos/%s/pulls/%d/files?per_page=100" % (repo, n))]}
                     s_["diff"], why = suspect_diff(repo, s_)

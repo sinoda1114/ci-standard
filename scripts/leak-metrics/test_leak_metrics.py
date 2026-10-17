@@ -376,7 +376,7 @@ class Run(unittest.TestCase):
                "message": "fix: x", "verdict": "unjudged", "serious": False, "suspects": [10], "attempts": 1}
         fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
         fake.api = {"api repos/o/r/commits/abcdef5/pulls": "[]", "api --paginate --slurp repos/o/r/commits/abcdef5?per_page=100": json.dumps([{"files": [{"patch": "+x"}]}]),
-                    "api repos/o/r/pulls/10": json.dumps({"title": "feat: y"}), "pr diff 10 -R o/r": "+y",
+                    "api repos/o/r/pulls/10": json.dumps({"title": "feat: y", "merged_at": "2026-07-25T00:00:00Z", "base": {"ref": "main"}}), "pr diff 10 -R o/r": "+y",
                     "api --paginate --slurp repos/o/r/pulls/10/files?per_page=100": json.dumps([[{"filename": "a"}]])}
         self.go(fake, [])
         self.assertEqual(len(self.judged), 1)
@@ -637,10 +637,10 @@ class RefetchPr(Run):
         old = {"key": "o/r@abcde15", "repo": "o/r", "kind": "fix", "sha": "abcde15", "date": "2026-08-01T00:00:00Z",
                "message": "fix: x", "verdict": "unjudged", "serious": False, "suspects": [10], "pr": 15}
         fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
-        fake.api = {"api repos/o/r/pulls/15": json.dumps({"title": "fix: x", "body": ""}),
+        fake.api = {"api repos/o/r/pulls/15": json.dumps({"title": "fix: x", "body": "", "merged_at": "2026-08-01T00:00:00Z", "merge_commit_sha": "abcde15"}),
                     "api --paginate --slurp repos/o/r/pulls/15/files?per_page=100": json.dumps([[{"filename": "a.js"}]]),
                     "pr diff 15 -R o/r": "+PR-WHOLE-DIFF",
-                    "api repos/o/r/pulls/10": json.dumps({"title": "feat: y"}),
+                    "api repos/o/r/pulls/10": json.dumps({"title": "feat: y", "merged_at": "2026-07-25T00:00:00Z", "base": {"ref": "main"}}),
                     "api --paginate --slurp repos/o/r/pulls/10/files?per_page=100": json.dumps([[{"filename": "a.js"}]]),
                     "pr diff 10 -R o/r": "+y"}
         lm.gh = fake
@@ -657,7 +657,7 @@ class Round3Lm(Run):
                "message": "fix: x", "verdict": "unjudged", "serious": False, "suspects": []}
         fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
         fake.api = {"api repos/o/r/commits/abcde16/pulls": json.dumps([{"number": 16, "merge_commit_sha": "abcde16"}]),
-                    "api repos/o/r/pulls/16": json.dumps({"title": "fix: x", "body": ""}),
+                    "api repos/o/r/pulls/16": json.dumps({"title": "fix: x", "body": "", "merged_at": "2026-08-01T00:00:00Z", "merge_commit_sha": "abcde16"}),
                     "api --paginate --slurp repos/o/r/pulls/16/files?per_page=100": json.dumps([[{"filename": "a.js"}]]),
                     "pr diff 16 -R o/r": "+WHOLE"}
         lm.gh = fake
@@ -726,7 +726,7 @@ class RefetchRevert(Run):
         fake.api = {"api repos/o/r/commits/abcdef8/pulls": "[]", "api --paginate --slurp repos/o/r/commits/abcdef8?per_page=100": json.dumps([{"commit": {"message": 'Revert "x"\n\nThis reverts commit 1234567.'},
                                                                  "files": [{"patch": "-x"}]}]),
                     "api repos/o/r/commits/1234567/pulls": json.dumps([{"number": 10}]),
-                    "api repos/o/r/pulls/10": json.dumps({"title": "feat: x", "merged_at": "2026-07-25T00:00:00Z"}),
+                    "api repos/o/r/pulls/10": json.dumps({"title": "feat: x", "merged_at": "2026-07-25T00:00:00Z", "base": {"ref": "main"}}),
                     "api --paginate --slurp repos/o/r/pulls/10/files?per_page=100": json.dumps([[{"filename": "src/big.js"}]])}
 
         def pr_diff(*args, input_text=None):
@@ -1022,7 +1022,7 @@ class RebuildSuspects(Run):
                     "api repos/o/r": json.dumps({"owner": {"login": "o"}, "archived": False, "default_branch": "main"}),
                     "api repos/o/r/pulls?state=closed&base=main&sort=updated&direction=desc&per_page=50&page=1": json.dumps([{"number": 10, "merged_at": "2026-08-05T00:00:00Z", "title": "feat: x"}]),
                     "api --paginate --slurp repos/o/r/pulls/10/files?per_page=100": json.dumps([[{"filename": "src/a.js"}]]),
-                    "api repos/o/r/pulls/10": json.dumps({"title": "feat: x"}),
+                    "api repos/o/r/pulls/10": json.dumps({"title": "feat: x", "merged_at": "2026-08-05T00:00:00Z", "base": {"ref": "main"}}),
                     "pr diff 10 -R o/r": "+x"}
         lm.gh = fake
         lm.collect = lambda owner, exclude, skip=frozenset(): ([], [])
@@ -1037,16 +1037,39 @@ class RebuildPr(Run):
         old = {"key": "o/r@abcde34", "repo": "o/r", "kind": "fix", "sha": "abcde34", "date": "2026-08-10T00:00:00Z",
                "message": "fix", "verdict": "unjudged", "serious": False, "suspects": [], "pr": 34, "rebuild_suspects": True}
         fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
-        fake.api = {"api repos/o/r/pulls/34": json.dumps({"title": "fix: a", "body": ""}),
+        fake.api = {"api repos/o/r/pulls/34": json.dumps({"title": "fix: a", "body": "", "merged_at": "2026-08-10T00:00:00Z", "merge_commit_sha": "abcde34"}),
                     "api --paginate --slurp repos/o/r/pulls/34/files?per_page=100": json.dumps([[{"filename": "src/a.js"}]]),
                     "pr diff 34 -R o/r": "-a",
                     "api repos/o/r/pulls?state=closed&base=main&sort=updated&direction=desc&per_page=50&page=1": json.dumps([{"number": 10, "merged_at": "2026-08-05T00:00:00Z", "title": "feat: x"}]),
                     "api --paginate --slurp repos/o/r/pulls/10/files?per_page=100": json.dumps([[{"filename": "src/a.js"}]]),
-                    "api repos/o/r/pulls/10": json.dumps({"title": "feat: x"}), "pr diff 10 -R o/r": "+x"}
+                    "api repos/o/r/pulls/10": json.dumps({"title": "feat: x", "merged_at": "2026-08-05T00:00:00Z", "base": {"ref": "main"}}), "pr diff 10 -R o/r": "+x"}
         lm.gh = fake
         lm.collect = lambda owner, exclude, skip=frozenset(): ([], [])
         lm.run(lm.argparse.Namespace(owner="o", ledger="o/ledger", exclude="", dry_run=False))
         self.assertEqual(fake.ledgers()["[漏れの記録] 2026-08"][0]["suspects"], [10])
+
+
+class RefetchTrust(Run):
+    """台帳の pr・suspects を信じない（P6 の直し直し）"""
+    def test_pr_number_that_does_not_match_the_commit_is_not_refetched(self):
+        old = {"key": "o/r@abcde35", "repo": "o/r", "kind": "fix", "sha": "abcde35", "date": "2026-08-01T00:00:00Z",
+               "message": "fix", "verdict": "unjudged", "serious": False, "suspects": [], "pr": 35}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
+        fake.api = {"api repos/o/r/pulls/35": json.dumps({"title": "feat: 未マージ", "body": "", "merged_at": None, "merge_commit_sha": "zzz"})}
+        self.go(fake, [])
+        self.assertFalse([c for c in fake.calls if c[0] == "pr"])
+        self.assertEqual(self.judged, [])
+
+    def test_unmerged_or_other_branch_suspects_are_not_sent(self):
+        old = {"key": "o/r@abcde36", "repo": "o/r", "kind": "fix", "sha": "abcde36", "date": "2026-08-01T00:00:00Z",
+               "message": "fix", "verdict": "unjudged", "serious": False, "suspects": [40, 41]}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
+        fake.api = {"api repos/o/r/commits/abcde36/pulls": "[]",
+                    "api --paginate --slurp repos/o/r/commits/abcde36?per_page=100": json.dumps([{"commit": {"message": "fix: x"}, "files": []}]),
+                    "api repos/o/r/pulls/40": json.dumps({"title": "secret draft", "merged_at": None}),
+                    "api repos/o/r/pulls/41": json.dumps({"title": "release", "merged_at": "2026-07-25T00:00:00Z", "base": {"ref": "release"}})}
+        self.go(fake, [])
+        self.assertFalse([c for c in fake.calls if c[0] == "pr"])  # どちらの差分も取らない（AI に渡さない）
 
 
 class Round3NCollect(Collect):
@@ -1081,7 +1104,7 @@ class FinalP(Run):
         fake.api = {"api repos/o/r": json.dumps({"owner": {"login": "o"}, "archived": False, "default_branch": "main"}),
                     "api repos/o/r/commits/abcde30/pulls": "[]",
                     "api --paginate --slurp repos/o/r/commits/abcde30?per_page=100": json.dumps([{"commit": {"message": "fix: x"}, "files": []}]),
-                    "api repos/o/r/pulls/10": json.dumps({"title": "t"}),
+                    "api repos/o/r/pulls/10": json.dumps({"title": "t", "merged_at": "2026-07-25T00:00:00Z", "base": {"ref": "main"}}),
                     "api --paginate --slurp repos/o/r/pulls/10/files?per_page=100": "[[]]", "pr diff 10 -R o/r": "+x"}
         self.replies = ["not json"]
         self.go(fake, [])
@@ -1136,7 +1159,7 @@ class FinalP(Run):
         fake2.api = {"api repos/o/r": json.dumps({"owner": {"login": "o"}, "archived": False, "default_branch": "main"}),
                      "api repos/o/r/commits/abcde33/pulls": "[]",
                      "api --paginate --slurp repos/o/r/commits/abcde33?per_page=100": json.dumps([{"commit": {"message": "fix: 本当の題名"}, "files": []}]),
-                     "api repos/o/r/pulls/10": json.dumps({"title": "t"}),
+                     "api repos/o/r/pulls/10": json.dumps({"title": "t", "merged_at": "2026-07-25T00:00:00Z", "base": {"ref": "main"}}),
                      "api --paginate --slurp repos/o/r/pulls/10/files?per_page=100": "[[]]", "pr diff 10 -R o/r": "+x"}
         self.prompts.clear()
         self.go(fake2, [])
