@@ -95,8 +95,10 @@ jobs:
             echo "has-e2e=false" >> "$GITHUB_OUTPUT"
           fi
 
-  # ワークフローの検査（jactionlint）。第三者のバイナリなので、build と切り離した専用のジョブで動かす
-  # （トークンを .git/config に残さず、install・ビルド・キャッシュとも同じジョブにしない）。
+  # ワークフローの検査（jactionlint）。第三者のバイナリなので、build と別の専用のジョブで動かす。
+  # 得られるのは「.git/config にトークンを残さない」「secrets を渡さない」「install・ビルドと同じジョブで動かない」まで。
+  # 同じ実行のランタイムトークン（キャッシュへの書き込みなど）からは切り離せないので、配布物そのものの正当性は
+  # 版とチェックサムの固定と、self-test の artifact attestation の照合で担保する。
   # 合否は build の最後のステップがこのジョブの結果を見て決めるので、必須チェック ci / build で止まる。
   #   - 判定: correctness（構文・式・needs などの誤り）だけで落とす。読めない式が 1 つあるとワークフローごと起動しないため
   #   - 助言: 既定プロファイル（SHA 固定・permissions などのセキュリティ・運用ルール）は警告の注釈を出すだけで落とさない
@@ -108,6 +110,8 @@ jobs:
   workflow-lint:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

@@ -99,7 +99,7 @@ scripts/sweep.sh                     # ローカルから全リポジトリ見�
    強制したいリポジトリだけ `.github/fallow-strict` を置くと**両方が同時に強制モード**になる。
    **新規PJは最初から置く**（負債が溜まる前なら通せるため）
 8. **ワークフローの検査（jactionlint）**: Node・Python の標準CIは、呼び出し側の `.github/workflows/`・composite action・`dependabot.yml` を
-   [jactionlint](https://github.com/jdx/jactionlint) で検査する。第三者のバイナリなので専用の `workflow-lint` ジョブ（トークンを残さない）で動かし、
+   [jactionlint](https://github.com/jdx/jactionlint) で検査する。第三者のバイナリなので専用の `workflow-lint` ジョブ（トークンを `.git/config` に残さず、secrets も渡さない）で動かし、
    合否は `ci / build` の最後のステップに反映する。
    - **落とすのは correctness の違反だけ**（構文・式・`needs:` などの誤り。読めない式が 1 つあるとワークフローごと起動しないため）
    - 既定プロファイルのセキュリティ・運用ルール（SHA 固定・`permissions:` など）は、PR に警告の注釈を出すだけで落とさない
@@ -108,6 +108,8 @@ scripts/sweep.sh                     # ローカルから全リポジトリ見�
      - その行だけ: 対象の行に `# jactionlint ignore=<規則ID>` を付ける
      - リポジトリ全体: `.github/jactionlint.yaml` に `rules:` → `<規則ID>: off` を書く
    - 版を上げるときは、上げる前に全リポジトリの既定ブランチで correctness が通ることを確かめる（手順は `self-test.yml` のコメント）
+   - 配布物は版とチェックサムで固定し、self-test が毎回 GitHub artifact attestation（jdx/jactionlint の CI でビルドされた証明）も照合する
+   - **セキュリティの関門ではない**: セキュリティ規則は警告止まりで、correctness も PR に抑止設定を足せば止められる。危ない変更はレビューで止める
 
 ## AIレビューボット（Cursor Bugbot / Amazon Q / Devin / Socket）
 

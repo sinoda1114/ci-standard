@@ -52,14 +52,19 @@ jobs:
         # node-ci.yml・python-ci.yml の版は、呼び出し側の全リポジトリの必須チェック ci / build に効く（呼び出しは @main）。
         # 新しい版で correctness の規則が増えることがあるので、上げる前に全リポジトリの既定ブランチで
         # `jactionlint --profile correctness --shellcheck= --pyflakes= --no-online` が通ることを確かめる。
+        # 配布元: jdx/jactionlint（mise の作者 jdx による actionlint のフォーク。MIT）。チェックサムの写しは
+        # 「その時点の配布物と同じ」しか保証しないので、固定したハッシュの配布物が jdx/jactionlint の CI で
+        # ビルドされたこと（GitHub artifact attestation）もここで毎回照合する。
         env:
           JACTIONLINT_VERSION: '2.2.0'
           JACTIONLINT_SHA256: 8137d5bfe266dd5e48d2af2306827785ce07c6988e04b1c3d6ad4776e97d27d2
           STANDARD_REPO: sinoda1114/ci-standard
+          GH_TOKEN: ${{ github.token }}
         run: |
           tarball="jactionlint_${JACTIONLINT_VERSION}_linux_amd64.tar.gz"
           curl --retry 3 --retry-all-errors -sSfL -o "$RUNNER_TEMP/$tarball" "https://github.com/jdx/jactionlint/releases/download/v${JACTIONLINT_VERSION}/${tarball}"
           echo "${JACTIONLINT_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          gh attestation verify "$RUNNER_TEMP/$tarball" --repo jdx/jactionlint
           tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" jactionlint
           lint() { "$RUNNER_TEMP/jactionlint" --no-hints --no-online --profile correctness --shellcheck= --pyflakes= "$@"; }
           lint
