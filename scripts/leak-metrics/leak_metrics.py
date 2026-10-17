@@ -35,6 +35,7 @@ SEVERITIES = ("critical", "high", "other")
 LEAK_VALUES = ("yes", "no", "unclear")
 FIX_RE = re.compile(r"^(fix|hotfix|revert)(\([^)]*\))?!?:|^Revert\b", re.I)
 REVERT_RE = re.compile(r"This reverts commit ([0-9a-f]{7,40})")
+REVERT_PR_RE = re.compile(r"^Reverts [\w.-]+/[\w.-]+#(\d+)\s*$", re.M)  # GitHub の Revert ボタンで作った PR の本文
 STATE_BEGIN = "<!-- leak-metrics-state"
 STATE_END = "leak-metrics-state -->"
 MAX_BODY_CHARS = 60000      # 台帳 Issue 1 本の本文の上限（GitHub の上限 65,536 文字より小さく取る）
@@ -54,6 +55,11 @@ def revert_target(msg):
     return m.group(1) if m else None
 
 
+def revert_pr_number(msg):
+    m = REVERT_PR_RE.search(msg or "")
+    return int(m.group(1)) if m else None
+
+
 def _ts(s):
     return dt.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
 
@@ -66,9 +72,14 @@ def fix_candidates(repo, commits, prs, revert_pr=None):
             continue
         when = _ts(c["date"])
         target = revert_target(c["message"])
-        kind = "revert" if target or c["message"].lower().startswith("revert") else "fix"
+        target_pr = revert_pr_number(c["message"])
+        kind = "revert" if target or target_pr or c["message"].lower().startswith("revert") else "fix"
         suspects, incomplete, known = [], c.get("incomplete", ""), False
-        if target and revert_pr:
+        if target_pr:  # 本文が「Reverts owner/repo#12」なら、元の PR の番号がそのまま分かる
+            known = True
+            suspects = [p for p in prs if p["number"] == target_pr and p.get("merged_at")
+                        and dt.timedelta(0) < when - _ts(p["merged_at"]) <= dt.timedelta(days=WINDOW_DAYS)]
+        elif target and revert_pr:
             try:
                 n = revert_pr(target)
                 known = True  # revert 元が分かった（PR が無いことが分かった場合も含む）
@@ -89,7 +100,8 @@ def fix_candidates(repo, commits, prs, revert_pr=None):
         suspects = [dict(p) for p in sorted(suspects, key=lambda p: p["merged_at"], reverse=True)[:MAX_SUSPECTS]]  # 候補ごとに別の写し
         out.append({"key": "%s@%s" % (repo, c["sha"]), "repo": repo, "kind": kind, "sha": c["sha"],
                     "date": c["date"], "message": c["message"].splitlines()[0][:200],
-                    "diff": c.get("diff", ""), "suspects": suspects, **({"incomplete": incomplete} if incomplete else {})})
+                    "diff": c.get("diff", ""), "suspects": suspects, **({"incomplete": incomplete} if incomplete else {}),
+                    **({"pr": c["pr"]} if c.get("pr") else {})})
     return out
 
 
@@ -164,6 +176,8 @@ def build_prompt(c):
 
 def base_record(c, why=""):
     rec = {k: c.get(k) for k in ("key", "repo", "kind", "sha", "date", "message")}
+    if c.get("pr"):
+        rec["pr"] = c["pr"]  # 修正の PR の候補（取り直しで PR 全体の差分を取るため）
     rec["suspects"] = [s["number"] for s in c["suspects"]]
     rec.update({"verdict": "unjudged", "serious": False, "severity": None, "security": None,
                 "caused_by_pr": None, "rationale": why, "models": []})
@@ -300,7 +314,7 @@ def valid_shape(r):
         return False
     types = {"repo": str, "kind": str, "sha": str, "date": str, "message": str, "verdict": str, "rationale": str,
              "month": str, "severity": str, "is_leak": str, "serious": bool, "notified": bool, "security": bool,
-             "attempts": int, "part": int, "caused_by_pr": int, "suspects": list, "models": list}
+             "attempts": int, "part": int, "pr": int, "caused_by_pr": int, "suspects": list, "models": list}
     for k, t in types.items():
         v = r.get(k)
         if v is not None and not (isinstance(v, t) and not (t is int and isinstance(v, bool))):
@@ -459,43 +473,40 @@ def collect(owner, exclude):
             for p in _paged("repos/%s/pulls?state=closed&base=%s&sort=updated&direction=desc&per_page=50" % (name, branch)):
                 if p.get("merged_at") and _ts(p["merged_at"]) >= since_pr:
                     files = [f["filename"] for f in _paged("repos/%s/pulls/%d/files?per_page=100" % (name, p["number"]))]
-                    prs.append({"number": p["number"], "merged_at": p["merged_at"], "title": p["title"], "files": files})
-            commits, pr_level = [], {}
+                    prs.append({"number": p["number"], "merged_at": p["merged_at"], "title": p["title"], "files": files,
+                                "merge_commit_sha": p.get("merge_commit_sha"), "body": p.get("body") or ""})
+            nowz = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+            commits = []
+            # 修正の PR: 窓の中でマージされ、題名が fix・revert の PR を 1 つの候補にする（squash・マージコミット・リベースの
+            # どれで入っても同じ。中のコミットのメッセージには頼らない）。差分は PR 全体、キーはマージのコミット
+            for p in prs:
+                if not (p.get("merge_commit_sha") and is_fix_message(p["title"]) and _ts(p["merged_at"]) >= now - dt.timedelta(days=WINDOW_DAYS)):
+                    continue
+                pdiff, why = suspect_diff(name, {"number": p["number"], "files": p["files"]})
+                commits.append({"sha": p["merge_commit_sha"], "date": min(p["merged_at"], nowz),
+                                "message": p["title"] + "\n\n" + p["body"], "files": p["files"], "prs": [p["number"]],
+                                "diff": pdiff, "pr": p["number"], **({"incomplete": why} if why else {})})
+            pr_shas = {c["sha"] for c in commits}
+            # 直接 push された fix・revert のコミット（PR に属するコミットは、上の修正の PR の候補が受け持つ。
+            # 題名が fix でない PR の途中の直しは、候補にしない）
             for c in _paged("repos/%s/commits?sha=%s&since=%s&per_page=100" % (name, branch, since_fix)):
                 msg = c["commit"]["message"]
-                if not is_fix_message(msg):
+                if c["sha"] in pr_shas or not is_fix_message(msg):
                     continue
                 try:  # 1 件の取得の失敗で、リポジトリの残りの候補を落とさない
+                    own_prs = json.loads(gh("api", "repos/%s/commits/%s/pulls" % (name, c["sha"])))
+                    if own_prs:
+                        continue
                     # 変更ファイルは 300 件ごとにページが分かれるので、全ページを読む
                     files_all = [f for page in _paged("repos/%s/commits/%s?per_page=100" % (name, c["sha"]))
                                  for f in (page.get("files") or [] if isinstance(page, dict) else [])]
-                    own_prs = json.loads(gh("api", "repos/%s/commits/%s/pulls" % (name, c["sha"])))
                 except Exception as e:
                     errors.append("%s@%s: %s" % (name, c["sha"][:7], str(e)[:200]))
                     continue
-                own = [p["number"] for p in own_prs]
-                date = min(c["commit"]["committer"]["date"], now.strftime("%Y-%m-%dT%H:%M:%SZ"))  # 未来の日時は今に丸める
-                if own_prs and c["sha"] not in {p.get("merge_commit_sha") for p in own_prs}:
-                    # PR の中のコミット（マージコミット方式・リベースで既定ブランチに入った）。直しの単位は PR にする:
-                    # PR の題名が fix なら PR を 1 つの候補に、そうでなければ（機能の PR の途中の直し）候補にしない
-                    p0 = own_prs[0]
-                    n0 = p0.get("number")
-                    if type(n0) is int and is_fix_message(p0.get("title") or "") and n0 not in pr_level:
-                        try:
-                            pf = [f["filename"] for f in _paged("repos/%s/pulls/%d/files?per_page=100" % (name, n0))]
-                        except Exception as e:
-                            errors.append("%s#%d: %s" % (name, n0, str(e)[:200]))
-                            continue
-                        pdiff, why = suspect_diff(name, {"number": n0, "files": pf})
-                        pr_level[n0] = {"sha": p0.get("merge_commit_sha") or c["sha"], "message": p0["title"],
-                                        "date": min(p0.get("merged_at") or date, now.strftime("%Y-%m-%dT%H:%M:%SZ")),
-                                        "files": pf, "prs": [n0], "diff": pdiff, **({"incomplete": why} if why else {})}
-                    continue
+                date = min(c["commit"]["committer"]["date"], nowz)  # 未来の日時は今に丸める
                 commits.append({"sha": c["sha"], "date": date, "message": msg,
-                                "files": [f["filename"] for f in files_all], "prs": own,
+                                "files": [f["filename"] for f in files_all], "prs": [],
                                 "diff": "\n".join(f.get("patch", "") for f in files_all)})
-
-            commits += list(pr_level.values())
 
             def revert_pr(sha, name=name):
                 ps = json.loads(gh("api", "repos/%s/commits/%s/pulls" % (name, sha)))
@@ -568,24 +579,35 @@ def refetch(stale, owner, exclude, errors):
                 sus = [{"number": n, "title": json.loads(gh("api", "repos/%s/pulls/%d" % (repo, n)))["title"], "diff": ""}
                        for n in r["suspects"]]
             else:
-                # 通常の集め方（collect・fix_candidates）とそろえる: 変更ファイルは全ページ、revert は元の PR だけを窓の中で
-                pages = [x for x in _paged("repos/%s/commits/%s?per_page=100" % (repo, r["sha"])) if isinstance(x, dict)]
-                d = pages[0] if pages else {}
-                diff = "\n".join(f.get("patch", "") for x in pages for f in x.get("files") or [])
+                # 通常の集め方（collect・fix_candidates）とそろえる: 修正の PR は PR 全体の差分、コミットは変更ファイルの全ページ、
+                # revert は元の PR だけを窓の中で
                 nums = list(r["suspects"])
-                own_prs = json.loads(gh("api", "repos/%s/commits/%s/pulls" % (repo, r["sha"])))
-                if own_prs and r["sha"] not in {p.get("merge_commit_sha") for p in own_prs}:
-                    # PR の中で直したコミット（collect と同じく候補にしない）。台帳では判定済み扱いにして取り直しを止める
-                    out.append({k: r.get(k) for k in ("key", "repo", "kind", "sha", "date", "message")} | {"diff": "", "suspects": []})
-                    continue
-                target = revert_target((d.get("commit") or {}).get("message", ""))
-                if target:  # revert は元の PR を探し直す（前回は取得に失敗して、ファイルの重なりで代えていたかもしれない）
+                if r.get("pr"):
+                    pp = json.loads(gh("api", "repos/%s/pulls/%d" % (repo, r["pr"])))
+                    pf = [f["filename"] for f in _paged("repos/%s/pulls/%d/files?per_page=100" % (repo, r["pr"]))]
+                    diff, why = suspect_diff(repo, {"number": r["pr"], "files": pf})
+                    if why:
+                        raise RuntimeError(why)
+                    msg = (pp.get("title") or "") + "\n\n" + (pp.get("body") or "")
+                else:
+                    own_prs = json.loads(gh("api", "repos/%s/commits/%s/pulls" % (repo, r["sha"])))
+                    if own_prs and r["sha"] not in {p.get("merge_commit_sha") for p in own_prs}:
+                        # PR の中のコミット（collect と同じく候補にしない）。台帳では判定済み扱いにして取り直しを止める
+                        out.append({k: r.get(k) for k in ("key", "repo", "kind", "sha", "date", "message")} | {"diff": "", "suspects": []})
+                        continue
+                    pages = [x for x in _paged("repos/%s/commits/%s?per_page=100" % (repo, r["sha"])) if isinstance(x, dict)]
+                    diff = "\n".join(f.get("patch", "") for x in pages for f in x.get("files") or [])
+                    msg = ((pages[0] if pages else {}).get("commit") or {}).get("message", "")
+                target, target_pr = revert_target(msg), revert_pr_number(msg)
+                if target_pr:
+                    nums = [target_pr]
+                elif target:  # revert は元の PR を探し直す（前回は取得に失敗して、ファイルの重なりで代えていたかもしれない）
                     ps = json.loads(gh("api", "repos/%s/commits/%s/pulls" % (repo, target)))
                     nums = [ps[0]["number"]] if ps and type(ps[0].get("number")) is int else []
                 sus = []
                 for n in nums:
                     p = json.loads(gh("api", "repos/%s/pulls/%d" % (repo, n)))
-                    if target:
+                    if target or target_pr:
                         m = p.get("merged_at")
                         if not (m and dt.timedelta(0) < _ts(r["date"]) - _ts(m) <= dt.timedelta(days=WINDOW_DAYS)):
                             continue  # revert 元の PR が窓（直前 14 日）の外なら原因の候補にしない
@@ -600,7 +622,8 @@ def refetch(stale, owner, exclude, errors):
                 errors.append("%s: 取り直しに失敗: %s" % (r["key"], str(e)[:200]))
             failed.append(r["key"])
             continue
-        out.append({k: r.get(k) for k in ("key", "repo", "kind", "sha", "date", "message")} | {"diff": diff, "suspects": sus})
+        out.append({k: r.get(k) for k in ("key", "repo", "kind", "sha", "date", "message", "pr") if r.get(k) is not None}
+                   | {"diff": diff, "suspects": sus})
     return out, failed
 
 

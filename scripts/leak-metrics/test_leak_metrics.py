@@ -408,7 +408,7 @@ class Run(unittest.TestCase):
         self.assertEqual(len(tried), lm.MAX_PER_RUN)
         fake.calls.clear()
         self.go(fake, [])
-        asked = {c[-1].split("/commits/")[1].split("?")[0] for c in fake.calls if c[0] == "api" and "/commits/" in c[-1]}
+        asked = {c[-1].split("/commits/")[1].split("?")[0].split("/")[0] for c in fake.calls if c[0] == "api" and "/commits/" in c[-1]}
         self.assertTrue({k.split("@")[1] for k in {r["key"] for r in olds} - tried} <= asked)
 
     def test_many_serious_records_stay_within_body_limit(self):
@@ -627,6 +627,24 @@ class Round2Lm(Run):
         self.assertEqual(self.judged, [])
 
 
+class RefetchPr(Run):
+    def test_refetched_fix_pr_uses_the_whole_pr_diff(self):
+        old = {"key": "o/r@abcde15", "repo": "o/r", "kind": "fix", "sha": "abcde15", "date": "2026-08-01T00:00:00Z",
+               "message": "fix: x", "verdict": "unjudged", "serious": False, "suspects": [10], "pr": 15}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
+        fake.api = {"api repos/o/r/pulls/15": json.dumps({"title": "fix: x", "body": ""}),
+                    "api --paginate --slurp repos/o/r/pulls/15/files?per_page=100": json.dumps([[{"filename": "a.js"}]]),
+                    "pr diff 15 -R o/r": "+PR-WHOLE-DIFF",
+                    "api repos/o/r/pulls/10": json.dumps({"title": "feat: y"}),
+                    "api --paginate --slurp repos/o/r/pulls/10/files?per_page=100": json.dumps([[{"filename": "a.js"}]]),
+                    "pr diff 10 -R o/r": "+y"}
+        lm.gh = fake
+        lm.collect = lambda owner, exclude: ([], [])
+        lm.run(lm.argparse.Namespace(owner="o", ledger="o/ledger", exclude="", dry_run=False))
+        self.assertEqual(fake.ledgers()["[漏れの記録] 2026-08"][0]["verdict"], "judged")
+        self.assertTrue(any("PR-WHOLE-DIFF" in p for p in self.prompts))
+
+
 class Round2b(Run):
     def test_rejudged_record_is_not_lost_and_moves_only_backward(self):
         mk = lambda i, v: {"key": "o/r@%07x" % i, "repo": "o/r", "kind": "fix", "sha": "%07x" % i,
@@ -724,8 +742,8 @@ class Collect(unittest.TestCase):
 
     PR10 = {"number": 10, "merged_at": "2026-10-15T00:00:00Z", "title": "feat: x", "merge_commit_sha": "m10"}
 
-    def base_routes(self, commits, detail_pages=None, pulls_of=None):
-        r = {"repos/o/r/pulls?state=closed": [[self.PR10]],
+    def base_routes(self, commits, detail_pages=None, pulls_of=None, more_prs=()):
+        r = {"repos/o/r/pulls?state=closed": [[self.PR10] + list(more_prs)],
              "repos/o/r/pulls/10/files": [[{"filename": "src/a.js"}]],
              "repos/o/r/commits?sha=main": [[{"sha": c, "commit": {"message": m, "committer": {"date": "2026-10-18T00:00:00Z"}}}
                                             for c, m in commits]],
@@ -750,14 +768,27 @@ class Collect(unittest.TestCase):
     def test_fix_commit_inside_a_feature_pr_is_not_a_candidate(self):
         pulls = {"f2": [{"number": 11, "merge_commit_sha": "m11", "title": "feat: 新機能", "merged_at": "2026-10-18T00:00:00Z"}],
                  "m11": [{"number": 11, "merge_commit_sha": "m11", "title": "fix: PR の squash", "merged_at": "2026-10-18T00:00:00Z"}]}
-        self.fake(self.base_routes([("f2", "fix: レビュー中の直し"), ("m11", "fix: PR の squash")], pulls_of=pulls))
+        p11 = {"number": 11, "merged_at": "2026-10-18T00:00:00Z", "title": "feat: 新機能", "merge_commit_sha": "m11"}
+        r = self.base_routes([("f2", "fix: レビュー中の直し"), ("m11", "Merge pull request #11")], pulls_of=pulls, more_prs=[p11])
+        r["repos/o/r/pulls/11/files"] = [[{"filename": "src/a.js"}]]
+        self.fake(r)
         cands, _ = lm.collect("o", set())
-        self.assertEqual([c["key"] for c in cands], ["o/r@m11"])
+        self.assertEqual(cands, [])  # 機能の PR の途中の直しは候補にしない
+
+    def test_squashed_fix_pr_is_one_candidate(self):
+        p13 = {"number": 13, "merged_at": "2026-10-18T00:00:00Z", "title": "fix: PR の squash", "merge_commit_sha": "m13"}
+        r = self.base_routes([("m13", "fix: PR の squash")], pulls_of={"m13": [p13]}, more_prs=[p13])
+        r["repos/o/r/pulls/13/files"] = [[{"filename": "src/a.js"}]]
+        r["pr diff 13"] = "+fix"
+        self.fake(r)
+        cands, _ = lm.collect("o", set())
+        self.assertEqual([c["key"] for c in cands], ["o/r@m13"])
+        self.assertEqual(cands[0]["pr"], 13)
 
     def test_fix_pr_merged_with_a_merge_commit_is_one_candidate(self):
         p12 = {"number": 12, "merge_commit_sha": "m12", "title": "fix: a を直す", "merged_at": "2026-10-18T00:00:00Z"}
         pulls = {"c1": [p12], "c2": [p12]}
-        r = self.base_routes([("c1", "fix: a の 1"), ("c2", "fix: a の 2")], pulls_of=pulls)
+        r = self.base_routes([("c1", "address review"), ("c2", "fix: a の 2")], pulls_of=pulls, more_prs=[p12])  # 中のコミットが fix で始まらなくてもよい
         r["repos/o/r/pulls/12/files"] = [[{"filename": "src/a.js"}]]
         r["pr diff 12"] = "-a\n+b"
         self.fake(r)
@@ -778,6 +809,17 @@ class Collect(unittest.TestCase):
         cands, errors = lm.collect("o", set())
         self.assertIn("incomplete", cands[0])
         self.assertEqual(len(errors), 1)
+
+    def test_revert_pr_body_points_to_original_pr(self):
+        p14 = {"number": 14, "merged_at": "2026-10-18T00:00:00Z", "title": 'Revert "feat: x"', "merge_commit_sha": "m14",
+               "body": "Reverts o/r#10"}
+        r = self.base_routes([], more_prs=[p14])
+        r["repos/o/r/pulls/14/files"] = [[{"filename": "src/a.js"}]]
+        r["pr diff 14"] = "-x"
+        self.fake(r)
+        cands, _ = lm.collect("o", set())
+        self.assertEqual(cands[0]["kind"], "revert")
+        self.assertEqual([s["number"] for s in cands[0]["suspects"]], [10])
 
     def test_branch_name_is_url_encoded(self):
         def gh(*args, input_text=None):
