@@ -1291,14 +1291,105 @@ class SecretsRound2(unittest.TestCase):
             lm.redact(s)
             self.assertLess(time.monotonic() - t0, 1.0, s[:10])
 
-    def test_identifiers_are_not_secrets_but_keys_are(self):  # C3
-        self.assertFalse(lm.has_secret("+  token = getAuthorizationHeader(request)"))
-        self.assertFalse(lm.has_secret("+  password = passwordFromEnvironment"))
+    def test_any_keyword_assignment_is_a_secret(self):  # C3 を置き換え: 疑わしければ送らない（ユーザーの判断 2026-10-17）
+        self.assertTrue(lm.has_secret("+  token = getAuthorizationHeader(request)"))
+        self.assertTrue(lm.has_secret("+  password = passwordFromEnvironment"))
         self.assertTrue(lm.has_secret("+  token = ab12cd34ef56gh78ij90"))
         self.assertTrue(lm.has_secret('+  "api_key": "abcdefgh12345678"'))
+        self.assertTrue(lm.has_secret('"api_key" : "%s"' % ("k" * 202)))
+        self.assertTrue(lm.has_secret("$config['db_password'] => 'x'"))
         self.assertNotIn("ab12cd34ef56gh78ij90", lm.redact("token = ab12cd34ef56gh78ij90"))
-        self.assertTrue(lm.has_secret('"api_key": "%s"' % ("k" * 202)))  # 長い値も見逃さない
-        self.assertFalse(lm.has_secret("+  token = getAuthorizationHeaderV2(request)"))  # 数字を含む関数名
+        # キーワードの直後に代入が無いものは秘密情報と見なさない
+        self.assertFalse(lm.has_secret("+  // refresh the token before it expires"))
+        self.assertFalse(lm.has_secret("+  tokens.push(tokenize(line))"))
+
+
+class SecretsRound3(unittest.TestCase):
+    """最後の全体のレビュー（HEAD 1780b64）の指摘 D1〜D4・D8"""
+    def test_keyword_after_many_keywords_on_one_line_is_found(self):  # D1
+        line = "+ " + " token" * 25 + ' password = "abcdefgh12345678"'
+        self.assertTrue(lm.has_secret(line))
+
+    def test_title_cut_at_200_chars_is_checked_in_full(self):  # D2
+        title = "fix: " + "x" * 190 + " token=abcdefgh12345678"
+        c = lm.fix_candidates("o/r", [commit("abcdef1", "2026-10-10T00:00:00Z", title, ["a"])],
+                              [pr(10, "2026-10-05T00:00:00Z", ["a"])])[0]
+        self.assertLessEqual(len(c["message"]), 200)
+        out = lm.judge(c, api=lambda m, p: self.fail("送った"), has_key=True)
+        self.assertEqual(out["verdict"], "secret")
+        i = lm.issue_candidates("o/r", [{"number": 5, "created_at": "2026-10-10T00:00:00Z", "title": title, "body": ""}],
+                                [pr(10, "2026-10-05T00:00:00Z", ["a"])])[0]
+        self.assertEqual(lm.judge(i, api=lambda m, p: self.fail("送った"), has_key=True)["verdict"], "secret")
+
+    def test_mixed_quotes_in_value_are_found(self):  # D3
+        self.assertTrue(lm.has_secret("""+  password = "abc'defghijk" """))
+        self.assertTrue(lm.has_secret("""+  secret: 'ab"cdefghijk'"""))
+
+    def test_pgp_private_key_is_found(self):  # D4
+        self.assertTrue(lm.has_secret("+-----BEGIN PGP PRIVATE KEY BLOCK-----"))
+
+    def test_too_long_to_check_is_treated_as_secret(self):  # 調べきれないものも送らない
+        self.assertTrue(lm.has_secret("a" * (lm.MAX_SECRET_SCAN_CHARS + 1)))
+
+    def test_redact_keeps_text_after_overlapping_spans(self):  # D8
+        out = lm.redact('password="token=abcdefgh12345678" tail text')
+        self.assertIn("tail text", out)
+        self.assertNotIn("abcdefgh12345678", out)
+
+    def test_whitespace_after_keyword_is_fast(self):
+        import time
+        for s in ("token" + " " * 200000 + "x", ("token" + " " * 50) * 4000):
+            t0 = time.monotonic()
+            lm.has_secret(s)
+            self.assertLess(time.monotonic() - t0, 1.0)
+
+
+class Round4Lm(Run):
+    """最後の全体のレビュー（HEAD 1780b64）の指摘 D5〜D7"""
+    def test_refetched_pr_must_have_a_fix_title(self):  # D6
+        old = {"key": "o/r@abcde16", "repo": "o/r", "kind": "fix", "sha": "abcde16", "date": "2026-08-01T00:00:00Z",
+               "message": "fix: x", "verdict": "unjudged", "serious": False, "suspects": [10], "pr": 16}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
+        fake.api = {"api repos/o/r/pulls/16": json.dumps({"title": "feat: 新機能", "body": "", "merged_at": "2026-08-01T00:00:00Z",
+                                                          "merge_commit_sha": "abcde16", "base": {"ref": "main"}}),
+                    "api --paginate --slurp repos/o/r/pulls/16/files?per_page=100": json.dumps([[{"filename": "a.js"}]]),
+                    "pr diff 16 -R o/r": "+feature"}
+        self.go(fake, [])
+        self.assertFalse([c for c in fake.calls if c[0] == "pr"])
+        self.assertEqual(self.judged, [])
+
+    def test_owner_match_ignores_case(self):  # D7
+        r = {"repo": "O/r", "kind": "fix", "sha": "abcdef1", "key": "O/r@abcdef1", "suspects": [10]}
+        self.assertTrue(lm.valid_record(r, "o", set()))
+
+    def test_refetch_stops_at_its_time_budget(self):  # D5
+        old = {"key": "o/r@abcde17", "repo": "o/r", "kind": "fix", "sha": "abcde17", "date": "2026-08-01T00:00:00Z",
+               "message": "fix: x", "verdict": "unjudged", "serious": False, "suspects": [10], "pr": 17}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
+        saved = lm.monotonic
+        clock = iter([0, 0])
+        lm.monotonic = lambda: next(clock, 10 ** 6)
+        try:
+            self.go(fake, [])
+        finally:
+            lm.monotonic = saved
+        self.assertFalse([c for c in fake.calls if c[:2] == ("api", "repos/o/r/pulls/17")])
+        rec = fake.ledgers()["[漏れの記録] 2026-08"][0]
+        self.assertFalse(rec.get("refetch_failures"))  # 時間で見送った分は、取り直しの失敗に数えない
+
+
+class Round4Collect(Collect):
+    def test_collect_stops_at_its_time_budget(self):  # D5
+        self.fake(self.base_routes([]))
+        saved = lm.monotonic
+        clock = iter([0])
+        lm.monotonic = lambda: next(clock, 10 ** 6)
+        try:
+            cands, errors = lm.collect("o", set())
+        finally:
+            lm.monotonic = saved
+        self.assertEqual(cands, [])
+        self.assertTrue(any("時間の上限" in e for e in errors))
 
 
 if __name__ == "__main__":

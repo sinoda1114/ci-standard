@@ -29,6 +29,8 @@ MAX_PER_RUN = 60            # 1 回の実行で判定する上限（料金の上
 MAX_REPOS = 1000            # 集めるリポジトリの上限（超えたら取得失敗として知らせる）
 MAX_REFETCH_ERRORS = 3      # 取り直しの失敗を「取得失敗」に数える回数（以後は数えずに取り直しだけ続ける。毎日赤くし続けない）
 MAX_JUDGE_SECONDS = 20 * 60  # 判定に使う時間の上限。job の timeout-minutes（30）より前に保存まで終える
+MAX_COLLECT_SECONDS = 10 * 60  # 集める処理の時間の上限（残りのリポジトリは見送り、取得の失敗に数える）
+MAX_REFETCH_SECONDS = 5 * 60   # 取り直しの時間の上限（残りは台帳に未判定のまま残し、次回に回す）
 MAX_PROMPT_CHARS = 60000    # 1 件の判定に渡すプロンプトの上限（文字）
 MAX_FIX_DIFF_CHARS = 25000  # そのうち修正の差分に使う分。残りを原因の候補で分ける（候補の節が切り詰めで消えないように）
 MAX_SUSPECTS = 5
@@ -39,7 +41,7 @@ REVERT_RE = re.compile(r"This reverts commit ([0-9a-f]{7,40})")
 REVERT_PR_RE = re.compile(r"^Reverts ([\w.-]+/[\w.-]+)#(\d+)\s*$", re.M)  # GitHub の Revert ボタンで作った PR の本文
 # 外部の API に送る前に伏せる秘密情報（scripts/pr-triage/triage.py と同じ）
 SECRET_RE = re.compile(
-    r"(-----BEGIN [A-Z ]*PRIVATE KEY-----"
+    r"(-----BEGIN [A-Z ]*PRIVATE KEY"                     # PEM・PGP（PRIVATE KEY BLOCK）
     r"|AKIA[0-9A-Z]{16}"                                  # AWS access key
     r"|AIza[0-9A-Za-z_\-]{35}"                            # Google API key
     r"|sk-[A-Za-z0-9_\-]{20,}"                            # OpenAI 系
@@ -49,6 +51,11 @@ SECRET_RE = re.compile(
     r")")
 # 代入の形（password = "…"・"api_key": "…" など）は 2 段で確かめる: キーワードを探し、その直後の決まった長さだけを調べる
 # （1 つの正規表現で書くと、長い英数字の行で二乗の時間になる）
+# 送るかどうかの判定（has_secret）は、値の形を見ない。キーワードの直後に : か = があれば、疑わしいので送らない
+# （値の書き方の抜け道をふさぎきれないため。ユーザーの判断 2026-10-17）
+SECRET_ASSIGN_RE = re.compile(r"""[\w.-]{0,100}['"]?\]?[ \t]*[:=]""")  # config["password"] = … の ] も許す
+MAX_SECRET_SCAN_CHARS = 2000000  # これより長い文字列は調べきらずに、秘密情報を含むものとして扱う
+# 伏せる（redact）ときは、値の形まで見て範囲を決める
 SECRET_KEY_RE = re.compile(r"(?i)(password|passwd|secret|api[_-]?key|token|credential)")
 # 引用符の値は長さの上限を付けない（長い鍵も見逃さない）。引用符の無い値は、数字を含み、関数の呼び出しでないものだけ
 SECRET_VALUE_RE = re.compile(r"""[\w.-]{0,100}['"]?\s*[:=]\s*(['"][^'"\n]{8,}['"]|(?=[A-Za-z0-9_\-/+=]*\d)[A-Za-z0-9_\-/+=]{16,}(?![A-Za-z0-9_\-/+=])(?!\s*\())""")
@@ -122,7 +129,8 @@ def fix_candidates(repo, commits, prs, revert_pr=None):
                     suspects.append(p)
         suspects = [dict(p) for p in sorted(suspects, key=lambda p: p["merged_at"], reverse=True)[:MAX_SUSPECTS]]  # 候補ごとに別の写し
         out.append({"key": "%s@%s" % (repo, c["sha"]), "repo": repo, "kind": kind, "sha": c["sha"], "files": list(c.get("files") or []),
-                    "date": c["date"], "message": c["message"].splitlines()[0][:200],
+                    "date": c["date"], "message": first_line(c["message"])[:200],
+                    "message_full": first_line(c["message"]),  # 秘密情報は、切る前の 1 行目の全文で確かめる
                     "diff": c.get("diff", ""), "suspects": suspects, **({"incomplete": incomplete} if incomplete else {}),
                     **({"pr": c["pr"]} if c.get("pr") else {}),
                     **({"rebuild_suspects": True} if c.get("rebuild_suspects") else {})})
@@ -138,7 +146,7 @@ def issue_candidates(repo, issues, prs):
                and dt.timedelta(0) < when - _ts(p["merged_at"]) <= dt.timedelta(days=WINDOW_DAYS)]
         sus = sorted(sus, key=lambda p: p["merged_at"], reverse=True)[:MAX_SUSPECTS]
         out.append({"key": "%s#%d" % (repo, i["number"]), "repo": repo, "kind": "issue", "sha": "",
-                    "date": i["created_at"], "message": i["title"][:200],
+                    "date": i["created_at"], "message": i["title"][:200], "message_full": i["title"],
                     "diff": i.get("body") or "",  # 切らずに持つ（秘密情報は全文で確かめ、プロンプトを作るときにだけ切る）
                     "suspects": [{"number": p["number"], "title": p["title"], "diff": ""} for p in sus]})
     return out
@@ -205,7 +213,12 @@ def redact(text):
             part = part.split("\n", 1)[0] + "\n（秘密情報のファイルなので、差分は送らない）\n"
         out.append(part)
     t = SECRET_RE.sub("（秘密情報を伏せた）", "".join(out))
-    spans = list(secret_assignments(t))
+    spans = []
+    for a, b in sorted(secret_assignments(t)):  # 重なる範囲はまとめる（後ろから置き換えたときに、位置がずれないように）
+        if spans and a <= spans[-1][1]:
+            spans[-1] = (spans[-1][0], max(spans[-1][1], b))
+        else:
+            spans.append((a, b))
     for a, b in reversed(spans):
         t = t[:a] + "（秘密情報を伏せた）" + t[b:]
     return t
@@ -225,12 +238,22 @@ def commit_diff(entries):
 
 
 def has_secret(text):
-    """秘密情報のファイル（.env・鍵など。名前の変更の前後・空白を含むパスも）か、秘密情報の形を含むか"""
+    """秘密情報のファイル（.env・鍵など。名前の変更の前後・空白を含むパスも）か、秘密情報の形か、
+    キーワードへの代入（値の形は問わない）を含むか。長すぎて調べきれないものも、含むものとして扱う"""
     t = str(text or "")
+    if len(t) > MAX_SECRET_SCAN_CHARS:
+        return True
     for m in DIFF_PATH_LINE_RE.finditer(t):
         if SECRET_NAME_RE.search(m.group(0)):
             return True
-    return bool(SECRET_RE.search(t)) or next(secret_assignments(t), None) is not None
+    if SECRET_RE.search(t):
+        return True
+    return any(SECRET_ASSIGN_RE.match(t, m.end()) for m in SECRET_KEY_RE.finditer(t))
+
+
+def first_line(text):
+    lines = str(text or "").splitlines()
+    return lines[0] if lines else ""
 
 
 def secret_files(files):
@@ -288,7 +311,7 @@ def judge(c, api, has_key):
         rec["verdict"] = "no-suspect"
         return rec
     # 秘密情報を見つけたら、伏せて送るのではなく、送らない（正規表現で伏せきることはできないため。判定はしないで確定する）
-    if (secret_files(c.get("files")) or has_secret(c.get("diff")) or has_secret(c.get("message"))
+    if (secret_files(c.get("files")) or has_secret(c.get("diff")) or has_secret(c.get("message_full", c.get("message")))
             or any(secret_files(s.get("files")) or has_secret(s.get("diff")) or has_secret(s.get("title")) for s in c["suspects"])):
         rec["verdict"] = "secret"
         rec["rationale"] = "差分に秘密情報（のファイル・形）を含むので、AI に送らずに判定しない"
@@ -584,9 +607,13 @@ def collect(owner, exclude, skip=frozenset()):
     repos = json.loads(gh("repo", "list", owner, "--limit", str(MAX_REPOS), "--no-archived", "--source",
                           "--json", "nameWithOwner,defaultBranchRef"))
     cands, errors = [], []
+    started = monotonic()
     if len(repos) >= MAX_REPOS:  # 上限で黙って打ち切らない
         errors.append("リポジトリが %d 件以上あり、一覧を打ち切った（MAX_REPOS を上げる）" % MAX_REPOS)
-    for r in repos:
+    for k, r in enumerate(repos):
+        if monotonic() - started > MAX_COLLECT_SECONDS:  # 黙って打ち切らない（窓を出た候補は二度と集まらない）
+            errors.append("時間の上限で、残りの %d リポジトリを見送った" % (len(repos) - k))
+            break
         name = r["nameWithOwner"]
         if name.split("/")[1] in exclude or not r.get("defaultBranchRef"):
             continue
@@ -676,7 +703,7 @@ def collect(owner, exclude, skip=frozenset()):
 def valid_record(r, owner, exclude):
     """台帳の記録を、取り直しの前に確かめる（台帳は人が編集できるので、取得先を記録の値に任せない）"""
     repo = r.get("repo")
-    if not isinstance(repo, str) or not re.fullmatch(r"%s/[A-Za-z0-9._-]+" % re.escape(owner), repo) \
+    if not isinstance(repo, str) or not re.fullmatch(r"%s/[A-Za-z0-9._-]+" % re.escape(owner), repo, re.I) \
             or repo.split("/")[1] in (".", ".."):
         return False
     if repo.split("/")[1] in exclude:
@@ -725,7 +752,10 @@ def refetch(stale, owner, exclude, errors):
     _REPO_INFO.clear()
     # 後から除外したリポジトリの記録は、上限を当てる前に除く（取り直さず、取得失敗にも数えない。記録はそのまま残す）
     live = [r for r in stale if not (isinstance(r.get("repo"), str) and r["repo"].split("/")[-1] in exclude)]
+    started = monotonic() if live else 0
     for r in sorted(live, key=lambda r: (int(r.get("attempts") or 0), r.get("date") or ""))[:MAX_PER_RUN]:
+        if monotonic() - started > MAX_REFETCH_SECONDS:
+            break  # 残りは台帳に未判定のまま残す（試した回数にも、取り直しの失敗にも数えない）
         # 取り直しの失敗を取得失敗に数えるのは、取り直しの失敗の最初の MAX_REFETCH_ERRORS 回だけ
         # （attempts は判定の失敗でも増えるので、取り直しの失敗は refetch_failures で別に数える）
         counts = int(r.get("refetch_failures") or 0) < MAX_REFETCH_ERRORS
@@ -774,6 +804,8 @@ def refetch(stale, owner, exclude, errors):
                             or (pp.get("base") or {}).get("ref", info.get("default_branch")) != info.get("default_branch")):
                         # 台帳の pr を信じない: マージされていて、マージのコミットが記録の SHA と同じ PR だけを取り直す
                         raise RuntimeError("台帳の pr（#%s）が記録のコミットと合わない" % pr_no)
+                    if not is_fix_message(pp.get("title")):  # collect と同じく、題名が fix・revert の PR だけ
+                        raise RuntimeError("台帳の pr（#%s）の題名が fix・revert ではない" % pr_no)
                     pf = file_names(_paged("repos/%s/pulls/%d/files?per_page=100" % (repo, pr_no)))
                     rec_files = pf
                     diff, why = suspect_diff(repo, {"number": pr_no, "files": pf})
@@ -831,7 +863,7 @@ def refetch(stale, owner, exclude, errors):
             continue
         # プロンプトに入る message は、台帳の値ではなく取り直したコミット・PR・Issue のもの（台帳を書き換えて判定を誘導させない）
         out.append({k: r.get(k) for k in ("key", "repo", "kind", "sha", "date", "pr") if r.get(k) is not None}
-                   | {"message": (fetched_msg or "").splitlines()[0][:200] if fetched_msg else "", "diff": diff, "suspects": sus,
+                   | {"message": first_line(fetched_msg)[:200], "message_full": first_line(fetched_msg), "diff": diff, "suspects": sus,
                       "files": rec_files})
     return out, failed
 
