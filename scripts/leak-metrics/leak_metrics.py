@@ -18,6 +18,7 @@ import os
 import re
 import subprocess
 import sys
+import urllib.parse
 import urllib.request
 
 WINDOW_DAYS = 14
@@ -63,14 +64,17 @@ def fix_candidates(repo, commits, prs, revert_pr=None):
         when = _ts(c["date"])
         target = revert_target(c["message"])
         kind = "revert" if target or c["message"].lower().startswith("revert") else "fix"
-        suspects, incomplete = [], ""
+        suspects, incomplete, known = [], "", False
         if target and revert_pr:
             try:
                 n = revert_pr(target)
+                known = True  # revert 元が分かった（PR が無いことが分かった場合も含む）
             except Exception as e:  # 取れなければ、この候補だけを次回に回す（リポジトリ全体を落とさない）
                 n, incomplete = None, "revert 元の PR を取得できない: %s" % str(e)[:150]
-            suspects = [p for p in prs if p["number"] == n]
-        if not suspects:
+            # 原因の候補は revert 元の PR だけ。窓（直前 14 日）の外や一覧に無いなら候補なし（ファイルの重なりで付け替えない）
+            suspects = [p for p in prs if p["number"] == n and p.get("merged_at")
+                        and dt.timedelta(0) < when - _ts(p["merged_at"]) <= dt.timedelta(days=WINDOW_DAYS)]
+        if not suspects and not known:
             files = set(c.get("files") or [])
             own = set(c.get("prs") or [])
             for p in prs:
@@ -442,7 +446,7 @@ def collect(owner, exclude):
         name = r["nameWithOwner"]
         if name.split("/")[1] in exclude or not r.get("defaultBranchRef"):
             continue
-        branch = r["defaultBranchRef"]["name"]
+        branch = urllib.parse.quote(r["defaultBranchRef"]["name"], safe="")  # API のパスに入れるので & # + % を逃がす
         try:
             prs = []
             for p in _paged("repos/%s/pulls?state=closed&base=%s&sort=updated&direction=desc&per_page=50" % (name, branch)):
@@ -455,15 +459,20 @@ def collect(owner, exclude):
                 if not is_fix_message(msg):
                     continue
                 try:  # 1 件の取得の失敗で、リポジトリの残りの候補を落とさない
-                    detail = json.loads(gh("api", "repos/%s/commits/%s" % (name, c["sha"])))
-                    own = [p["number"] for p in json.loads(gh("api", "repos/%s/commits/%s/pulls" % (name, c["sha"])))]
+                    # 変更ファイルは 300 件ごとにページが分かれるので、全ページを読む
+                    files_all = [f for page in _paged("repos/%s/commits/%s?per_page=100" % (name, c["sha"]))
+                                 for f in (page.get("files") or [] if isinstance(page, dict) else [])]
+                    own_prs = json.loads(gh("api", "repos/%s/commits/%s/pulls" % (name, c["sha"])))
                 except Exception as e:
                     errors.append("%s@%s: %s" % (name, c["sha"][:7], str(e)[:200]))
                     continue
+                own = [p["number"] for p in own_prs]
+                if own_prs and c["sha"] not in {p.get("merge_commit_sha") for p in own_prs}:
+                    continue  # PR の中で直したコミット（マージコミット方式で既定ブランチに入った）。マージ後の直しではない
                 date = min(c["commit"]["committer"]["date"], now.strftime("%Y-%m-%dT%H:%M:%SZ"))  # 未来の日時は今に丸める
                 commits.append({"sha": c["sha"], "date": date, "message": msg,
-                                "files": [f["filename"] for f in detail.get("files", [])], "prs": own,
-                                "diff": "\n".join(f.get("patch", "") for f in detail.get("files", []))})
+                                "files": [f["filename"] for f in files_all], "prs": own,
+                                "diff": "\n".join(f.get("patch", "") for f in files_all)})
 
             def revert_pr(sha, name=name):
                 ps = json.loads(gh("api", "repos/%s/commits/%s/pulls" % (name, sha)))
@@ -477,8 +486,13 @@ def collect(owner, exclude):
                     s["diff"], why = diffs[s["number"]]
                     if why:
                         c["incomplete"] = why
-            issues = [i for i in _paged("repos/%s/issues?state=all&labels=type:fix&since=%s&per_page=100" % (name, since_fix))
-                      if "pull_request" not in i and _ts(i["created_at"]) >= now - dt.timedelta(days=WINDOW_DAYS)]
+            try:  # Issue を無効にしたリポジトリ（HTTP 410）などで失敗しても、修正コミットの候補は残す
+                issues = [i for i in _paged("repos/%s/issues?state=all&labels=type:fix&since=%s&per_page=100" % (name, since_fix))
+                          if "pull_request" not in i and _ts(i["created_at"]) >= now - dt.timedelta(days=WINDOW_DAYS)]
+            except Exception as e:
+                if "HTTP 410" not in str(e):
+                    errors.append("%s: Issue を取得できない: %s" % (name, str(e)[:200]))
+                issues = []
             cands += fc + issue_candidates(name, issues, prs)
         except Exception as e:  # 1 リポジトリの失敗で全体を止めない。失敗は記録に出す
             if "HTTP 409" in str(e):  # 空のリポジトリ（コミットが無い）は対象外

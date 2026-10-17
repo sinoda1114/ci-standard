@@ -641,5 +641,97 @@ class RefetchRevert(Run):
         self.assertTrue(any("src/big.js" in p for p in self.prompts))
 
 
+class Collect(unittest.TestCase):
+    """collect() を偽の gh で通す（1 周目の /ai-review の指摘 L2・L3・L4・L7・L10）"""
+    NOW = lm.dt.datetime(2026, 10, 20, tzinfo=lm.dt.timezone.utc)
+
+    def setUp(self):
+        self.saved = (lm.gh, lm.utcnow)
+        lm.utcnow = lambda: self.NOW
+        self.calls = []
+
+    def tearDown(self):
+        lm.gh, lm.utcnow = self.saved
+
+    def fake(self, routes, fail=()):
+        def gh(*args, input_text=None):
+            self.calls.append(args)
+            key = " ".join(args)
+            for f in fail:
+                if f in key:
+                    raise RuntimeError("gh api %s: HTTP 410" % f)
+            if args[:2] == ("repo", "list"):
+                return json.dumps([{"nameWithOwner": "o/r", "defaultBranchRef": {"name": "main"}}])
+            for k, v in routes.items():
+                if k in key:
+                    return v if isinstance(v, str) else json.dumps(v)
+            if "--paginate" in args:
+                return "[[]]"
+            raise RuntimeError("gh %s: HTTP 404" % key)
+        lm.gh = gh
+
+    PR10 = {"number": 10, "merged_at": "2026-10-15T00:00:00Z", "title": "feat: x", "merge_commit_sha": "m10"}
+
+    def base_routes(self, commits, detail_pages=None, pulls_of=None):
+        r = {"repos/o/r/pulls?state=closed": [[self.PR10]],
+             "repos/o/r/pulls/10/files": [[{"filename": "src/a.js"}]],
+             "repos/o/r/commits?sha=main": [[{"sha": c, "commit": {"message": m, "committer": {"date": "2026-10-18T00:00:00Z"}}}
+                                            for c, m in commits]],
+             "pr diff 10": "+x"}
+        for c, _ in commits:
+            r["repos/o/r/commits/%s?per_page=100" % c] = detail_pages or [{"files": [{"filename": "src/a.js", "patch": "-a"}]}]
+            r["repos/o/r/commits/%s/pulls" % c] = (pulls_of or {}).get(c, [])
+        return r
+
+    def test_commit_files_are_read_from_every_page(self):
+        pages = [{"files": [{"filename": "z%d.js" % i} for i in range(300)]}, {"files": [{"filename": "src/a.js", "patch": "-a"}]}]
+        self.fake(self.base_routes([("f1", "fix: a")], detail_pages=pages))
+        cands, _ = lm.collect("o", set())
+        self.assertEqual([s["number"] for s in cands[0]["suspects"]], [10])
+
+    def test_issue_fetch_failure_keeps_fix_candidates(self):
+        self.fake(self.base_routes([("f1", "fix: a")]), fail=("repos/o/r/issues",))
+        cands, errors = lm.collect("o", set())
+        self.assertEqual([c["key"] for c in cands], ["o/r@f1"])
+        self.assertEqual(errors, [])  # Issue を無効にしたリポジトリ（410）は失敗に数えない
+
+    def test_fix_commit_inside_a_merged_pr_is_not_a_candidate(self):
+        pulls = {"f2": [{"number": 11, "merge_commit_sha": "m11"}], "m11": [{"number": 11, "merge_commit_sha": "m11"}]}
+        self.fake(self.base_routes([("f2", "fix: レビュー中の直し"), ("m11", "fix: PR の squash")], pulls_of=pulls))
+        cands, _ = lm.collect("o", set())
+        self.assertEqual([c["key"] for c in cands], ["o/r@m11"])
+
+    def test_branch_name_is_url_encoded(self):
+        def gh(*args, input_text=None):
+            self.calls.append(args)
+            if args[:2] == ("repo", "list"):
+                return json.dumps([{"nameWithOwner": "o/r", "defaultBranchRef": {"name": "rel#1+a"}}])
+            return "[[]]"
+        lm.gh = gh
+        lm.collect("o", set())
+        paths = [a[3] for a in self.calls if a[:2] == ("api", "--paginate")]
+        self.assertTrue(paths and all("rel#1+a" not in p for p in paths))
+        self.assertTrue(any("rel%231%2Ba" in p for p in paths))
+
+
+class RevertWindow(unittest.TestCase):
+    PRS = [pr(10, "2026-10-01T00:00:00Z", ["src/a.js"]), pr(12, "2026-10-08T00:00:00Z", ["src/a.js"])]
+
+    def test_revert_of_pr_outside_window_has_no_suspect_and_no_fallback(self):
+        c = commit("r1", "2026-10-20T00:00:00Z", 'Revert "x"\n\nThis reverts commit abcdef1.', ["src/a.js"])
+        out = lm.fix_candidates("o/r", [c], self.PRS, revert_pr=lambda sha: 10)  # 元の PR は 19 日前
+        self.assertEqual(out[0]["suspects"], [])
+
+    def test_revert_of_pr_not_in_list_has_no_fallback(self):
+        c = commit("r2", "2026-10-15T00:00:00Z", 'Revert "x"\n\nThis reverts commit abcdef1.', ["src/a.js"])
+        out = lm.fix_candidates("o/r", [c], self.PRS, revert_pr=lambda sha: 99)  # 元の PR は一覧より古い
+        self.assertEqual(out[0]["suspects"], [])
+
+    def test_revert_of_pr_inside_window_points_to_it(self):
+        c = commit("r3", "2026-10-15T00:00:00Z", 'Revert "x"\n\nThis reverts commit abcdef1.', ["src/a.js"])
+        out = lm.fix_candidates("o/r", [c], self.PRS, revert_pr=lambda sha: 12)
+        self.assertEqual([s["number"] for s in out[0]["suspects"]], [12])
+
+
 if __name__ == "__main__":
     unittest.main()
