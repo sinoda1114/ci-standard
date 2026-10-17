@@ -13,6 +13,11 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # jactionlint の版とチェックサム（出所の照合・文法の検査・配布するジョブ本体の実行で共有する）。
+    # node-ci.yml・python-ci.yml にも同じ値があり、scripts/check-jactionlint-pins.sh が揃っているかを見る。
+    env:
+      JACTIONLINT_VERSION: '2.2.0'
+      JACTIONLINT_SHA256: 8137d5bfe266dd5e48d2af2306827785ce07c6988e04b1c3d6ad4776e97d27d2
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -35,36 +40,37 @@ jobs:
       - name: jactionlint の版とチェックサムが揃っているか
         run: bash scripts/check-jactionlint-pins.sh
 
+      - name: jactionlint の配布物の出所を照合
+        # 配布元: jdx/jactionlint（mise の作者 jdx による actionlint のフォーク。MIT）。チェックサムの写しは
+        # 「その時点の配布物と同じ」しか保証しないので、固定したハッシュの配布物が jdx/jactionlint の CI で
+        # ビルドされたこと（GitHub artifact attestation）も毎回照合する。
+        # このジョブで jactionlint を一度でも動かすより前に、別のステップで行う（先に動いた不正な配布物が
+        # GITHUB_PATH で gh を差し替えると照合を偽装できる。トークンもこのステップの環境にしか置かない）。
+        # 版を上げるときは、https://github.com/jdx/jactionlint/releases の jactionlint_<版>_checksums.txt から
+        # linux_amd64.tar.gz の行の値を JACTIONLINT_SHA256 に写す（ジョブの env）。
+        # node-ci.yml・python-ci.yml の版は、呼び出し側の全リポジトリの必須チェック ci / build に効く（呼び出しは @main）。
+        # 新しい版で correctness の規則が増えることがあるので、上げる前に全リポジトリの既定ブランチで
+        # `jactionlint --profile correctness --shellcheck= --pyflakes= --no-online` が通ることを確かめる。
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tarball="jactionlint_${JACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl --retry 3 --retry-all-errors -sSfL -o "$RUNNER_TEMP/$tarball" "https://github.com/jdx/jactionlint/releases/download/v${JACTIONLINT_VERSION}/${tarball}"
+          echo "${JACTIONLINT_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          gh attestation verify "$RUNNER_TEMP/$tarball" --repo jdx/jactionlint
+
       - name: ワークフローの文法と式の検査（jactionlint）
         # run: の中の ${{ … }} も Actions の式として評価される。読めない式が 1 つあると、ワークフロー全体が起動しない。
         # 2026-10-04 に、判定スクリプトの f-string の ${{…}} で node-ci.yml を全リポジトリで止めかけた再発防止。
         # 対象: このリポジトリのワークフロー（.yml・.yaml を jactionlint が自動で探す）、配布するテンプレート、
         #       sweep.sh がヒアドキュメントで組み立てて全リポジトリに配る ci.yml（node・python の両方）。
         # correctness プロファイル（actionlint 相当の検査）で判定する。shellcheck と pyflakes の検査は対象外にしている
-        # （目的はワークフローの文法と式）。
-        # 版を上げるときは、https://github.com/jdx/jactionlint/releases の jactionlint_<版>_checksums.txt から
-        # linux_amd64.tar.gz の行の値を JACTIONLINT_SHA256 に写す（取得物を照合してから実行するため）。
-        # node-ci.yml・python-ci.yml にも同じ値があり、scripts/check-jactionlint-pins.sh が揃っているかを見る。
-        # node-ci.yml・python-ci.yml の版は、呼び出し側の全リポジトリの必須チェック ci / build に効く（呼び出しは @main）。
-        # 新しい版で correctness の規則が増えることがあるので、上げる前に全リポジトリの既定ブランチで
-        # `jactionlint --profile correctness --shellcheck= --pyflakes= --no-online` が通ることを確かめる。
-        # 配布元: jdx/jactionlint（mise の作者 jdx による actionlint のフォーク。MIT）。チェックサムの写しは
-        # 「その時点の配布物と同じ」しか保証しないので、固定したハッシュの配布物が jdx/jactionlint の CI で
-        # ビルドされたこと（GitHub artifact attestation）もここで毎回照合する。
-        # 照合は、このジョブで jactionlint を一度でも動かすより前に行う（先に動いた不正な配布物が GITHUB_PATH で
-        # gh を差し替えると照合を偽装できるため）。そのためこのステップは、配布するジョブ本体を動かすステップより前に置く。
-        # トークンは照合にだけ使い、jactionlint を動かす前に消す。
+        # （目的はワークフローの文法と式）。配布物は前のステップで照合したものを、もう一度ハッシュを確かめて使う。
         env:
-          JACTIONLINT_VERSION: '2.2.0'
-          JACTIONLINT_SHA256: 8137d5bfe266dd5e48d2af2306827785ce07c6988e04b1c3d6ad4776e97d27d2
           STANDARD_REPO: sinoda1114/ci-standard
-          ATTESTATION_TOKEN: ${{ github.token }}
         run: |
           tarball="jactionlint_${JACTIONLINT_VERSION}_linux_amd64.tar.gz"
-          curl --retry 3 --retry-all-errors -sSfL -o "$RUNNER_TEMP/$tarball" "https://github.com/jdx/jactionlint/releases/download/v${JACTIONLINT_VERSION}/${tarball}"
           echo "${JACTIONLINT_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
-          GH_TOKEN="$ATTESTATION_TOKEN" gh attestation verify "$RUNNER_TEMP/$tarball" --repo jdx/jactionlint
-          unset ATTESTATION_TOKEN
           tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" jactionlint
           lint() { "$RUNNER_TEMP/jactionlint" --no-hints --no-online --profile correctness --shellcheck= --pyflakes= "$@"; }
           lint

@@ -7,10 +7,12 @@ node-ci.yml・python-ci.yml の workflow-lint ジョブは、呼び出し側の�
   2. build が workflow-lint の結果で落ちる配線（needs・!cancelled()・最後の結果のステップ）があること
   3. このリポジトリ（correctness の違反なし）で終了コード 0
   4. 標準 CI を @main で呼ぶ見本で終了コード 0、SHA 固定の警告も助言の実行の失敗も出ないこと
-  5. run: に読めない式を書いた見本のリポジトリで終了コード 1
-使い方: python3 scripts/run-workflow-lint-step.py（GitHub Actions の上で。RUNNER_TEMP と curl・sha256sum を使う）
+     （陽性対照として、除外の --ignore を外すとその警告が出ることも確かめる）
+  5. run: に読めない式を書いた見本のリポジトリで、判定の実行が undefined variable で終了コード 1
+使い方: python3 scripts/run-workflow-lint-step.py（GitHub Actions の上で。curl・sha256sum を使う。RUNNER_TEMP は実行ごとに作る）
 """
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -29,6 +31,10 @@ jobs:
   ci:
     uses: sinoda1114/ci-standard/.github/workflows/node-ci.yml@main
 """
+IGNORE_OPTION = """--ignore 'reusable workflow call "sinoda1114/ci-standard/[^"]*@main" must be pinned'"""
+PINNED_WARNING = re.compile(r'reusable workflow call "sinoda1114/ci-standard/[^"]*@main" must be pinned')
+# 判定の実行（text 形式）の行。助言の実行の出力は ::warning で始まるので、これには当たらない
+JUDGMENT_UNDEFINED_X = re.compile(r'^\.github/workflows/ci\.yml:\d+:\d+: undefined variable "x"', re.MULTILINE)
 BROKEN_WORKFLOW = """on: push
 jobs:
   t:
@@ -105,11 +111,17 @@ def main():
     if rc != 0:
         sys.exit("::error::違反の無いこのリポジトリで workflow-lint のステップが失敗した")
 
+    if script.count(IGNORE_OPTION) != 1:
+        sys.exit("::error::workflow-lint のステップに、標準 CI の呼び出しを外す --ignore がちょうど 1 つ無い")
     with tempfile.TemporaryDirectory() as caller:
         make_repo(caller, CALLER_WORKFLOW)
+        # 陽性対照: 除外を外すと SHA 固定の警告が実際に出る（出ないなら、下の否定の確認は何も確かめていない）
+        _, control = run_step(env_vars, script.replace(IGNORE_OPTION, ""), caller)
         rc, out = run_step(env_vars, script, caller)
-    print(f"標準 CI を @main で呼ぶ見本: 終了コード {rc}（期待 0）")
-    if rc != 0 or "must be pinned" in out or "助言の実行が失敗" in out:
+    if not PINNED_WARNING.search(control):
+        sys.exit("::error::除外を外しても SHA 固定の警告が出ない（jactionlint の文言が変わった可能性。--ignore を見直す）")
+    print(f"標準 CI を @main で呼ぶ見本: 終了コード {rc}（期待 0）。除外を外すと警告が出ることも確認")
+    if rc != 0 or PINNED_WARNING.search(out) or "助言の実行が失敗" in out:
         sys.exit("::error::標準 CI の呼び出し（@main）で、失敗・SHA 固定の警告・助言の実行の失敗のどれかが出た")
 
     with tempfile.TemporaryDirectory() as broken:
@@ -117,7 +129,7 @@ def main():
         rc, out = run_step(env_vars, script, broken)
     print(f"壊れた見本: 終了コード {rc}（期待 1）")
     # 失敗の理由も見る（別の理由で 1 になっていても気付けるように）
-    if rc != 1 or 'undefined variable "x"' not in out:
+    if rc != 1 or not JUDGMENT_UNDEFINED_X.search(out):
         sys.exit("::error::読めない式のある見本で、workflow-lint のステップが undefined variable で終了コード 1 にならなかった")
     print("workflow-lint のステップは期待どおり")
 
