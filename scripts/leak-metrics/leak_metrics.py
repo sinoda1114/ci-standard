@@ -50,6 +50,8 @@ SECRET_RE = re.compile(
     r"|(?i:['\"]?[\w.-]*(password|passwd|secret|api[_-]?key|token|credential)[\w.-]*['\"]?\s*[:=]\s*(['\"][^'\"]{8,}['\"]|[A-Za-z0-9_\-/+=]{16,}))"
     r")")
 SECRET_PATH_RE = re.compile(r"(^|/)(\.env[^/]*|[^/]*\.pem|[^/]*\.key|id_rsa[^/]*|id_ed25519[^/]*|credentials[^/]*|\.npmrc|\.netrc)$")
+# 差分の中のファイルのパスの行（空白を含むパスも、名前の変更の前後も見る）
+DIFF_PATH_LINE_RE = re.compile(r"(?m)^(?:diff --git a/(.*) b/(.*)|--- a/(.*)|\+\+\+ b/(.*)|rename (?:from|to) (.*))$")
 STATE_BEGIN = "<!-- leak-metrics-state"
 STATE_END = "leak-metrics-state -->"
 MAX_BODY_CHARS = 60000      # 台帳 Issue 1 本の本文の上限（GitHub の上限 65,536 文字より小さく取る）
@@ -183,13 +185,25 @@ def redact(text):
 
 
 def commit_diff(entries):
-    """コミットの変更ファイルの patch を、ファイルごとに diff --git の見出しを付けて連結する（redact が秘密情報のファイルを見分けられるように）"""
+    """コミットの変更ファイルの patch を、ファイルごとに diff --git の見出しを付けて連結する。名前を変えたファイルは
+    変更前のパスも見出しに入れる（秘密情報のファイルを見分けられるように）"""
     parts = []
     for f in entries or []:
         if isinstance(f, dict):
             name = f.get("filename") or ""
-            parts.append("diff --git a/%s b/%s\n%s" % (name, name, f.get("patch", "")))
+            old = f.get("previous_filename") or name
+            head = "diff --git a/%s b/%s\n" % (old, name) + ("rename from %s\nrename to %s\n" % (old, name) if old != name else "")
+            parts.append(head + f.get("patch", ""))
     return "\n".join(parts)
+
+
+def has_secret(text):
+    """秘密情報のファイル（.env・鍵など。名前の変更の前後・空白を含むパスも）か、秘密情報の形を含むか"""
+    t = str(text or "")
+    for m in DIFF_PATH_LINE_RE.finditer(t):
+        if any(g and SECRET_PATH_RE.search(g.strip()) for g in m.groups()):
+            return True
+    return bool(SECRET_RE.search(t))
 
 
 def file_names(entries):
@@ -240,6 +254,12 @@ def judge(c, api, has_key):
         return rec
     if not c["suspects"]:
         rec["verdict"] = "no-suspect"
+        return rec
+    # 秘密情報を見つけたら、伏せて送るのではなく、送らない（正規表現で伏せきることはできないため。判定はしないで確定する）
+    if has_secret(c.get("diff")) or has_secret(c.get("message")) or any(
+            has_secret(s.get("diff")) or has_secret(s.get("title")) for s in c["suspects"]):
+        rec["verdict"] = "secret"
+        rec["rationale"] = "差分に秘密情報（のファイル・形）を含むので、AI に送らずに判定しない"
         return rec
     if not has_key:
         rec["rationale"] = "API キーが無い"
@@ -373,7 +393,7 @@ def valid_shape(r):
 
 
 def pending(candidates, known):
-    done = {r["key"] for r in known if r.get("verdict") in ("judged", "no-suspect")}
+    done = {r["key"] for r in known if r.get("verdict") in ("judged", "no-suspect", "secret")}
     return [c for c in candidates if c["key"] not in done]
 
 
@@ -415,7 +435,7 @@ def load_ledger(issues):
     同じ月・同じ番の Issue が 2 本あっても（過去の重複）、両方の記録を読む（判定済みを優先）。
     戻り値: (key → 記録, 月 → {番: Issue 番号}) 。読めない台帳があれば LedgerError"""
     recs, slots = {}, {}
-    rank = {"judged": 0, "no-suspect": 0, "unjudged": 1}
+    rank = {"judged": 0, "no-suspect": 0, "secret": 0, "unjudged": 1}
     for i in sorted(issues, key=lambda i: i["number"]):
         m = LEDGER_TITLE_RE.match(i.get("title") or "")
         if not m:
@@ -866,7 +886,7 @@ def run(a):
         return 1
     exclude = set(a.exclude.split(",")) | {a.ledger.split("/")[1]}
     known, slots = load_ledger(list_issues(a.ledger))  # 読めない台帳があれば止める（上書きで消さない）
-    done = {k for k, r in known.items() if r.get("verdict") in ("judged", "no-suspect")}
+    done = {k for k, r in known.items() if r.get("verdict") in ("judged", "no-suspect", "secret")}
     cands, errors = collect(a.owner, exclude, done)
     stale = [r for r in known.values() if r.get("verdict") == "unjudged" and r["key"] not in {c["key"] for c in cands}]
     again, failed = refetch(stale, a.owner, exclude, errors)  # 窓から外れた未判定も判定し直す

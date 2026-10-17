@@ -1232,5 +1232,38 @@ class RefetchPrBranch(Run):
         self.assertEqual(self.judged, [])
 
 
+class SecretsNotSent(unittest.TestCase):
+    """秘密情報を見つけたら AI に送らない（ユーザーの判断 A、2026-10-17）"""
+    CAND = {"key": "o/r@s1", "repo": "o/r", "kind": "fix", "sha": "s1", "message": "fix: x", "diff": "-a\n+b",
+            "suspects": [{"number": 10, "title": "feat: x", "diff": "+a"}]}
+
+    def judge(self, **kw):
+        sent = []
+        out = lm.judge(dict(self.CAND, **kw), api=lambda m, p: sent.append(p) or "x", has_key=True)
+        return out, sent
+
+    def test_renamed_secret_file_is_not_sent(self):
+        d = lm.commit_diff([{"filename": "config/settings.txt", "previous_filename": ".env.production", "patch": "-DB_PASS=abcdefgh"}])
+        out, sent = self.judge(diff=d)
+        self.assertEqual((out["verdict"], sent), ("secret", []))
+
+    def test_secret_file_with_spaces_in_path_is_not_sent(self):
+        d = "diff --git a/project settings/.env.production b/project settings/.env.production\n-DB_PASS=abcdefgh\n"
+        out, sent = self.judge(diff=d)
+        self.assertEqual((out["verdict"], sent), ("secret", []))
+
+    def test_secret_shape_in_suspect_diff_is_not_sent(self):
+        out, sent = self.judge(suspects=[{"number": 10, "title": "feat", "diff": '+  "api_key": "s3cr3t-value-123"'}])
+        self.assertEqual((out["verdict"], sent), ("secret", []))
+
+    def test_secret_records_are_not_retried(self):
+        todo = lm.pending([{"key": "a"}], [{"key": "a", "verdict": "secret"}])
+        self.assertEqual(todo, [])
+
+    def test_clean_candidate_is_still_judged(self):
+        out, sent = self.judge()
+        self.assertTrue(sent)
+
+
 if __name__ == "__main__":
     unittest.main()
