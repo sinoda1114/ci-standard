@@ -271,6 +271,8 @@ class FakeGitHub:
             return json.dumps({"visibility": getattr(self, "visibility", "PRIVATE")})
         if args[0] in ("api", "pr"):
             key = " ".join(args)
+            if key not in self.api and len(args) == 2 and args[0] == "api" and "/compare/" in args[1]:
+                return json.dumps({"status": "ahead"})  # 既定ブランチに入っている（既定）
             if key not in self.api and len(args) == 2 and args[0] == "api" and re.fullmatch(r"repos/[^/?]+/[^/?]+", args[1]):
                 # リポジトリの情報の既定（持ち主 o・アーカイブなし・既定ブランチ main）
                 return json.dumps({"owner": {"login": args[1].split("/")[1]}, "archived": False, "default_branch": "main"})
@@ -375,7 +377,7 @@ class Run(unittest.TestCase):
         old = {"key": "o/r@abcdef5", "repo": "o/r", "kind": "fix", "sha": "abcdef5", "date": "2026-08-01T00:00:00Z",
                "message": "fix: x", "verdict": "unjudged", "serious": False, "suspects": [10], "attempts": 1}
         fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
-        fake.api = {"api repos/o/r/commits/abcdef5/pulls": "[]", "api --paginate --slurp repos/o/r/commits/abcdef5?per_page=100": json.dumps([{"files": [{"patch": "+x"}]}]),
+        fake.api = {"api repos/o/r/commits/abcdef5/pulls": "[]", "api --paginate --slurp repos/o/r/commits/abcdef5?per_page=100": json.dumps([{"commit": {"message": "fix: x"}, "files": [{"patch": "+x"}]}]),
                     "api repos/o/r/pulls/10": json.dumps({"title": "feat: y", "merged_at": "2026-07-25T00:00:00Z", "base": {"ref": "main"}}), "pr diff 10 -R o/r": "+y",
                     "api --paginate --slurp repos/o/r/pulls/10/files?per_page=100": json.dumps([[{"filename": "a"}]])}
         self.go(fake, [])
@@ -602,7 +604,7 @@ class RefetchInsidePr(Run):
         old = {"key": "o/r@abcdefa", "repo": "o/r", "kind": "fix", "sha": "abcdefa", "date": "2026-08-01T00:00:00Z",
                "message": "fix: x", "verdict": "unjudged", "serious": False, "suspects": [10]}
         fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
-        fake.api = {"api --paginate --slurp repos/o/r/commits/abcdefa?per_page=100": json.dumps([{"files": [{"patch": "+x"}]}]),
+        fake.api = {"api --paginate --slurp repos/o/r/commits/abcdefa?per_page=100": json.dumps([{"commit": {"message": "fix: x"}, "files": [{"patch": "+x"}]}]),
                     "api repos/o/r/commits/abcdefa/pulls": json.dumps([{"number": 11, "merge_commit_sha": "m11"}])}
         lm.gh = fake
         lm.collect = lambda owner, exclude, skip=frozenset(): ([], [])
@@ -1070,6 +1072,27 @@ class RefetchTrust(Run):
                     "api repos/o/r/pulls/41": json.dumps({"title": "release", "merged_at": "2026-07-25T00:00:00Z", "base": {"ref": "release"}})}
         self.go(fake, [])
         self.assertFalse([c for c in fake.calls if c[0] == "pr"])  # どちらの差分も取らない（AI に渡さない）
+
+
+class RefetchTrust2(Run):
+    """台帳の Issue・コミットの記録も信じない（P6 の 2 回目の却下の理由）"""
+    def test_issue_record_that_is_really_a_pr_is_not_refetched(self):
+        old = {"key": "o/r#50", "repo": "o/r", "kind": "issue", "sha": "", "date": "2026-08-01T00:00:00Z",
+               "message": "x", "verdict": "unjudged", "serious": False, "suspects": []}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
+        fake.api = {"api repos/o/r/issues/50": json.dumps({"title": "secret PR", "body": "private", "pull_request": {}, "labels": []})}
+        self.go(fake, [])
+        self.assertEqual(self.judged, [])
+
+    def test_commit_not_on_default_branch_is_not_refetched(self):
+        old = {"key": "o/r@abcde51", "repo": "o/r", "kind": "fix", "sha": "abcde51", "date": "2026-08-01T00:00:00Z",
+               "message": "fix", "verdict": "unjudged", "serious": False, "suspects": []}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
+        fake.api = {"api repos/o/r/commits/abcde51/pulls": "[]",
+                    "api --paginate --slurp repos/o/r/commits/abcde51?per_page=100": json.dumps([{"commit": {"message": "fix: 秘密の枝"}, "files": [{"patch": "+secret"}]}]),
+                    "api repos/o/r/compare/abcde51...main": json.dumps({"status": "diverged"})}
+        self.go(fake, [])
+        self.assertEqual(self.judged, [])
 
 
 class Round3NCollect(Collect):

@@ -648,10 +648,18 @@ def refetch(stale, owner, exclude, errors):
                 continue
             if r["kind"] == "issue":
                 i = json.loads(gh("api", "repos/%s/issues/%s" % (repo, r["key"].rsplit("#", 1)[1])))
+                # 台帳の値を信じない: collect と同じく、PR ではない type:fix の Issue だけを取り直す
+                if "pull_request" in i or "type:fix" not in [l.get("name") for l in i.get("labels") or [] if isinstance(l, dict)]:
+                    raise RuntimeError("台帳の記録が type:fix の Issue ではない")
                 diff = (i.get("body") or "")[:8000]
                 fetched_msg = i.get("title") or ""
-                sus = [{"number": n, "title": json.loads(gh("api", "repos/%s/pulls/%d" % (repo, n)))["title"], "diff": ""}
-                       for n in r["suspects"]]
+                sus = []
+                for n in r["suspects"]:  # 原因の候補は、既定ブランチに、Issue の作成の直前 14 日にマージされた PR だけ
+                    p = json.loads(gh("api", "repos/%s/pulls/%d" % (repo, n)))
+                    m = p.get("merged_at")
+                    if (m and dt.timedelta(0) < _ts(r["date"]) - _ts(m) <= dt.timedelta(days=WINDOW_DAYS)
+                            and (p.get("base") or {}).get("ref") == info.get("default_branch")):
+                        sus.append({"number": n, "title": p.get("title", ""), "diff": ""})
             else:
                 # 通常の集め方（collect・fix_candidates）とそろえる: 修正の PR は PR 全体の差分、コミットは変更ファイルの全ページ、
                 # revert は元の PR だけを窓の中で
@@ -683,6 +691,13 @@ def refetch(stale, owner, exclude, errors):
                     pages = [x for x in _paged("repos/%s/commits/%s?per_page=100" % (repo, r["sha"])) if isinstance(x, dict)]
                     diff = "\n".join(f.get("patch", "") for x in pages for f in x.get("files") or [])
                     msg = ((pages[0] if pages else {}).get("commit") or {}).get("message", "")
+                    # 台帳の値を信じない: collect と同じく、既定ブランチに入った fix・revert のコミットだけを取り直す
+                    if not is_fix_message(msg):
+                        raise RuntimeError("台帳の記録のコミットが fix・revert ではない")
+                    cmp = json.loads(gh("api", "repos/%s/compare/%s...%s" % (
+                        repo, r["sha"], urllib.parse.quote(info.get("default_branch") or "", safe=""))))
+                    if cmp.get("status") not in ("ahead", "identical"):
+                        raise RuntimeError("台帳の記録のコミットが既定ブランチに入っていない")
                     if r.get("rebuild_suspects"):
                         # 前回はコミットの詳細を取れず、原因の候補を作れなかった。通常の集め方（fix_candidates）で作り直す
                         nums = rebuild_suspects(repo, r, [f["filename"] for x in pages for f in x.get("files") or []], msg)
