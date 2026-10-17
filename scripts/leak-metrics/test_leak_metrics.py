@@ -717,6 +717,12 @@ class Collect(unittest.TestCase):
         cands, _ = lm.collect("o", set())
         self.assertEqual([c["key"] for c in cands], ["o/r@m11"])
 
+    def test_suspect_diff_failure_is_counted_as_a_fetch_error(self):
+        self.fake(self.base_routes([("f1", "fix: a")]), fail=("pr diff 10",))
+        cands, errors = lm.collect("o", set())
+        self.assertIn("incomplete", cands[0])
+        self.assertEqual(len(errors), 1)
+
     def test_branch_name_is_url_encoded(self):
         def gh(*args, input_text=None):
             self.calls.append(args)

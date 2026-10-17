@@ -484,6 +484,7 @@ def collect(owner, exclude):
                 ps = json.loads(gh("api", "repos/%s/commits/%s/pulls" % (name, sha)))
                 return ps[0]["number"] if ps else None
             fc = fix_candidates(name, commits, prs, revert_pr=revert_pr)
+            seen_why = set()
             diffs = {}  # 同じ PR の差分は 1 回だけ取る（失敗も同じ結果を、その PR を候補に持つ全員に返す）
             for c in fc:  # 原因の候補の差分は、判定に使うものだけ取る
                 for s in c["suspects"]:
@@ -492,6 +493,9 @@ def collect(owner, exclude):
                     s["diff"], why = diffs[s["number"]]
                     if why:
                         c["incomplete"] = why
+                        if why not in seen_why:  # 取得の失敗にも数える（終了コードで気づけるように。同じ失敗は 1 回だけ）
+                            seen_why.add(why)
+                            errors.append("%s: %s" % (name, why))
             try:  # Issue を無効にしたリポジトリ（HTTP 410）などで失敗しても、修正コミットの候補は残す
                 issues = [i for i in _paged("repos/%s/issues?state=all&labels=type:fix&since=%s&per_page=100" % (name, since_fix))
                           if "pull_request" not in i and _ts(i["created_at"]) >= now - dt.timedelta(days=WINDOW_DAYS)]
