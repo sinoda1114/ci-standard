@@ -1256,6 +1256,15 @@ class SecretsNotSent(unittest.TestCase):
         out, sent = self.judge(suspects=[{"number": 10, "title": "feat", "diff": '+  "api_key": "s3cr3t-value-123"'}])
         self.assertEqual((out["verdict"], sent), ("secret", []))
 
+    def test_quoted_or_tab_paths_and_file_lists_are_checked(self):
+        d = 'diff --git "a/dir\\tx/.env.production" "b/dir\\tx/.env.production"\n-DB_PASS=abcdefgh\n'
+        out, sent = self.judge(diff=d)
+        self.assertEqual((out["verdict"], sent), ("secret", []))
+        out, sent = self.judge(suspects=[{"number": 10, "title": "feat", "diff": "-x", "files": ["dir\tx/.env.production"]}])
+        self.assertEqual((out["verdict"], sent), ("secret", []))
+        out, sent = self.judge(files=["deploy/id_rsa"])
+        self.assertEqual((out["verdict"], sent), ("secret", []))
+
     def test_secret_records_are_not_retried(self):
         todo = lm.pending([{"key": "a"}], [{"key": "a", "verdict": "secret"}])
         self.assertEqual(todo, [])

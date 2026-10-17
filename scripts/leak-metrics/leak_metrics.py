@@ -51,7 +51,9 @@ SECRET_RE = re.compile(
     r")")
 SECRET_PATH_RE = re.compile(r"(^|/)(\.env[^/]*|[^/]*\.pem|[^/]*\.key|id_rsa[^/]*|id_ed25519[^/]*|credentials[^/]*|\.npmrc|\.netrc)$")
 # 差分の中のファイルのパスの行（空白を含むパスも、名前の変更の前後も見る）
-DIFF_PATH_LINE_RE = re.compile(r"(?m)^(?:diff --git a/(.*) b/(.*)|--- a/(.*)|\+\+\+ b/(.*)|rename (?:from|to) (.*))$")
+DIFF_PATH_LINE_RE = re.compile(r"(?m)^(?:diff --git |--- |\+\+\+ |rename (?:from|to) ).*$")
+# 見出しの行のどこかにある秘密情報のファイルの名前（git が引用符で囲んだパス・空白やタブを含むパスでも見つかるように）
+SECRET_NAME_RE = re.compile(r"""(?:^|[/"\s\\])(\.env[^/"\s\\]*|[^/"\s\\]*\.pem|[^/"\s\\]*\.key|id_rsa[^/"\s\\]*|id_ed25519[^/"\s\\]*|credentials[^/"\s\\]*|\.npmrc|\.netrc)(?=["\s\\]|$)""")
 STATE_BEGIN = "<!-- leak-metrics-state"
 STATE_END = "leak-metrics-state -->"
 MAX_BODY_CHARS = 60000      # 台帳 Issue 1 本の本文の上限（GitHub の上限 65,536 文字より小さく取る）
@@ -115,7 +117,7 @@ def fix_candidates(repo, commits, prs, revert_pr=None):
                 if dt.timedelta(0) < age <= dt.timedelta(days=WINDOW_DAYS) and files & set(p.get("files") or []):
                     suspects.append(p)
         suspects = [dict(p) for p in sorted(suspects, key=lambda p: p["merged_at"], reverse=True)[:MAX_SUSPECTS]]  # 候補ごとに別の写し
-        out.append({"key": "%s@%s" % (repo, c["sha"]), "repo": repo, "kind": kind, "sha": c["sha"],
+        out.append({"key": "%s@%s" % (repo, c["sha"]), "repo": repo, "kind": kind, "sha": c["sha"], "files": list(c.get("files") or []),
                     "date": c["date"], "message": c["message"].splitlines()[0][:200],
                     "diff": c.get("diff", ""), "suspects": suspects, **({"incomplete": incomplete} if incomplete else {}),
                     **({"pr": c["pr"]} if c.get("pr") else {}),
@@ -177,8 +179,8 @@ def redact(text):
     """外部の API に送る文字列から秘密情報を伏せる。秘密情報のファイル（.env・鍵など）の差分は中身ごと送らない"""
     out = []
     for part in re.split(r"(?m)^(?=diff --git )", str(text or "")):
-        m = re.match(r"diff --git a/(\S+) b/(\S+)", part)
-        if m and (SECRET_PATH_RE.search(m.group(1)) or SECRET_PATH_RE.search(m.group(2))):
+        head = part.split("\n", 1)[0]
+        if head.startswith("diff --git ") and SECRET_NAME_RE.search(head):
             part = part.split("\n", 1)[0] + "\n（秘密情報のファイルなので、差分は送らない）\n"
         out.append(part)
     return SECRET_RE.sub("（秘密情報を伏せた）", "".join(out))
@@ -201,9 +203,14 @@ def has_secret(text):
     """秘密情報のファイル（.env・鍵など。名前の変更の前後・空白を含むパスも）か、秘密情報の形を含むか"""
     t = str(text or "")
     for m in DIFF_PATH_LINE_RE.finditer(t):
-        if any(g and SECRET_PATH_RE.search(g.strip()) for g in m.groups()):
+        if SECRET_NAME_RE.search(m.group(0)):
             return True
     return bool(SECRET_RE.search(t))
+
+
+def secret_files(files):
+    """API から取った生のパスの一覧に、秘密情報のファイルがあるか（差分の見出しの書き方に左右されない）"""
+    return any(isinstance(f, str) and SECRET_PATH_RE.search(f) for f in files or [])
 
 
 def file_names(entries):
@@ -256,8 +263,8 @@ def judge(c, api, has_key):
         rec["verdict"] = "no-suspect"
         return rec
     # 秘密情報を見つけたら、伏せて送るのではなく、送らない（正規表現で伏せきることはできないため。判定はしないで確定する）
-    if has_secret(c.get("diff")) or has_secret(c.get("message")) or any(
-            has_secret(s.get("diff")) or has_secret(s.get("title")) for s in c["suspects"]):
+    if (secret_files(c.get("files")) or has_secret(c.get("diff")) or has_secret(c.get("message"))
+            or any(secret_files(s.get("files")) or has_secret(s.get("diff")) or has_secret(s.get("title")) for s in c["suspects"])):
         rec["verdict"] = "secret"
         rec["rationale"] = "差分に秘密情報（のファイル・形）を含むので、AI に送らずに判定しない"
         return rec
@@ -703,6 +710,7 @@ def refetch(stale, owner, exclude, errors):
             failed.append(r["key"])
             continue
         repo = r["repo"]
+        rec_files = []
         try:
             info = repo_info(repo)  # 台帳の値だけで取り直す先を決めない: 今の持ち主のもので、アーカイブされていないこと
             if ((info.get("owner") or {}).get("login") or "").lower() != owner.lower() or info.get("archived"):
@@ -742,6 +750,7 @@ def refetch(stale, owner, exclude, errors):
                         # 台帳の pr を信じない: マージされていて、マージのコミットが記録の SHA と同じ PR だけを取り直す
                         raise RuntimeError("台帳の pr（#%s）が記録のコミットと合わない" % pr_no)
                     pf = file_names(_paged("repos/%s/pulls/%d/files?per_page=100" % (repo, pr_no)))
+                    rec_files = pf
                     diff, why = suspect_diff(repo, {"number": pr_no, "files": pf})
                     if why:
                         raise RuntimeError(why)
@@ -755,6 +764,7 @@ def refetch(stale, owner, exclude, errors):
                         continue
                     pages = [x for x in _paged("repos/%s/commits/%s?per_page=100" % (repo, r["sha"])) if isinstance(x, dict)]
                     diff = commit_diff([f for x in pages for f in x.get("files") or []])
+                    rec_files = file_names([f for x in pages for f in x.get("files") or []])
                     msg = ((pages[0] if pages else {}).get("commit") or {}).get("message", "")
                     # 台帳の値を信じない: collect と同じく、既定ブランチに入った fix・revert のコミットだけを取り直す
                     if not is_fix_message(msg):
@@ -796,7 +806,8 @@ def refetch(stale, owner, exclude, errors):
             continue
         # プロンプトに入る message は、台帳の値ではなく取り直したコミット・PR・Issue のもの（台帳を書き換えて判定を誘導させない）
         out.append({k: r.get(k) for k in ("key", "repo", "kind", "sha", "date", "pr") if r.get(k) is not None}
-                   | {"message": (fetched_msg or "").splitlines()[0][:200] if fetched_msg else "", "diff": diff, "suspects": sus})
+                   | {"message": (fetched_msg or "").splitlines()[0][:200] if fetched_msg else "", "diff": diff, "suspects": sus,
+                      "files": rec_files})
     return out, failed
 
 
