@@ -7,7 +7,9 @@
 #   - e2e … playwright.config.* があればジョブごと実行（.github/ci-skip-e2e でオプトアウト可）
 #   - quality … Fallow（未使用コード/重複/複雑度）+ React Doctor（Reactアンチパターン）。
 #               既定 report-only/advisory、.github/fallow-strict を置くと両方が強制モードになる
-#   - package.json が無い場合（テンプレ直後の空リポジトリ）は全て skip して緑にする
+#   - workflow-lint … 呼び出し側のワークフローを jactionlint で検査。correctness の違反で ci / build を落とす
+#   - package.json が無い場合（テンプレ直後の空リポジトリ）は Node 用のステップを全て skip する
+#     （build ジョブ自体は走り、ワークフローの検査や detect が失敗すれば赤になる）
 #
 # リポジトリ固有のCI用環境変数（非シークレット）は .github/ci.env に KEY=VALUE で置く。
 #
@@ -95,30 +97,82 @@ jobs:
             echo "has-e2e=false" >> "$GITHUB_OUTPUT"
           fi
 
+  # ワークフローの検査（jactionlint）。第三者のバイナリなので、build と別の専用のジョブで動かす。
+  # 得られるのは「.git/config にトークンを残さない」「secrets を渡さない」「install・ビルドと同じジョブで動かない」まで。
+  # 同じ実行のランタイムトークン（キャッシュへの書き込みなど）からは切り離せないので、配布物そのものの正当性は
+  # 版とチェックサムの固定と、self-test の artifact attestation の照合で担保する。
+  # 合否は build の最後のステップがこのジョブの結果を見て決めるので、必須チェック ci / build で止まる。
+  #   - 判定: correctness（構文・式・needs などの誤り）だけで落とす。読めない式が 1 つあるとワークフローごと起動しないため
+  #   - 助言: 既定プロファイル（SHA 固定・permissions などのセキュリティ・運用ルール）は警告の注釈を出すだけで落とさない
+  #   - shellcheck・pyflakes は使わない（目的はワークフローの文法と式）。GitHub への問い合わせもしない
+  # correctness には jactionlint が同梱するデータで判定する規則（unknown-runner-label・unknown-action-input など）がある。
+  # 新しいランナーや action の入力に追いついておらず誤って落ちたときは、呼び出し側で抑止できる（README の「ワークフローの検査」）。
+  # 版とチェックサムは self-test.yml・python-ci.yml と揃える（scripts/check-jactionlint-pins.sh が見る）。
+  # 版を上げる手順は self-test.yml のコメントを参照。
+  workflow-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: ワークフローの検査（jactionlint）
+        env:
+          JACTIONLINT_VERSION: '2.2.0'
+          JACTIONLINT_SHA256: 8137d5bfe266dd5e48d2af2306827785ce07c6988e04b1c3d6ad4776e97d27d2
+        run: |
+          tarball="jactionlint_${JACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl --retry 3 --retry-all-errors -sSfL -o "$RUNNER_TEMP/$tarball" "https://github.com/jdx/jactionlint/releases/download/v${JACTIONLINT_VERSION}/${tarball}" \
+            || { echo "::error::jactionlint の取得に失敗しました（ワークフローの誤りではありません。GitHub の障害なら再実行で直ることが多い）"; exit 1; }
+          echo "${JACTIONLINT_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" jactionlint
+          lint() { "$RUNNER_TEMP/jactionlint" --no-hints --no-color --no-online --shellcheck= --pyflakes= "$@"; }
+          # 助言。標準 CI の呼び出し（ci-standard/...@main）は設計上 main を追うので、SHA 固定の警告から外す。
+          # 終了コード 1 は「指摘あり」。2 以上は実行そのものの失敗なので、黙って消さずに警告を出す
+          advisory_rc=0
+          lint --format github --ignore 'reusable workflow call "sinoda1114/ci-standard/[^"]*@main" must be pinned' \
+            > "$RUNNER_TEMP/advisory.txt" || advisory_rc=$?
+          sed -E 's/^::error( |::)/::warning\1/' "$RUNNER_TEMP/advisory.txt"
+          if [ "$advisory_rc" -gt 1 ]; then
+            echo "::warning::jactionlint の助言の実行が失敗しました（終了コード ${advisory_rc}）"
+          fi
+          # 判定
+          lint --profile correctness
+
   build:
-    needs: detect
-    if: needs.detect.outputs.has-node == 'true'
+    needs: [detect, workflow-lint]
+    # package.json が無いリポジトリでもジョブ自体は走らせ、Node 用のステップだけを飛ばす。
+    # ジョブごとスキップにすると、ワークフローの検査の失敗が必須チェック ci / build をすり抜けるため
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.detect.outputs.has-node == 'true'
 
       # corepack で package.json の packageManager フィールドに従い pnpm/yarn を有効化
       - name: Enable corepack
+        if: needs.detect.outputs.has-node == 'true'
         run: corepack enable
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: needs.detect.outputs.has-node == 'true'
         with:
           node-version: ${{ inputs.node-version }}
           cache: ${{ needs.detect.outputs.pm }}
 
       - name: CI用環境変数を読み込み (.github/ci.env)
+        if: needs.detect.outputs.has-node == 'true'
         run: |
           if [ -f .github/ci.env ]; then
             grep -v '^\s*#' .github/ci.env >> "$GITHUB_ENV"
           fi
 
       - name: 実行対象スクリプトを判定
+        if: needs.detect.outputs.has-node == 'true'
         run: |
           has() { node -e "process.exit(require('./package.json').scripts?.['$1'] ? 0 : 1)"; }
           echo "HAS_LINT=$(has lint && echo true || echo false)" >> "$GITHUB_ENV"
@@ -128,6 +182,7 @@ jobs:
           echo "HAS_BUILD=$(has build && echo true || echo false)" >> "$GITHUB_ENV"
 
       - name: Install dependencies
+        if: needs.detect.outputs.has-node == 'true'
         env:
           PM: ${{ needs.detect.outputs.pm }}
         run: |
@@ -184,6 +239,7 @@ jobs:
       # 判定スクリプトは、呼び出されたこのワークフローと版がずれないよう下に埋め込む（scripts/audit-gate.py と同一。
       # 一致は self-test の test_audit_gate.py が検査する）。
       - name: Audit (high以上を検出)
+        if: needs.detect.outputs.has-node == 'true'
         env:
           PM: ${{ needs.detect.outputs.pm }}
         run: |
@@ -587,6 +643,25 @@ jobs:
               yarn) yarn npm audit --severity high || yarn audit --level high || true ;;
               *)    npm audit --audit-level=high ;;
             esac
+          fi
+
+      # ワークフローの検査（workflow-lint ジョブ）の合否をここで反映する。build の needs が失敗すると build はスキップになり、
+      # スキップは必須チェックを満たしてしまうため、build を !cancelled() で走らせてここで落とす。
+      # 最後に置き、lint・テストなどの結果も出す
+      - name: ワークフローの検査（jactionlint）の結果
+        if: ${{ !cancelled() }}
+        env:
+          WORKFLOW_LINT_RESULT: ${{ needs.workflow-lint.result }}
+          DETECT_RESULT: ${{ needs.detect.result }}
+        run: |
+          if [ "$WORKFLOW_LINT_RESULT" != success ]; then
+            echo "::error::ワークフローの検査（workflow-lint ジョブ）の結果が ${WORKFLOW_LINT_RESULT} でした。そのジョブのログを見てください"
+            exit 1
+          fi
+          # detect が失敗すると Node 用のステップが全部飛ぶので、黙って緑にしない
+          if [ "$DETECT_RESULT" != success ]; then
+            echo "::error::リポジトリ構成の判定（detect ジョブ）の結果が ${DETECT_RESULT} でした。そのジョブのログを見てください"
+            exit 1
           fi
 
   # コード健全性ゲート（Fallow）: 未使用コード・重複・複雑度・アーキテクチャ境界の検出。
