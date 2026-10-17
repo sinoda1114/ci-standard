@@ -612,7 +612,8 @@ class Round2Lm(Run):
     """2 周目の /ai-review の指摘 M2・M3"""
     def test_record_that_can_never_be_refetched_stops_failing_the_run(self):
         old = {"key": "o/r@abcde77", "repo": "o/r", "kind": "fix", "sha": "abcde77", "date": "2026-08-01T00:00:00Z",
-               "message": "fix: x", "verdict": "unjudged", "serious": False, "suspects": [10], "attempts": 3}
+               "message": "fix: x", "verdict": "unjudged", "serious": False, "suspects": [10], "attempts": 3,
+               "refetch_failures": 3}
         fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
         rc = self.go(fake, [])  # 取り直しは 404（偽の API に応答が無い）
         self.assertEqual(rc, 0)
@@ -973,14 +974,15 @@ class Round3N(Run):
 
     def test_invalid_record_stops_failing_the_run_after_a_few_tries(self):  # N4
         bad = {"key": "evil/x#1", "repo": "evil/x", "kind": "issue", "sha": "", "date": "2026-08-01T00:00:00Z",
-               "verdict": "unjudged", "serious": False, "suspects": [], "attempts": 3}
+               "verdict": "unjudged", "serious": False, "suspects": [], "attempts": 3, "refetch_failures": 3}
         fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([bad], "2026-08")}])
         self.assertEqual(self.go(fake, []), 0)
 
     def test_refetch_errors_are_counted_exactly_max_times(self):  # N5
         for att, want in [(2, 1), (3, 0)]:
             old = {"key": "o/r@abcde21", "repo": "o/r", "kind": "fix", "sha": "abcde21", "date": "2026-08-01T00:00:00Z",
-                   "message": "fix", "verdict": "unjudged", "serious": False, "suspects": [1], "attempts": att}
+                   "message": "fix", "verdict": "unjudged", "serious": False, "suspects": [1], "attempts": 5,
+                   "refetch_failures": att}  # attempts（判定の失敗も含む）ではなく、取り直しの失敗の回数で数える
             fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
             self.assertEqual(self.go(fake, []), want, att)
 
@@ -1013,7 +1015,8 @@ class RebuildSuspects(Run):
         fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
         fake.api = {"api repos/o/r/commits/abcde22/pulls": "[]",
                     "api --paginate --slurp repos/o/r/commits/abcde22?per_page=100": json.dumps([{"commit": {"message": "fix: a"}, "files": [{"filename": "src/a.js", "patch": "-a"}]}]),
-                    "api --paginate --slurp repos/o/r/pulls?state=closed&sort=updated&direction=desc&per_page=50": json.dumps([[{"number": 10, "merged_at": "2026-08-05T00:00:00Z", "title": "feat: x"}]]),
+                    "api repos/o/r": json.dumps({"default_branch": "main"}),
+                    "api --paginate --slurp repos/o/r/pulls?state=closed&base=main&sort=updated&direction=desc&per_page=50": json.dumps([[{"number": 10, "merged_at": "2026-08-05T00:00:00Z", "title": "feat: x"}]]),
                     "api --paginate --slurp repos/o/r/pulls/10/files?per_page=100": json.dumps([[{"filename": "src/a.js"}]]),
                     "api repos/o/r/pulls/10": json.dumps({"title": "feat: x"}),
                     "pr diff 10 -R o/r": "+x"}

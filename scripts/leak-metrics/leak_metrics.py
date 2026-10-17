@@ -320,7 +320,7 @@ def valid_shape(r):
         return False
     types = {"repo": str, "kind": str, "sha": str, "date": str, "message": str, "verdict": str, "rationale": str,
              "month": str, "severity": str, "is_leak": str, "serious": bool, "notified": bool, "security": bool,
-             "attempts": int, "part": int, "pr": int, "rebuild_suspects": bool, "caused_by_pr": int, "suspects": list, "models": list}
+             "attempts": int, "part": int, "pr": int, "rebuild_suspects": bool, "refetch_failures": int, "caused_by_pr": int, "suspects": list, "models": list}
     for k, t in types.items():
         v = r.get(k)
         if v is not None and not (isinstance(v, t) and not (t is int and isinstance(v, bool))):
@@ -578,7 +578,9 @@ def rebuild_suspects(repo, r, files, msg):
     """記録の日付の直前 14 日にマージされ、同じファイルを触った PR を、原因の候補として作り直す（PR の番号の配列）"""
     when = _ts(r["date"])
     prs = []
-    for p in _paged("repos/%s/pulls?state=closed&sort=updated&direction=desc&per_page=50" % repo):
+    # 通常の集め方と同じく、既定ブランチにマージされた PR だけを見る
+    base = urllib.parse.quote(json.loads(gh("api", "repos/%s" % repo)).get("default_branch") or "", safe="")
+    for p in _paged("repos/%s/pulls?state=closed&base=%s&sort=updated&direction=desc&per_page=50" % (repo, base)):
         m = p.get("merged_at")
         if m and dt.timedelta(0) < when - _ts(m) <= dt.timedelta(days=WINDOW_DAYS):
             pf = [f["filename"] for f in _paged("repos/%s/pulls/%d/files?per_page=100" % (repo, p["number"]))]
@@ -595,7 +597,9 @@ def refetch(stale, owner, exclude, errors):
     # 後から除外したリポジトリの記録は、上限を当てる前に除く（取り直さず、取得失敗にも数えない。記録はそのまま残す）
     live = [r for r in stale if not (isinstance(r.get("repo"), str) and r["repo"].split("/")[-1] in exclude)]
     for r in sorted(live, key=lambda r: (int(r.get("attempts") or 0), r.get("date") or ""))[:MAX_PER_RUN]:
-        counts = int(r.get("attempts") or 0) < MAX_REFETCH_ERRORS  # 失敗を取得失敗に数えるのは最初の MAX_REFETCH_ERRORS 回だけ
+        # 取り直しの失敗を取得失敗に数えるのは、取り直しの失敗の最初の MAX_REFETCH_ERRORS 回だけ
+        # （attempts は判定の失敗でも増えるので、取り直しの失敗は refetch_failures で別に数える）
+        counts = int(r.get("refetch_failures") or 0) < MAX_REFETCH_ERRORS
         if not valid_record(r, owner, exclude):
             if counts:
                 errors.append("台帳の記録が不正なので取り直さない: %s" % str(r.get("key"))[:100])
@@ -757,7 +761,8 @@ def run(a):
     again, failed = refetch(stale, a.owner, exclude, errors)  # 窓から外れた未判定も判定し直す
     cands += again
     for k in failed:  # 取り直せなかったものも試した回数に数え、次回は他の記録に順番を回す
-        known[k] = dict(known[k], attempts=int(known[k].get("attempts") or 0) + 1)
+        known[k] = dict(known[k], attempts=int(known[k].get("attempts") or 0) + 1,
+                        refetch_failures=int(known[k].get("refetch_failures") or 0) + 1)
     todo = prioritize(pending(cands, list(known.values())), list(known.values()))
     has_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
     new, skipped = [], set()
