@@ -37,6 +37,18 @@ LEAK_VALUES = ("yes", "no", "unclear")
 FIX_RE = re.compile(r"^(fix|hotfix|revert)(\([^)]*\))?!?:|^Revert\b", re.I)
 REVERT_RE = re.compile(r"This reverts commit ([0-9a-f]{7,40})")
 REVERT_PR_RE = re.compile(r"^Reverts ([\w.-]+/[\w.-]+)#(\d+)\s*$", re.M)  # GitHub の Revert ボタンで作った PR の本文
+# 外部の API に送る前に伏せる秘密情報（scripts/pr-triage/triage.py と同じ）
+SECRET_RE = re.compile(
+    r"(-----BEGIN [A-Z ]*PRIVATE KEY-----"
+    r"|AKIA[0-9A-Z]{16}"                                  # AWS access key
+    r"|AIza[0-9A-Za-z_\-]{35}"                            # Google API key
+    r"|sk-[A-Za-z0-9_\-]{20,}"                            # OpenAI 系
+    r"|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}"  # GitHub classic / fine-grained
+    r"|xox[abprs]-[A-Za-z0-9\-]{10,}"                     # Slack
+    r"|apikey_[A-Za-z0-9_]{30,}"
+    r"|(?i:(password|passwd|secret|api[_-]?key|token)\s*[:=]\s*(['\"][^'\"]{8,}['\"]|[A-Za-z0-9_\-/+=]{16,}))"
+    r")")
+SECRET_PATH_RE = re.compile(r"(^|/)(\.env[^/]*|[^/]*\.pem|[^/]*\.key|id_rsa[^/]*|id_ed25519[^/]*|credentials[^/]*|\.npmrc|\.netrc)$")
 STATE_BEGIN = "<!-- leak-metrics-state"
 STATE_END = "leak-metrics-state -->"
 MAX_BODY_CHARS = 60000      # 台帳 Issue 1 本の本文の上限（GitHub の上限 65,536 文字より小さく取る）
@@ -158,6 +170,27 @@ def needs_stage2(j):
     return j["is_leak"] == "unclear" or j["severity"] in ("critical", "high") or j["security"]
 
 
+def redact(text):
+    """外部の API に送る文字列から秘密情報を伏せる。秘密情報のファイル（.env・鍵など）の差分は中身ごと送らない"""
+    out = []
+    for part in re.split(r"(?m)^(?=diff --git )", str(text or "")):
+        m = re.match(r"diff --git a/(\S+) b/(\S+)", part)
+        if m and (SECRET_PATH_RE.search(m.group(1)) or SECRET_PATH_RE.search(m.group(2))):
+            part = part.split("\n", 1)[0] + "\n（秘密情報のファイルなので、差分は送らない）\n"
+        out.append(part)
+    return SECRET_RE.sub("（秘密情報を伏せた）", "".join(out))
+
+
+def file_names(entries):
+    """PR・コミットの変更ファイルの一覧。名前を変えたファイルは変更前のパスも入れる（原因の PR と結び付けるため）"""
+    names = []
+    for f in entries or []:
+        for k in ("filename", "previous_filename"):
+            if isinstance(f, dict) and f.get(k) and f[k] not in names:
+                names.append(f[k])
+    return names
+
+
 def build_prompt(c):
     """修正の差分と原因の候補に別々の予算を持たせる（末尾で一括に切ると、候補の節が丸ごと消えることがある）"""
     head = ("次の修正（%s）が、直前にマージされた PR が入れた不具合を直したものかを判定してください。\n"
@@ -168,12 +201,12 @@ def build_prompt(c):
             "- severity: critical はデータ消失・認証の迂回・任意コード実行などの大事故、high は利用者に明確な害がある不具合、"
             "other はそれ以外（見た目・軽微な性能など）。\n"
             "- security: 脆弱性（注入・認可・秘密情報の漏えいなど）の修正なら true。\n\n" % c["kind"])
-    fix = "## 修正: %s\n```diff\n%s\n```\n\n## 原因の候補\n" % (str(c["message"])[:200], (c.get("diff") or "")[:MAX_FIX_DIFF_CHARS])
+    fix = "## 修正: %s\n```diff\n%s\n```\n\n## 原因の候補\n" % (redact(str(c["message"])[:200]), redact(c.get("diff") or "")[:MAX_FIX_DIFF_CHARS])
     sus_list = c["suspects"][:MAX_SUSPECTS]
-    wrap = [("### PR #%s: %s\n```diff\n" % (s["number"], str(s.get("title", ""))[:200]), "\n```") for s in sus_list]
+    wrap = [("### PR #%s: %s\n```diff\n" % (s["number"], redact(str(s.get("title", ""))[:200])), "\n```") for s in sus_list]
     room = MAX_PROMPT_CHARS - len(head) - len(fix) - sum(len(a) + len(b) for a, b in wrap) - len(wrap)  # 枠と改行の分を正確に引く
     per = max(0, room // max(1, len(sus_list)))
-    sus = [a + (s.get("diff") or "")[:per] + b for (a, b), s in zip(wrap, sus_list)]  # 題名の % を書式として読まない
+    sus = [a + redact(s.get("diff") or "")[:per] + b for (a, b), s in zip(wrap, sus_list)]  # 題名の % を書式として読まない
     return (head + fix + "\n".join(sus))[:MAX_PROMPT_CHARS]
 
 
@@ -499,7 +532,7 @@ def collect(owner, exclude, skip=frozenset()):
             prs = []
             for p in recent_prs(name, branch, since_pr):
                 if p.get("merged_at") and _ts(p["merged_at"]) >= since_pr:
-                    files = [f["filename"] for f in _paged("repos/%s/pulls/%d/files?per_page=100" % (name, p["number"]))]
+                    files = file_names(_paged("repos/%s/pulls/%d/files?per_page=100" % (name, p["number"])))
                     prs.append({"number": p["number"], "merged_at": p["merged_at"], "title": p["title"], "files": files,
                                 "merge_commit_sha": p.get("merge_commit_sha"), "body": p.get("body") or ""})
             nowz = now.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -537,7 +570,7 @@ def collect(owner, exclude, skip=frozenset()):
                     continue
                 date = min(c["commit"]["committer"]["date"], nowz)  # 未来の日時は今に丸める
                 commits.append({"sha": c["sha"], "date": date, "message": msg,
-                                "files": [f["filename"] for f in files_all], "prs": [],
+                                "files": file_names(files_all), "prs": [],
                                 "diff": "\n".join(f.get("patch", "") for f in files_all)})
 
             def revert_pr(sha, name=name):
@@ -615,7 +648,7 @@ def rebuild_suspects(repo, r, files, msg):
     for p in recent_prs(repo, base, when - dt.timedelta(days=WINDOW_DAYS)):
         m = p.get("merged_at")
         if m and dt.timedelta(0) < when - _ts(m) <= dt.timedelta(days=WINDOW_DAYS):
-            pf = [f["filename"] for f in _paged("repos/%s/pulls/%d/files?per_page=100" % (repo, p["number"]))]
+            pf = file_names(_paged("repos/%s/pulls/%d/files?per_page=100" % (repo, p["number"])))
             prs.append({"number": p["number"], "merged_at": m, "title": p.get("title", ""), "files": pf})
     c = {"sha": r["sha"], "date": r["date"], "message": msg or r.get("message") or "", "files": files, "prs": []}
     cands = fix_candidates(repo, [c], prs)
@@ -673,10 +706,11 @@ def refetch(stale, owner, exclude, errors):
                         pr_no = hit[0]["number"]
                 if pr_no:
                     pp = json.loads(gh("api", "repos/%s/pulls/%d" % (repo, pr_no)))
-                    if not pp.get("merged_at") or pp.get("merge_commit_sha") != r["sha"]:
+                    if (not pp.get("merged_at") or pp.get("merge_commit_sha") != r["sha"]
+                            or (pp.get("base") or {}).get("ref", info.get("default_branch")) != info.get("default_branch")):
                         # 台帳の pr を信じない: マージされていて、マージのコミットが記録の SHA と同じ PR だけを取り直す
                         raise RuntimeError("台帳の pr（#%s）が記録のコミットと合わない" % pr_no)
-                    pf = [f["filename"] for f in _paged("repos/%s/pulls/%d/files?per_page=100" % (repo, pr_no))]
+                    pf = file_names(_paged("repos/%s/pulls/%d/files?per_page=100" % (repo, pr_no)))
                     diff, why = suspect_diff(repo, {"number": pr_no, "files": pf})
                     if why:
                         raise RuntimeError(why)
@@ -700,7 +734,7 @@ def refetch(stale, owner, exclude, errors):
                         raise RuntimeError("台帳の記録のコミットが既定ブランチに入っていない")
                     if r.get("rebuild_suspects"):
                         # 前回はコミットの詳細を取れず、原因の候補を作れなかった。通常の集め方（fix_candidates）で作り直す
-                        nums = rebuild_suspects(repo, r, [f["filename"] for x in pages for f in x.get("files") or []], msg)
+                        nums = rebuild_suspects(repo, r, file_names([f for x in pages for f in x.get("files") or []]), msg)
                 fetched_msg = msg
                 target, target_pr = revert_target(msg), revert_pr_number(msg, repo)
                 if target_pr:
@@ -719,7 +753,7 @@ def refetch(stale, owner, exclude, errors):
                     if (p.get("base") or {}).get("ref") != info.get("default_branch"):
                         continue
                     s_ = {"number": n, "title": p.get("title", ""),
-                          "files": [f["filename"] for f in _paged("repos/%s/pulls/%d/files?per_page=100" % (repo, n))]}
+                          "files": file_names(_paged("repos/%s/pulls/%d/files?per_page=100" % (repo, n)))}
                     s_["diff"], why = suspect_diff(repo, s_)
                     if why:
                         raise RuntimeError(why)

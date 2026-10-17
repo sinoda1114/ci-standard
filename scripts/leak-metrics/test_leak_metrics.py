@@ -1190,5 +1190,38 @@ class FinalP(Run):
         self.assertTrue(any("本当の題名" in p for p in self.prompts))
 
 
+class SecretsAndRenames(unittest.TestCase):
+    """全体のレビューの指摘 B1・Q3"""
+    def test_secrets_in_diffs_are_not_sent(self):  # B1
+        key = "ghp_" + "a" * 36
+        aws = "AKIA" + "B" * 16
+        diff = ("diff --git a/src/a.js b/src/a.js\n-const k = '%s'\n+const k = process.env.K\n"
+                "diff --git a/.env b/.env\n-API_TOKEN=plainvalue1234567890\n" % key)
+        c = {"kind": "fix", "message": "fix: 鍵を消す %s" % aws, "diff": diff,
+             "suspects": [{"number": 1, "title": "feat: x", "diff": "+password = 'hunter2hunter2'\n"}]}
+        p = lm.build_prompt(c)
+        for bad in (key, aws, "plainvalue1234567890", "hunter2hunter2"):
+            self.assertNotIn(bad, p)
+        self.assertIn("process.env.K", p)  # 秘密でない行は残す
+
+    def test_renamed_files_keep_the_old_path(self):  # Q3
+        self.assertEqual(lm.file_names([{"filename": "new.py", "previous_filename": "old.py"}, {"filename": "b.py"}]),
+                         ["new.py", "old.py", "b.py"])
+
+
+class RefetchPrBranch(Run):
+    def test_refetched_fix_pr_on_another_branch_is_not_sent(self):  # Q2
+        old = {"key": "o/r@abcde52", "repo": "o/r", "kind": "fix", "sha": "abcde52", "date": "2026-08-01T00:00:00Z",
+               "message": "fix", "verdict": "unjudged", "serious": False, "suspects": [], "pr": 52}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
+        fake.api = {"api repos/o/r/pulls/52": json.dumps({"title": "feat: release だけ", "body": "", "merged_at": "2026-08-01T00:00:00Z",
+                                                          "merge_commit_sha": "abcde52", "base": {"ref": "release"}}),
+                    "api --paginate --slurp repos/o/r/pulls/52/files?per_page=100": json.dumps([[{"filename": "a.js"}]]),
+                    "pr diff 52 -R o/r": "+release-only"}
+        self.go(fake, [])
+        self.assertFalse([c for c in fake.calls if c[0] == "pr"])
+        self.assertEqual(self.judged, [])
+
+
 if __name__ == "__main__":
     unittest.main()
