@@ -18,6 +18,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.request
 
@@ -25,6 +26,7 @@ WINDOW_DAYS = 14
 STAGE1_MODEL = "claude-haiku-5-5"
 STAGE2_MODEL = "claude-opus-5-5"
 MAX_PER_RUN = 60            # 1 回の実行で判定する上限（料金の上限を決める）
+MAX_JUDGE_SECONDS = 20 * 60  # 判定に使う時間の上限。job の timeout-minutes（30）より前に保存まで終える
 MAX_PROMPT_CHARS = 60000    # 1 件の判定に渡すプロンプトの上限（文字）
 MAX_FIX_DIFF_CHARS = 25000  # そのうち修正の差分に使う分。残りを原因の候補で分ける（候補の節が切り詰めで消えないように）
 MAX_SUSPECTS = 5
@@ -395,6 +397,10 @@ def serious_issue(r):
 
 # ------------------------------------------------------------ 外部との入出力
 
+def monotonic():
+    return time.monotonic()
+
+
 def utcnow():
     return dt.datetime.now(dt.timezone.utc)
 
@@ -597,8 +603,11 @@ def notify(ledger, records, errors):
     pending_r = [r for r in records.values() if r.get("serious") and not r.get("notified")]
     if not pending_r:
         return []
+    try:  # ラベルは無いときだけ作る（--force は毎回、色を乱数で塗り替える）
+        gh("label", "create", "type:fix", "-R", ledger, "--color", "d73a4a", "--description", "漏れの記録")
+    except Exception:
+        pass  # すでにある（あるいは作れない。そのときは起票の失敗として次回に回る）
     try:
-        gh("label", "create", "type:fix", "-R", ledger, "--force")
         done = marked_keys(list_issues(ledger))  # ラベルを外された [漏れ] Issue も見る
     except Exception as e:  # 一覧が取れないと二重に起票しうるので、今回は起票しない
         errors.append("[漏れ] Issue の確認に失敗: %s" % str(e)[:200])
@@ -618,6 +627,7 @@ def notify(ledger, records, errors):
 
 
 def run(a):
+    started = monotonic()
     now = utcnow()
     exclude = set(a.exclude.split(",")) | {a.ledger.split("/")[1]}
     known, slots = load_ledger(list_issues(a.ledger))  # 読めない台帳があれば止める（上書きで消さない）
@@ -629,13 +639,24 @@ def run(a):
         known[k] = dict(known[k], attempts=int(known[k].get("attempts") or 0) + 1)
     todo = prioritize(pending(cands, list(known.values())), list(known.values()))
     has_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
-    new = [judge(c, anthropic_api, has_key) for c in todo[:MAX_PER_RUN]]
+    new, skipped = [], set()
+    for c in todo[:MAX_PER_RUN]:
+        if monotonic() - started > MAX_JUDGE_SECONDS:
+            # 時間の上限: 残りは判定せずに未判定として残す（job の時間切れで、判定と料金がまるごと失われないように）
+            if c["key"] not in known:
+                new.append(base_record(c, "時間の上限で見送り"))
+            skipped.add(c["key"])
+            continue
+        new.append(judge(c, anthropic_api, has_key))
     for c in todo[MAX_PER_RUN:]:  # 上限で見送った分も未判定として残す（次回以降、試した回数の少ない順に選ぶ）
         if c["key"] not in known:
             new.append(base_record(c, "1 回の上限で見送り"))
+        skipped.add(c["key"])
     for r in new:
         old = known.get(r["key"]) or {}
-        r["attempts"] = int(old.get("attempts") or 0) + (1 if r["verdict"] == "unjudged" else 0)
+        # 見送った分（判定していない）は「試した回数」に数えない
+        tried = r["verdict"] == "unjudged" and r["key"] not in skipped
+        r["attempts"] = int(old.get("attempts") or 0) + (1 if tried else 0)
         if r.get("serious"):
             r["notified"] = bool(old.get("notified"))
         for k in ("month", "part"):  # 判定し直しても、入っている本から動かさない
@@ -656,7 +677,8 @@ def run(a):
         save_months(a.ledger, known, slots, {month_of(r, now) for r in notified}, now)
     for e in errors:
         print("取得失敗: " + e, file=sys.stderr)
-    return 1 if errors and not cands else 0
+    # 取得に失敗したリポジトリ・記録があれば、保存と起票を済ませてから 0 以外で終える（ワークフローを赤くして気づけるように）
+    return 1 if errors else 0
 
 
 def main():

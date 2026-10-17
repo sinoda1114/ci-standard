@@ -749,5 +749,47 @@ class RevertWindow(unittest.TestCase):
         self.assertEqual([s["number"] for s in out[0]["suspects"]], [12])
 
 
+class Robust2(Run):
+    """実行の頑丈さ（1 周目の /ai-review の指摘 L1・L6・L8・L9）"""
+    def test_judging_stops_at_time_budget_and_still_saves(self):
+        cands = [cand("o/r@%07x" % i, "2026-09-%02dT00:00:00Z" % (1 + i % 28)) for i in range(5)]
+        fake = FakeGitHub()
+        clock = iter([0, 0, 0, 10 ** 6, 10 ** 6, 10 ** 6, 10 ** 6, 10 ** 6, 10 ** 6, 10 ** 6])
+        saved = lm.monotonic
+        lm.monotonic = lambda: next(clock, 10 ** 6)
+        try:
+            self.go(fake, cands)
+        finally:
+            lm.monotonic = saved
+        recs = {r["key"]: r for rs in fake.ledgers().values() for r in rs}
+        self.assertEqual(len(recs), 5)  # 時間で見送った分も保存する
+        self.assertLess(len(self.judged), 5)
+        skipped = [r for r in recs.values() if "時間の上限" in (r.get("rationale") or "")]
+        self.assertTrue(skipped)
+        self.assertTrue(all(not r.get("attempts") for r in skipped))  # 見送りは試した回数に数えない（L6）
+
+    def test_over_cap_new_candidates_are_not_counted_as_tried(self):
+        cands = [cand("o/r@%07x" % i, "2026-09-%02dT00:00:00Z" % (1 + i % 28)) for i in range(lm.MAX_PER_RUN + 3)]
+        fake = FakeGitHub()
+        self.go(fake, cands)
+        recs = [r for rs in fake.ledgers().values() for r in rs if "上限で見送り" in (r.get("rationale") or "")]
+        self.assertEqual(len(recs), 3)
+        self.assertTrue(all(not r.get("attempts") for r in recs))
+
+    def test_label_is_not_recolored(self):
+        k = "o/r@abcdeff"
+        fake = FakeGitHub()
+        self.replies = [SERIOUS, SERIOUS]
+        self.go(fake, [cand(k, "2026-09-30T00:00:00Z")])
+        labels = [c for c in fake.calls if c[:2] == ("label", "create")]
+        self.assertTrue(labels and all("--force" not in c for c in labels))
+
+    def test_fetch_errors_make_the_exit_code_nonzero_after_saving(self):
+        fake = FakeGitHub()
+        rc = self.go(fake, [cand("o/r@abcdee0", "2026-09-30T00:00:00Z")], errors=["o/x: HTTP 403"])
+        self.assertNotEqual(rc, 0)
+        self.assertTrue(fake.ledgers())  # 保存は済ませてから
+
+
 if __name__ == "__main__":
     unittest.main()
