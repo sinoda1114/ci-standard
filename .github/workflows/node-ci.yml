@@ -119,7 +119,8 @@ jobs:
           JACTIONLINT_SHA256: 8137d5bfe266dd5e48d2af2306827785ce07c6988e04b1c3d6ad4776e97d27d2
         run: |
           tarball="jactionlint_${JACTIONLINT_VERSION}_linux_amd64.tar.gz"
-          curl --retry 3 --retry-all-errors -sSfL -o "$RUNNER_TEMP/$tarball" "https://github.com/jdx/jactionlint/releases/download/v${JACTIONLINT_VERSION}/${tarball}"
+          curl --retry 3 --retry-all-errors -sSfL -o "$RUNNER_TEMP/$tarball" "https://github.com/jdx/jactionlint/releases/download/v${JACTIONLINT_VERSION}/${tarball}" \
+            || { echo "::error::jactionlint の取得に失敗しました（ワークフローの誤りではありません。GitHub の障害なら再実行で直ることが多い）"; exit 1; }
           echo "${JACTIONLINT_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" jactionlint
           lint() { "$RUNNER_TEMP/jactionlint" --no-hints --no-color --no-online --shellcheck= --pyflakes= "$@"; }
@@ -128,7 +129,7 @@ jobs:
           advisory_rc=0
           lint --format github --ignore 'reusable workflow call "sinoda1114/ci-standard/[^"]*@main" must be pinned' \
             > "$RUNNER_TEMP/advisory.txt" || advisory_rc=$?
-          sed 's/^::error /::warning /' "$RUNNER_TEMP/advisory.txt"
+          sed -E 's/^::error( |::)/::warning\1/' "$RUNNER_TEMP/advisory.txt"
           if [ "$advisory_rc" -gt 1 ]; then
             echo "::warning::jactionlint の助言の実行が失敗しました（終了コード ${advisory_rc}）"
           fi
@@ -137,28 +138,35 @@ jobs:
 
   build:
     needs: [detect, workflow-lint]
-    if: ${{ !cancelled() && needs.detect.outputs.has-node == 'true' }}
+    # package.json が無いリポジトリでもジョブ自体は走らせ、Node 用のステップだけを飛ばす。
+    # ジョブごとスキップにすると、ワークフローの検査の失敗が必須チェック ci / build をすり抜けるため
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.detect.outputs.has-node == 'true'
 
       # corepack で package.json の packageManager フィールドに従い pnpm/yarn を有効化
       - name: Enable corepack
+        if: needs.detect.outputs.has-node == 'true'
         run: corepack enable
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: needs.detect.outputs.has-node == 'true'
         with:
           node-version: ${{ inputs.node-version }}
           cache: ${{ needs.detect.outputs.pm }}
 
       - name: CI用環境変数を読み込み (.github/ci.env)
+        if: needs.detect.outputs.has-node == 'true'
         run: |
           if [ -f .github/ci.env ]; then
             grep -v '^\s*#' .github/ci.env >> "$GITHUB_ENV"
           fi
 
       - name: 実行対象スクリプトを判定
+        if: needs.detect.outputs.has-node == 'true'
         run: |
           has() { node -e "process.exit(require('./package.json').scripts?.['$1'] ? 0 : 1)"; }
           echo "HAS_LINT=$(has lint && echo true || echo false)" >> "$GITHUB_ENV"
@@ -168,6 +176,7 @@ jobs:
           echo "HAS_BUILD=$(has build && echo true || echo false)" >> "$GITHUB_ENV"
 
       - name: Install dependencies
+        if: needs.detect.outputs.has-node == 'true'
         env:
           PM: ${{ needs.detect.outputs.pm }}
         run: |
@@ -224,6 +233,7 @@ jobs:
       # 判定スクリプトは、呼び出されたこのワークフローと版がずれないよう下に埋め込む（scripts/audit-gate.py と同一。
       # 一致は self-test の test_audit_gate.py が検査する）。
       - name: Audit (high以上を検出)
+        if: needs.detect.outputs.has-node == 'true'
         env:
           PM: ${{ needs.detect.outputs.pm }}
         run: |
@@ -636,9 +646,15 @@ jobs:
         if: ${{ !cancelled() }}
         env:
           WORKFLOW_LINT_RESULT: ${{ needs.workflow-lint.result }}
+          DETECT_RESULT: ${{ needs.detect.result }}
         run: |
           if [ "$WORKFLOW_LINT_RESULT" != success ]; then
             echo "::error::ワークフローの検査（workflow-lint ジョブ）の結果が ${WORKFLOW_LINT_RESULT} でした。そのジョブのログを見てください"
+            exit 1
+          fi
+          # detect が失敗すると Node 用のステップが全部飛ぶので、黙って緑にしない
+          if [ "$DETECT_RESULT" != success ]; then
+            echo "::error::リポジトリ構成の判定（detect ジョブ）の結果が ${DETECT_RESULT} でした。そのジョブのログを見てください"
             exit 1
           fi
 

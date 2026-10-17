@@ -50,7 +50,8 @@ jobs:
           JACTIONLINT_SHA256: 8137d5bfe266dd5e48d2af2306827785ce07c6988e04b1c3d6ad4776e97d27d2
         run: |
           tarball="jactionlint_${JACTIONLINT_VERSION}_linux_amd64.tar.gz"
-          curl --retry 3 --retry-all-errors -sSfL -o "$RUNNER_TEMP/$tarball" "https://github.com/jdx/jactionlint/releases/download/v${JACTIONLINT_VERSION}/${tarball}"
+          curl --retry 3 --retry-all-errors -sSfL -o "$RUNNER_TEMP/$tarball" "https://github.com/jdx/jactionlint/releases/download/v${JACTIONLINT_VERSION}/${tarball}" \
+            || { echo "::error::jactionlint の取得に失敗しました（ワークフローの誤りではありません。GitHub の障害なら再実行で直ることが多い）"; exit 1; }
           echo "${JACTIONLINT_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" jactionlint
           lint() { "$RUNNER_TEMP/jactionlint" --no-hints --no-color --no-online --shellcheck= --pyflakes= "$@"; }
@@ -59,7 +60,7 @@ jobs:
           advisory_rc=0
           lint --format github --ignore 'reusable workflow call "sinoda1114/ci-standard/[^"]*@main" must be pinned' \
             > "$RUNNER_TEMP/advisory.txt" || advisory_rc=$?
-          sed 's/^::error /::warning /' "$RUNNER_TEMP/advisory.txt"
+          sed -E 's/^::error( |::)/::warning\1/' "$RUNNER_TEMP/advisory.txt"
           if [ "$advisory_rc" -gt 1 ]; then
             echo "::warning::jactionlint の助言の実行が失敗しました（終了コード ${advisory_rc}）"
           fi

@@ -10,16 +10,24 @@ cd "$(dirname "$0")/.."
 [ ${#FILES[@]} -gt 0 ] || FILES=(.github/workflows/self-test.yml .github/workflows/node-ci.yml .github/workflows/python-ci.yml)
 
 status=0
+# 値を取り出して比べられる形にする（引用符・行末のコメント・前後の空白を落とす）
+value_of() { sed -E "s/^ *$1: *//; s/[[:space:]]+#.*$//; s/[\"']//g; s/[[:space:]]+$//"; }
 for key in JACTIONLINT_VERSION JACTIONLINT_SHA256; do
+  values=""
   for f in "${FILES[@]}"; do
-    if ! grep -q "^ *${key}:" "$f"; then
-      echo "::error file=$f::${key} が書かれていない"
+    v=$(grep -h "^ *${key}:" "$f" | value_of "$key" || true)
+    if [ -z "$v" ]; then
+      echo "::error file=$f::${key} が書かれていないか、値が空"
+      status=1
+    elif [ "$(printf '%s\n' "$v" | wc -l)" -gt 1 ]; then
+      echo "::error file=$f::${key} が 2 回以上書かれている"
       status=1
     fi
+    values="${values}${v}"$'\n'
   done
-  values=$(grep -h "^ *${key}:" "${FILES[@]}" | sed -E "s/^ *${key}: *//; s/'//g" | sort -u || true)
-  if [ "$(printf '%s\n' "$values" | grep -c .)" -gt 1 ]; then
-    echo "::error::${key} がファイルごとに違う: $(printf '%s ' $values)"
+  distinct=$(printf '%s' "$values" | grep . | sort -u || true)
+  if [ "$(printf '%s\n' "$distinct" | grep -c .)" -gt 1 ]; then
+    echo "::error::${key} がファイルごとに違う: $(printf '%s ' $distinct)"
     status=1
   fi
 done

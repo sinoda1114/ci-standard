@@ -35,6 +35,10 @@ jobs:
       - name: jactionlint の版とチェックサムが揃っているか
         run: bash scripts/check-jactionlint-pins.sh
 
+      - name: 配布する workflow-lint ジョブの本体を実際に走らせる
+        # node-ci.yml・python-ci.yml のステップを書かれたとおりに動かす（フラグや終了コードの扱いを誤ると、全リポジトリの ci / build が落ちるため）
+        run: python3 scripts/run-workflow-lint-step.py
+
       - name: ワークフローの文法と式の検査（jactionlint）
         # run: の中の ${{ … }} も Actions の式として評価される。読めない式が 1 つあると、ワークフロー全体が起動しない。
         # 2026-10-04 に、判定スクリプトの f-string の ${{…}} で node-ci.yml を全リポジトリで止めかけた再発防止。
