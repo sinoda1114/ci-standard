@@ -537,17 +537,22 @@ def refetch(stale, owner, exclude, errors):
                 sus = [{"number": n, "title": json.loads(gh("api", "repos/%s/pulls/%d" % (repo, n)))["title"], "diff": ""}
                        for n in r["suspects"]]
             else:
-                d = json.loads(gh("api", "repos/%s/commits/%s" % (repo, r["sha"])))
-                diff = "\n".join(f.get("patch", "") for f in d.get("files", []))
+                # 通常の集め方（collect・fix_candidates）とそろえる: 変更ファイルは全ページ、revert は元の PR だけを窓の中で
+                pages = [x for x in _paged("repos/%s/commits/%s?per_page=100" % (repo, r["sha"])) if isinstance(x, dict)]
+                d = pages[0] if pages else {}
+                diff = "\n".join(f.get("patch", "") for x in pages for f in x.get("files") or [])
                 nums = list(r["suspects"])
                 target = revert_target((d.get("commit") or {}).get("message", ""))
                 if target:  # revert は元の PR を探し直す（前回は取得に失敗して、ファイルの重なりで代えていたかもしれない）
                     ps = json.loads(gh("api", "repos/%s/commits/%s/pulls" % (repo, target)))
-                    if ps and type(ps[0].get("number")) is int:
-                        nums = [ps[0]["number"]]
+                    nums = [ps[0]["number"]] if ps and type(ps[0].get("number")) is int else []
                 sus = []
                 for n in nums:
                     p = json.loads(gh("api", "repos/%s/pulls/%d" % (repo, n)))
+                    if target:
+                        m = p.get("merged_at")
+                        if not (m and dt.timedelta(0) < _ts(r["date"]) - _ts(m) <= dt.timedelta(days=WINDOW_DAYS)):
+                            continue  # revert 元の PR が窓（直前 14 日）の外なら原因の候補にしない
                     s_ = {"number": n, "title": p.get("title", ""),
                           "files": [f["filename"] for f in _paged("repos/%s/pulls/%d/files?per_page=100" % (repo, n))]}
                     s_["diff"], why = suspect_diff(repo, s_)

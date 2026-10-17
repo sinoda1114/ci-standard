@@ -369,7 +369,7 @@ class Run(unittest.TestCase):
         old = {"key": "o/r@abcdef5", "repo": "o/r", "kind": "fix", "sha": "abcdef5", "date": "2026-08-01T00:00:00Z",
                "message": "fix: x", "verdict": "unjudged", "serious": False, "suspects": [10], "attempts": 1}
         fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
-        fake.api = {"api repos/o/r/commits/abcdef5": json.dumps({"files": [{"patch": "+x"}]}),
+        fake.api = {"api --paginate --slurp repos/o/r/commits/abcdef5?per_page=100": json.dumps([{"files": [{"patch": "+x"}]}]),
                     "api repos/o/r/pulls/10": json.dumps({"title": "feat: y"}), "pr diff 10 -R o/r": "+y",
                     "api --paginate --slurp repos/o/r/pulls/10/files?per_page=100": json.dumps([[{"filename": "a"}]])}
         self.go(fake, [])
@@ -406,7 +406,7 @@ class Run(unittest.TestCase):
         self.assertEqual(len(tried), lm.MAX_PER_RUN)
         fake.calls.clear()
         self.go(fake, [])
-        asked = {c[1].split("/commits/")[1] for c in fake.calls if c[0] == "api" and "/commits/" in c[1]}
+        asked = {c[-1].split("/commits/")[1].split("?")[0] for c in fake.calls if c[0] == "api" and "/commits/" in c[-1]}
         self.assertTrue({k.split("@")[1] for k in {r["key"] for r in olds} - tried} <= asked)
 
     def test_many_serious_records_stay_within_body_limit(self):
@@ -575,6 +575,22 @@ class Round2(unittest.TestCase):
         self.assertTrue(lm.build_prompt(c).endswith("```"))
 
 
+class RefetchRevertWindow(Run):
+    def test_refetched_revert_of_pr_outside_window_has_no_suspect(self):
+        old = {"key": "o/r@abcdef9", "repo": "o/r", "kind": "revert", "sha": "abcdef9", "date": "2026-08-01T00:00:00Z",
+               "message": "Revert", "verdict": "unjudged", "serious": False, "suspects": []}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
+        fake.api = {"api --paginate --slurp repos/o/r/commits/abcdef9?per_page=100": json.dumps([{"commit": {"message": 'Revert "x"\n\nThis reverts commit 1234567.'}, "files": []}]),
+                    "api repos/o/r/commits/1234567/pulls": json.dumps([{"number": 10}]),
+                    "api repos/o/r/pulls/10": json.dumps({"title": "feat: x", "merged_at": "2026-06-18T00:00:00Z"})}  # 44 日前
+        lm.gh = fake
+        lm.collect = lambda owner, exclude: ([], [])
+        lm.run(lm.argparse.Namespace(owner="o", ledger="o/ledger", exclude="", dry_run=False))
+        rec = fake.ledgers()["[漏れの記録] 2026-08"][0]
+        self.assertEqual(rec["verdict"], "no-suspect")
+        self.assertEqual(self.judged, [])
+
+
 class Round2b(Run):
     def test_rejudged_record_is_not_lost_and_moves_only_backward(self):
         mk = lambda i, v: {"key": "o/r@%07x" % i, "repo": "o/r", "kind": "fix", "sha": "%07x" % i,
@@ -622,10 +638,10 @@ class RefetchRevert(Run):
         old = {"key": "o/r@abcdef8", "repo": "o/r", "kind": "revert", "sha": "abcdef8", "date": "2026-08-01T00:00:00Z",
                "message": "Revert", "verdict": "unjudged", "serious": False, "suspects": []}
         fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
-        fake.api = {"api repos/o/r/commits/abcdef8": json.dumps({"commit": {"message": 'Revert "x"\n\nThis reverts commit 1234567.'},
-                                                                 "files": [{"patch": "-x"}]}),
+        fake.api = {"api --paginate --slurp repos/o/r/commits/abcdef8?per_page=100": json.dumps([{"commit": {"message": 'Revert "x"\n\nThis reverts commit 1234567.'},
+                                                                 "files": [{"patch": "-x"}]}]),
                     "api repos/o/r/commits/1234567/pulls": json.dumps([{"number": 10}]),
-                    "api repos/o/r/pulls/10": json.dumps({"title": "feat: x"}),
+                    "api repos/o/r/pulls/10": json.dumps({"title": "feat: x", "merged_at": "2026-07-25T00:00:00Z"}),
                     "api --paginate --slurp repos/o/r/pulls/10/files?per_page=100": json.dumps([[{"filename": "src/big.js"}]])}
 
         def pr_diff(*args, input_text=None):
