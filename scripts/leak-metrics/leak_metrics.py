@@ -46,7 +46,8 @@ SECRET_RE = re.compile(
     r"|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}"  # GitHub classic / fine-grained
     r"|xox[abprs]-[A-Za-z0-9\-]{10,}"                     # Slack
     r"|apikey_[A-Za-z0-9_]{30,}"
-    r"|(?i:(password|passwd|secret|api[_-]?key|token)\s*[:=]\s*(['\"][^'\"]{8,}['\"]|[A-Za-z0-9_\-/+=]{16,}))"
+    # 代入（キーは引用符で囲まれていてもよい: "api_key": "値" など）
+    r"|(?i:['\"]?[\w.-]*(password|passwd|secret|api[_-]?key|token|credential)[\w.-]*['\"]?\s*[:=]\s*(['\"][^'\"]{8,}['\"]|[A-Za-z0-9_\-/+=]{16,}))"
     r")")
 SECRET_PATH_RE = re.compile(r"(^|/)(\.env[^/]*|[^/]*\.pem|[^/]*\.key|id_rsa[^/]*|id_ed25519[^/]*|credentials[^/]*|\.npmrc|\.netrc)$")
 STATE_BEGIN = "<!-- leak-metrics-state"
@@ -179,6 +180,16 @@ def redact(text):
             part = part.split("\n", 1)[0] + "\n（秘密情報のファイルなので、差分は送らない）\n"
         out.append(part)
     return SECRET_RE.sub("（秘密情報を伏せた）", "".join(out))
+
+
+def commit_diff(entries):
+    """コミットの変更ファイルの patch を、ファイルごとに diff --git の見出しを付けて連結する（redact が秘密情報のファイルを見分けられるように）"""
+    parts = []
+    for f in entries or []:
+        if isinstance(f, dict):
+            name = f.get("filename") or ""
+            parts.append("diff --git a/%s b/%s\n%s" % (name, name, f.get("patch", "")))
+    return "\n".join(parts)
 
 
 def file_names(entries):
@@ -571,7 +582,7 @@ def collect(owner, exclude, skip=frozenset()):
                 date = min(c["commit"]["committer"]["date"], nowz)  # 未来の日時は今に丸める
                 commits.append({"sha": c["sha"], "date": date, "message": msg,
                                 "files": file_names(files_all), "prs": [],
-                                "diff": "\n".join(f.get("patch", "") for f in files_all)})
+                                "diff": commit_diff(files_all)})
 
             def revert_pr(sha, name=name):
                 ps = json.loads(gh("api", "repos/%s/commits/%s/pulls" % (name, sha)))
@@ -723,7 +734,7 @@ def refetch(stale, owner, exclude, errors):
                         out.append({k: r.get(k) for k in ("key", "repo", "kind", "sha", "date", "message")} | {"diff": "", "suspects": []})
                         continue
                     pages = [x for x in _paged("repos/%s/commits/%s?per_page=100" % (repo, r["sha"])) if isinstance(x, dict)]
-                    diff = "\n".join(f.get("patch", "") for x in pages for f in x.get("files") or [])
+                    diff = commit_diff([f for x in pages for f in x.get("files") or []])
                     msg = ((pages[0] if pages else {}).get("commit") or {}).get("message", "")
                     # 台帳の値を信じない: collect と同じく、既定ブランチに入った fix・revert のコミットだけを取り直す
                     if not is_fix_message(msg):

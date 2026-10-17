@@ -1204,6 +1204,15 @@ class SecretsAndRenames(unittest.TestCase):
             self.assertNotIn(bad, p)
         self.assertIn("process.env.K", p)  # 秘密でない行は残す
 
+    def test_json_style_secrets_and_commit_patches_of_secret_files(self):  # B1 の直し直し
+        c = {"kind": "fix", "message": "fix: x",
+             "diff": lm.commit_diff([{"filename": "config.json", "patch": '-  "api_key": "s3cr3t-value-123"\n+  "api_key": ""'},
+                                     {"filename": ".env.production", "patch": "-DB_PASS=abcdefgh"}]),
+             "suspects": []}
+        p = lm.build_prompt(c)
+        self.assertNotIn("s3cr3t-value-123", p)
+        self.assertNotIn("abcdefgh", p)
+
     def test_renamed_files_keep_the_old_path(self):  # Q3
         self.assertEqual(lm.file_names([{"filename": "new.py", "previous_filename": "old.py"}, {"filename": "b.py"}]),
                          ["new.py", "old.py", "b.py"])
