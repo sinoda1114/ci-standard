@@ -31,6 +31,7 @@ MAX_REFETCH_ERRORS = 3      # 取り直しの失敗を「取得失敗」に数�
 MAX_JUDGE_SECONDS = 20 * 60  # 判定に使う時間の上限。job の timeout-minutes（30）より前に保存まで終える
 MAX_COLLECT_SECONDS = 10 * 60  # 集める処理の時間の上限（残りのリポジトリは見送り、取得の失敗に数える）
 MAX_REFETCH_SECONDS = 5 * 60   # 取り直しの時間の上限（残りは台帳に未判定のまま残し、次回に回す）
+GH_TIMEOUT_SECONDS = 120       # gh の呼び出し 1 回の上限（1 回の呼び出しで時間の上限を越えないように）
 MAX_PROMPT_CHARS = 60000    # 1 件の判定に渡すプロンプトの上限（文字）
 MAX_FIX_DIFF_CHARS = 25000  # そのうち修正の差分に使う分。残りを原因の候補で分ける（候補の節が切り詰めで消えないように）
 MAX_SUSPECTS = 5
@@ -53,7 +54,8 @@ SECRET_RE = re.compile(
 # （1 つの正規表現で書くと、長い英数字の行で二乗の時間になる）
 # 送るかどうかの判定（has_secret）は、値の形を見ない。キーワードの直後に : か = があれば、疑わしいので送らない
 # （値の書き方の抜け道をふさぎきれないため。ユーザーの判断 2026-10-17）
-SECRET_ASSIGN_RE = re.compile(r"""[\w.-]{0,100}['"]?\]?[ \t]*[:=]""")  # config["password"] = … の ] も許す
+# config["password"] = … の ] も、キーと : の間の改行（差分の行頭の + - も）も許す
+SECRET_ASSIGN_RE = re.compile(r"""[\w.-]{0,100}['"]?\]?(?:\s|(?<=\n)[+-])*[:=]""")
 MAX_SECRET_SCAN_CHARS = 2000000  # これより長い文字列は調べきらずに、秘密情報を含むものとして扱う
 # 伏せる（redact）ときは、値の形まで見て範囲を決める
 SECRET_KEY_RE = re.compile(r"(?i)(password|passwd|secret|api[_-]?key|token|credential)")
@@ -545,8 +547,20 @@ def utcnow():
     return dt.datetime.now(dt.timezone.utc)
 
 
+class TimeBudget(Exception):
+    """集める処理・取り直しの時間の上限を越えた"""
+
+
+def check_time(started, limit):
+    if monotonic() - started > limit:
+        raise TimeBudget("時間の上限")
+
+
 def gh(*args, input_text=None):
-    r = subprocess.run(["gh", *args], capture_output=True, text=True, input=input_text)
+    try:
+        r = subprocess.run(["gh", *args], capture_output=True, text=True, input=input_text, timeout=GH_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("gh %s: %d 秒で応答が無い" % (" ".join(args[:3]), GH_TIMEOUT_SECONDS))
     if r.returncode != 0:
         raise RuntimeError("gh %s: %s" % (" ".join(args[:3]), r.stderr.strip()[:300]))
     return r.stdout
@@ -621,6 +635,7 @@ def collect(owner, exclude, skip=frozenset()):
         try:
             prs = []
             for p in recent_prs(name, branch, since_pr):
+                check_time(started, MAX_COLLECT_SECONDS)
                 if p.get("merged_at") and _ts(p["merged_at"]) >= since_pr:
                     files = file_names(_paged("repos/%s/pulls/%d/files?per_page=100" % (name, p["number"])))
                     prs.append({"number": p["number"], "merged_at": p["merged_at"], "title": p["title"], "files": files,
@@ -630,6 +645,7 @@ def collect(owner, exclude, skip=frozenset()):
             # 修正の PR: 窓の中でマージされ、題名が fix・revert の PR を 1 つの候補にする（squash・マージコミット・リベースの
             # どれで入っても同じ。中のコミットのメッセージには頼らない）。差分は PR 全体、キーはマージのコミット
             for p in prs:
+                check_time(started, MAX_COLLECT_SECONDS)
                 if not (p.get("merge_commit_sha") and is_fix_message(p["title"]) and _ts(p["merged_at"]) >= now - dt.timedelta(days=WINDOW_DAYS)):
                     continue
                 pdiff, why = (("", "") if "%s@%s" % (name, p["merge_commit_sha"]) in skip
@@ -644,6 +660,7 @@ def collect(owner, exclude, skip=frozenset()):
                 msg = c["commit"]["message"]
                 if c["sha"] in pr_shas or not is_fix_message(msg):
                     continue
+                check_time(started, MAX_COLLECT_SECONDS)
                 try:  # 1 件の取得の失敗で、リポジトリの残りの候補を落とさない
                     own_prs = json.loads(gh("api", "repos/%s/commits/%s/pulls" % (name, c["sha"])))
                     if own_prs:
@@ -651,6 +668,8 @@ def collect(owner, exclude, skip=frozenset()):
                     # 変更ファイルは 300 件ごとにページが分かれるので、全ページを読む
                     files_all = [f for page in _paged("repos/%s/commits/%s?per_page=100" % (name, c["sha"]))
                                  for f in (page.get("files") or [] if isinstance(page, dict) else [])]
+                except TimeBudget:
+                    raise
                 except Exception as e:
                     # 取れなくても台帳に未判定で残す（窓を出たあとも取り直せるように。材料が欠けているので判定はしない）
                     errors.append("%s@%s: %s" % (name, c["sha"][:7], str(e)[:200]))
@@ -678,6 +697,7 @@ def collect(owner, exclude, skip=frozenset()):
                     continue  # 判定済み（pending で外れる）
                 for s in c["suspects"]:
                     if s["number"] not in diffs:
+                        check_time(started, MAX_COLLECT_SECONDS)
                         diffs[s["number"]] = suspect_diff(name, s)
                     s["diff"], why = diffs[s["number"]]
                     if why:
@@ -693,6 +713,9 @@ def collect(owner, exclude, skip=frozenset()):
                     errors.append("%s: Issue を取得できない: %s" % (name, str(e)[:200]))
                 issues = []
             cands += fc + issue_candidates(name, issues, prs)
+        except TimeBudget:  # リポジトリの途中で上限に達した。このリポジトリの候補は捨て、残りも見送る
+            errors.append("時間の上限で、%s の途中から残りの %d リポジトリを見送った" % (name, len(repos) - k))
+            break
         except Exception as e:  # 1 リポジトリの失敗で全体を止めない。失敗は記録に出す
             if "HTTP 409" in str(e):  # 空のリポジトリ（コミットが無い）は対象外
                 continue
@@ -767,6 +790,7 @@ def refetch(stale, owner, exclude, errors):
         repo = r["repo"]
         rec_files = []
         try:
+            check_time(started, MAX_REFETCH_SECONDS)
             info = repo_info(repo)  # 台帳の値だけで取り直す先を決めない: 今の持ち主のもので、アーカイブされていないこと
             if ((info.get("owner") or {}).get("login") or "").lower() != owner.lower() or info.get("archived"):
                 if counts:
@@ -799,6 +823,7 @@ def refetch(stale, owner, exclude, errors):
                     if hit:
                         pr_no = hit[0]["number"]
                 if pr_no:
+                    check_time(started, MAX_REFETCH_SECONDS)
                     pp = json.loads(gh("api", "repos/%s/pulls/%d" % (repo, pr_no)))
                     if (not pp.get("merged_at") or pp.get("merge_commit_sha") != r["sha"]
                             or (pp.get("base") or {}).get("ref", info.get("default_branch")) != info.get("default_branch")):
@@ -842,6 +867,7 @@ def refetch(stale, owner, exclude, errors):
                     nums = [ps[0]["number"]] if ps and type(ps[0].get("number")) is int else []
                 sus = []
                 for n in nums:
+                    check_time(started, MAX_REFETCH_SECONDS)
                     p = json.loads(gh("api", "repos/%s/pulls/%d" % (repo, n)))
                     # 台帳の suspects を信じない: collect と同じく、既定ブランチに、記録の日付の直前 14 日にマージされた PR だけ
                     # （任意の未マージの PR の差分を AI に渡させない）
@@ -856,6 +882,8 @@ def refetch(stale, owner, exclude, errors):
                     if why:
                         raise RuntimeError(why)
                     sus.append(s_)
+        except TimeBudget:
+            break  # 残りは台帳に未判定のまま残す（試した回数にも、取り直しの失敗にも数えない）
         except Exception as e:  # 取り直せなければ未判定のまま残す
             if counts:
                 errors.append("%s: 取り直しに失敗: %s" % (r["key"], str(e)[:200]))

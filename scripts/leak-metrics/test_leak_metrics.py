@@ -1325,6 +1325,11 @@ class SecretsRound3(unittest.TestCase):
         self.assertTrue(lm.has_secret("""+  password = "abc'defghijk" """))
         self.assertTrue(lm.has_secret("""+  secret: 'ab"cdefghijk'"""))
 
+    def test_newline_between_key_and_colon_is_found(self):  # D1〜D3 の直し直し
+        self.assertTrue(lm.has_secret('{"password"\n: "abc\'defghijk123456"}'))
+        self.assertTrue(lm.has_secret('+  "password"\n+  : "abcdefghijk"'))
+        self.assertTrue(lm.has_secret('-  "password"\n-  = "abcdefghijk"'))
+
     def test_pgp_private_key_is_found(self):  # D4
         self.assertTrue(lm.has_secret("+-----BEGIN PGP PRIVATE KEY BLOCK-----"))
 
@@ -1358,6 +1363,22 @@ class Round4Lm(Run):
         self.assertFalse([c for c in fake.calls if c[0] == "pr"])
         self.assertEqual(self.judged, [])
 
+    def test_refetch_stops_inside_a_record_at_its_time_budget(self):  # D5 の直し直し
+        old = {"key": "o/r@abcde18", "repo": "o/r", "kind": "fix", "sha": "abcde18", "date": "2026-08-01T00:00:00Z",
+               "message": "fix: x", "verdict": "unjudged", "serious": False, "suspects": [10], "pr": 18}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
+        saved = lm.monotonic
+        clock = iter([0, 0, 0])
+        lm.monotonic = lambda: next(clock, 10 ** 6)
+        try:
+            self.go(fake, [])
+        finally:
+            lm.monotonic = saved
+        self.assertFalse([c for c in fake.calls if c[:2] == ("api", "repos/o/r/pulls/18")])
+        rec = fake.ledgers()["[漏れの記録] 2026-08"][0]
+        self.assertFalse(rec.get("refetch_failures"))
+        self.assertFalse(rec.get("attempts"))
+
     def test_owner_match_ignores_case(self):  # D7
         r = {"repo": "O/r", "kind": "fix", "sha": "abcdef1", "key": "O/r@abcdef1", "suspects": [10]}
         self.assertTrue(lm.valid_record(r, "o", set()))
@@ -1379,6 +1400,36 @@ class Round4Lm(Run):
 
 
 class Round4Collect(Collect):
+    def test_collect_stops_inside_a_repo_at_its_time_budget(self):  # D5 の直し直し
+        self.fake(self.base_routes([("c1", "fix: a")]))
+        saved = lm.monotonic
+        clock = iter([0, 0])
+        lm.monotonic = lambda: next(clock, 10 ** 6)
+        try:
+            cands, errors = lm.collect("o", set())
+        finally:
+            lm.monotonic = saved
+        self.assertEqual(cands, [])
+        self.assertTrue(any("時間の上限" in e for e in errors))
+        self.assertFalse([c for c in self.calls if "pulls/10/files" in " ".join(c)])
+
+    def test_gh_call_has_a_timeout(self):
+        import subprocess
+        saved = lm.subprocess.run
+        seen = {}
+
+        def run(*a, **k):
+            seen.update(k)
+            raise subprocess.TimeoutExpired(a[0], k.get("timeout"))
+        lm.subprocess.run = run
+        try:
+            lm.gh = self.saved[0]
+            with self.assertRaises(RuntimeError):
+                lm.gh("api", "x")
+        finally:
+            lm.subprocess.run = saved
+        self.assertEqual(seen.get("timeout"), lm.GH_TIMEOUT_SECONDS)
+
     def test_collect_stops_at_its_time_budget(self):  # D5
         self.fake(self.base_routes([]))
         saved = lm.monotonic
