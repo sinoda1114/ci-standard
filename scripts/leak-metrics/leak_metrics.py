@@ -451,6 +451,22 @@ def anthropic_api(model, prompt):
     return "".join(b.get("text", "") for b in d.get("content", []) if b.get("type") == "text")
 
 
+def recent_prs(repo, base, since):
+    """閉じた PR を、更新日の新しい順にページごとに読み、ページの最後が since より古くなったら打ち切る
+    （_paged は全履歴を読むので、履歴の多いリポジトリで毎日全部を取ってしまう）"""
+    page = 1
+    while page <= 200:
+        items = json.loads(gh("api", "repos/%s/pulls?state=closed&base=%s&sort=updated&direction=desc&per_page=50&page=%d"
+                              % (repo, base, page)))
+        items = [x for x in (items if isinstance(items, list) else []) if isinstance(x, dict)]
+        for p in items:
+            yield p
+        last = items[-1].get("updated_at") if items else None
+        if len(items) < 50 or (last and _ts(last) < since):
+            return
+        page += 1
+
+
 def suspect_diff(repo, s):
     """原因の候補の PR の差分。(差分, 欠けた理由)。大きすぎて取れない（HTTP 406）ものは、取り直しても同じなので
     変更ファイルの一覧で代えて判定を続ける。一時的な失敗は欠けた理由を返す（その候補は次回に判定し直す）"""
@@ -462,7 +478,8 @@ def suspect_diff(repo, s):
         return "", "PR #%s の差分を取得できない: %s" % (s["number"], str(e)[:150])
 
 
-def collect(owner, exclude):
+def collect(owner, exclude, skip=frozenset()):
+    """skip: 判定済みの候補の key。その候補の原因の候補の差分は取り直さない（取得の失敗で赤くもしない）"""
     now = utcnow()
     since_fix = (now - dt.timedelta(days=WINDOW_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
     since_pr = now - dt.timedelta(days=WINDOW_DAYS * 2)
@@ -478,7 +495,7 @@ def collect(owner, exclude):
         branch = urllib.parse.quote(r["defaultBranchRef"]["name"], safe="")  # API のパスに入れるので & # + % を逃がす
         try:
             prs = []
-            for p in _paged("repos/%s/pulls?state=closed&base=%s&sort=updated&direction=desc&per_page=50" % (name, branch)):
+            for p in recent_prs(name, branch, since_pr):
                 if p.get("merged_at") and _ts(p["merged_at"]) >= since_pr:
                     files = [f["filename"] for f in _paged("repos/%s/pulls/%d/files?per_page=100" % (name, p["number"]))]
                     prs.append({"number": p["number"], "merged_at": p["merged_at"], "title": p["title"], "files": files,
@@ -490,7 +507,8 @@ def collect(owner, exclude):
             for p in prs:
                 if not (p.get("merge_commit_sha") and is_fix_message(p["title"]) and _ts(p["merged_at"]) >= now - dt.timedelta(days=WINDOW_DAYS)):
                     continue
-                pdiff, why = suspect_diff(name, {"number": p["number"], "files": p["files"]})
+                pdiff, why = (("", "") if "%s@%s" % (name, p["merge_commit_sha"]) in skip
+                              else suspect_diff(name, {"number": p["number"], "files": p["files"]}))
                 commits.append({"sha": p["merge_commit_sha"], "date": min(p["merged_at"], nowz),
                                 "message": p["title"] + "\n\n" + p["body"], "files": p["files"], "prs": [p["number"]],
                                 "diff": pdiff, "pr": p["number"], **({"incomplete": why} if why else {})})
@@ -526,11 +544,13 @@ def collect(owner, exclude):
             fc = fix_candidates(name, commits, prs, revert_pr=revert_pr)
             seen_why = set()
             for c in fc:  # revert 元の PR を取れなかった候補も、取得の失敗に数える
-                if c.get("incomplete") and c["incomplete"] not in seen_why:
+                if c.get("incomplete") and c["key"] not in skip and c["incomplete"] not in seen_why:
                     seen_why.add(c["incomplete"])
                     errors.append("%s: %s" % (name, c["incomplete"]))
             diffs = {}  # 同じ PR の差分は 1 回だけ取る（失敗も同じ結果を、その PR を候補に持つ全員に返す）
             for c in fc:  # 原因の候補の差分は、判定に使うものだけ取る
+                if c["key"] in skip:
+                    continue  # 判定済み（pending で外れる）
                 for s in c["suspects"]:
                     if s["number"] not in diffs:
                         diffs[s["number"]] = suspect_diff(name, s)
@@ -574,13 +594,23 @@ def valid_record(r, owner, exclude):
     return False
 
 
+_REPO_INFO = {}
+
+
+def repo_info(repo):
+    """リポジトリの持ち主・アーカイブ・既定ブランチ（1 回の実行で 1 度だけ問い合わせる）"""
+    if repo not in _REPO_INFO:
+        _REPO_INFO[repo] = json.loads(gh("api", "repos/%s" % repo))
+    return _REPO_INFO[repo]
+
+
 def rebuild_suspects(repo, r, files, msg):
     """記録の日付の直前 14 日にマージされ、同じファイルを触った PR を、原因の候補として作り直す（PR の番号の配列）"""
     when = _ts(r["date"])
     prs = []
     # 通常の集め方と同じく、既定ブランチにマージされた PR だけを見る
-    base = urllib.parse.quote(json.loads(gh("api", "repos/%s" % repo)).get("default_branch") or "", safe="")
-    for p in _paged("repos/%s/pulls?state=closed&base=%s&sort=updated&direction=desc&per_page=50" % (repo, base)):
+    base = urllib.parse.quote(repo_info(repo).get("default_branch") or "", safe="")
+    for p in recent_prs(repo, base, when - dt.timedelta(days=WINDOW_DAYS)):
         m = p.get("merged_at")
         if m and dt.timedelta(0) < when - _ts(m) <= dt.timedelta(days=WINDOW_DAYS):
             pf = [f["filename"] for f in _paged("repos/%s/pulls/%d/files?per_page=100" % (repo, p["number"]))]
@@ -594,6 +624,7 @@ def refetch(stale, owner, exclude, errors):
     """窓から外れた未判定の記録を、判定できる形に取り直す（試した回数の少ない順に、1 回の上限まで）。
     戻り値: (取り直せた候補, 取り直せなかった記録の key)。取り直せなかったものも「試した」に数える"""
     out, failed = [], []
+    _REPO_INFO.clear()
     # 後から除外したリポジトリの記録は、上限を当てる前に除く（取り直さず、取得失敗にも数えない。記録はそのまま残す）
     live = [r for r in stale if not (isinstance(r.get("repo"), str) and r["repo"].split("/")[-1] in exclude)]
     for r in sorted(live, key=lambda r: (int(r.get("attempts") or 0), r.get("date") or ""))[:MAX_PER_RUN]:
@@ -607,9 +638,16 @@ def refetch(stale, owner, exclude, errors):
             continue
         repo = r["repo"]
         try:
+            info = repo_info(repo)  # 台帳の値だけで取り直す先を決めない: 今の持ち主のもので、アーカイブされていないこと
+            if ((info.get("owner") or {}).get("login") or "").lower() != owner.lower() or info.get("archived"):
+                if counts:
+                    errors.append("台帳の記録のリポジトリが対象外なので取り直さない: %s" % str(r.get("key"))[:100])
+                failed.append(r["key"])
+                continue
             if r["kind"] == "issue":
                 i = json.loads(gh("api", "repos/%s/issues/%s" % (repo, r["key"].rsplit("#", 1)[1])))
                 diff = (i.get("body") or "")[:8000]
+                fetched_msg = i.get("title") or ""
                 sus = [{"number": n, "title": json.loads(gh("api", "repos/%s/pulls/%d" % (repo, n)))["title"], "diff": ""}
                        for n in r["suspects"]]
             else:
@@ -630,6 +668,8 @@ def refetch(stale, owner, exclude, errors):
                     if why:
                         raise RuntimeError(why)
                     msg = (pp.get("title") or "") + "\n\n" + (pp.get("body") or "")
+                    if r.get("rebuild_suspects"):  # PR のマージコミットだった記録も、原因の候補を作り直す
+                        nums = rebuild_suspects(repo, r, pf, msg)
                 else:
                     if own_prs and r["sha"] not in {p.get("merge_commit_sha") for p in own_prs}:
                         # PR の中のコミット（collect と同じく候補にしない）。台帳では判定済み扱いにして取り直しを止める
@@ -641,6 +681,7 @@ def refetch(stale, owner, exclude, errors):
                     if r.get("rebuild_suspects"):
                         # 前回はコミットの詳細を取れず、原因の候補を作れなかった。通常の集め方（fix_candidates）で作り直す
                         nums = rebuild_suspects(repo, r, [f["filename"] for x in pages for f in x.get("files") or []], msg)
+                fetched_msg = msg
                 target, target_pr = revert_target(msg), revert_pr_number(msg, repo)
                 if target_pr:
                     nums = [target_pr]
@@ -654,6 +695,8 @@ def refetch(stale, owner, exclude, errors):
                         m = p.get("merged_at")
                         if not (m and dt.timedelta(0) < _ts(r["date"]) - _ts(m) <= dt.timedelta(days=WINDOW_DAYS)):
                             continue  # revert 元の PR が窓（直前 14 日）の外なら原因の候補にしない
+                        if ((p.get("base") or {}).get("ref") or info.get("default_branch")) != info.get("default_branch"):
+                            continue  # 既定ブランチ以外（release など）にマージされた PR は原因の候補にしない（collect とそろえる）
                     s_ = {"number": n, "title": p.get("title", ""),
                           "files": [f["filename"] for f in _paged("repos/%s/pulls/%d/files?per_page=100" % (repo, n))]}
                     s_["diff"], why = suspect_diff(repo, s_)
@@ -665,8 +708,9 @@ def refetch(stale, owner, exclude, errors):
                 errors.append("%s: 取り直しに失敗: %s" % (r["key"], str(e)[:200]))
             failed.append(r["key"])
             continue
-        out.append({k: r.get(k) for k in ("key", "repo", "kind", "sha", "date", "message", "pr") if r.get(k) is not None}
-                   | {"diff": diff, "suspects": sus})
+        # プロンプトに入る message は、台帳の値ではなく取り直したコミット・PR・Issue のもの（台帳を書き換えて判定を誘導させない）
+        out.append({k: r.get(k) for k in ("key", "repo", "kind", "sha", "date", "pr") if r.get(k) is not None}
+                   | {"message": (fetched_msg or "").splitlines()[0][:200] if fetched_msg else "", "diff": diff, "suspects": sus})
     return out, failed
 
 
@@ -756,7 +800,8 @@ def run(a):
         return 1
     exclude = set(a.exclude.split(",")) | {a.ledger.split("/")[1]}
     known, slots = load_ledger(list_issues(a.ledger))  # 読めない台帳があれば止める（上書きで消さない）
-    cands, errors = collect(a.owner, exclude)
+    done = {k for k, r in known.items() if r.get("verdict") in ("judged", "no-suspect")}
+    cands, errors = collect(a.owner, exclude, done)
     stale = [r for r in known.values() if r.get("verdict") == "unjudged" and r["key"] not in {c["key"] for c in cands}]
     again, failed = refetch(stale, a.owner, exclude, errors)  # 窓から外れた未判定も判定し直す
     cands += again
@@ -788,6 +833,8 @@ def run(a):
         for k in ("month", "part"):  # 判定し直しても、入っている本から動かさない
             if old.get(k):
                 r[k] = old[k]
+        if r["verdict"] == "unjudged" and old.get("refetch_failures"):  # まだ未判定なら、取り直しの失敗の回数も引き継ぐ
+            r["refetch_failures"] = old["refetch_failures"]
         known[r["key"]] = r
     # このログは公開リポジトリの Actions に出るので、件数の合計だけを出す（重大の件数・リポジトリ名は台帳にだけ残す）
     print("候補 %d / 今回判定 %d / 未判定 %d / 取得失敗 %d" % (
