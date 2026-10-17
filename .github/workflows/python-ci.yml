@@ -26,31 +26,53 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  # ワークフローの検査（jactionlint）。第三者のバイナリなので、build と切り離した専用のジョブで動かす
+  # （トークンを .git/config に残さず、install・ビルド・キャッシュとも同じジョブにしない）。
+  # 合否は build の最後のステップがこのジョブの結果を見て決めるので、必須チェック ci / build で止まる。
+  #   - 判定: correctness（構文・式・needs などの誤り）だけで落とす。読めない式が 1 つあるとワークフローごと起動しないため
+  #   - 助言: 既定プロファイル（SHA 固定・permissions などのセキュリティ・運用ルール）は警告の注釈を出すだけで落とさない
+  #   - shellcheck・pyflakes は使わない（目的はワークフローの文法と式）。GitHub への問い合わせもしない
+  # correctness には jactionlint が同梱するデータで判定する規則（unknown-runner-label・unknown-action-input など）がある。
+  # 新しいランナーや action の入力に追いついておらず誤って落ちたときは、呼び出し側で抑止できる（README の「ワークフローの検査」）。
+  # 版とチェックサムは self-test.yml・node-ci.yml と揃える（scripts/check-jactionlint-pins.sh が見る）。
+  # 版を上げる手順は self-test.yml のコメントを参照。
+  workflow-lint:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      # ワークフローの検査（jactionlint）。版とチェックサムは self-test.yml・node-ci.yml と揃える
-      # （scripts/check-jactionlint-pins.sh が見る）。版を上げる手順は self-test.yml のコメントを参照。
-      #   - 判定: correctness（構文・式・needs などの誤り）だけで落とす。読めない式が 1 つあるとワークフローごと起動しないため
-      #   - 助言: 既定プロファイル（SHA 固定・permissions などのセキュリティ・運用ルール）は警告の注釈を出すだけで落とさない
-      #   - shellcheck・pyflakes は使わない（目的はワークフローの文法と式）。GitHub への問い合わせもしない
       - name: ワークフローの検査（jactionlint）
         env:
           JACTIONLINT_VERSION: '2.2.0'
           JACTIONLINT_SHA256: 8137d5bfe266dd5e48d2af2306827785ce07c6988e04b1c3d6ad4776e97d27d2
         run: |
           tarball="jactionlint_${JACTIONLINT_VERSION}_linux_amd64.tar.gz"
-          curl -sSfL -o "$RUNNER_TEMP/$tarball" "https://github.com/jdx/jactionlint/releases/download/v${JACTIONLINT_VERSION}/${tarball}"
+          curl --retry 3 --retry-all-errors -sSfL -o "$RUNNER_TEMP/$tarball" "https://github.com/jdx/jactionlint/releases/download/v${JACTIONLINT_VERSION}/${tarball}"
           echo "${JACTIONLINT_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" jactionlint
           lint() { "$RUNNER_TEMP/jactionlint" --no-hints --no-color --no-online --shellcheck= --pyflakes= "$@"; }
-          # 標準 CI の呼び出し（ci-standard/...@main）は設計上 main を追うので、SHA 固定の警告から外す
+          # 助言。標準 CI の呼び出し（ci-standard/...@main）は設計上 main を追うので、SHA 固定の警告から外す。
+          # 終了コード 1 は「指摘あり」。2 以上は実行そのものの失敗なので、黙って消さずに警告を出す
+          advisory_rc=0
           lint --format github --ignore 'reusable workflow call "sinoda1114/ci-standard/[^"]*@main" must be pinned' \
-            | sed 's/^::error /::warning /' || true
+            > "$RUNNER_TEMP/advisory.txt" || advisory_rc=$?
+          sed 's/^::error /::warning /' "$RUNNER_TEMP/advisory.txt"
+          if [ "$advisory_rc" -gt 1 ]; then
+            echo "::warning::jactionlint の助言の実行が失敗しました（終了コード ${advisory_rc}）"
+          fi
+          # 判定
           lint --profile correctness
+
+  build:
+    needs: workflow-lint
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -106,3 +128,16 @@ jobs:
         # 注: pip-audit は当面 report-only（|| true）。誤検知・修正不能な
         # 推移的依存で全PJのCIが赤くなるのを避けるため。運用が安定したら
         # `|| true` を外して強制化する。
+
+      # ワークフローの検査（workflow-lint ジョブ）の合否をここで反映する。build の needs が失敗すると build はスキップになり、
+      # スキップは必須チェックを満たしてしまうため、build を !cancelled() で走らせてここで落とす。
+      # 最後に置き、lint・テストなどの結果も出す
+      - name: ワークフローの検査（jactionlint）の結果
+        if: ${{ !cancelled() }}
+        env:
+          WORKFLOW_LINT_RESULT: ${{ needs.workflow-lint.result }}
+        run: |
+          if [ "$WORKFLOW_LINT_RESULT" != success ]; then
+            echo "::error::ワークフローの検査（workflow-lint ジョブ）の結果が ${WORKFLOW_LINT_RESULT} でした。そのジョブのログを見てください"
+            exit 1
+          fi

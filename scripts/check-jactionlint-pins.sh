@@ -4,8 +4,9 @@
 # 版を上げるときに 1 か所だけ直す取りこぼしをここで落とす。
 # 使い方: bash scripts/check-jactionlint-pins.sh [ワークフロー...]（既定は下の FILES）
 set -euo pipefail
+FILES=()
+for f in "$@"; do FILES+=("$(cd "$(dirname "$f")" && pwd)/$(basename "$f")"); done   # 呼び出したディレクトリ基準で解決してから cd する
 cd "$(dirname "$0")/.."
-FILES=("$@")
 [ ${#FILES[@]} -gt 0 ] || FILES=(.github/workflows/self-test.yml .github/workflows/node-ci.yml .github/workflows/python-ci.yml)
 
 status=0
