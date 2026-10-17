@@ -485,6 +485,10 @@ def collect(owner, exclude):
                 return ps[0]["number"] if ps else None
             fc = fix_candidates(name, commits, prs, revert_pr=revert_pr)
             seen_why = set()
+            for c in fc:  # revert 元の PR を取れなかった候補も、取得の失敗に数える
+                if c.get("incomplete") and c["incomplete"] not in seen_why:
+                    seen_why.add(c["incomplete"])
+                    errors.append("%s: %s" % (name, c["incomplete"]))
             diffs = {}  # 同じ PR の差分は 1 回だけ取る（失敗も同じ結果を、その PR を候補に持つ全員に返す）
             for c in fc:  # 原因の候補の差分は、判定に使うものだけ取る
                 for s in c["suspects"]:
@@ -552,6 +556,11 @@ def refetch(stale, owner, exclude, errors):
                 d = pages[0] if pages else {}
                 diff = "\n".join(f.get("patch", "") for x in pages for f in x.get("files") or [])
                 nums = list(r["suspects"])
+                own_prs = json.loads(gh("api", "repos/%s/commits/%s/pulls" % (repo, r["sha"])))
+                if own_prs and r["sha"] not in {p.get("merge_commit_sha") for p in own_prs}:
+                    # PR の中で直したコミット（collect と同じく候補にしない）。台帳では判定済み扱いにして取り直しを止める
+                    out.append({k: r.get(k) for k in ("key", "repo", "kind", "sha", "date", "message")} | {"diff": "", "suspects": []})
+                    continue
                 target = revert_target((d.get("commit") or {}).get("message", ""))
                 if target:  # revert は元の PR を探し直す（前回は取得に失敗して、ファイルの重なりで代えていたかもしれない）
                     ps = json.loads(gh("api", "repos/%s/commits/%s/pulls" % (repo, target)))

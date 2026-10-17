@@ -369,7 +369,7 @@ class Run(unittest.TestCase):
         old = {"key": "o/r@abcdef5", "repo": "o/r", "kind": "fix", "sha": "abcdef5", "date": "2026-08-01T00:00:00Z",
                "message": "fix: x", "verdict": "unjudged", "serious": False, "suspects": [10], "attempts": 1}
         fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
-        fake.api = {"api --paginate --slurp repos/o/r/commits/abcdef5?per_page=100": json.dumps([{"files": [{"patch": "+x"}]}]),
+        fake.api = {"api repos/o/r/commits/abcdef5/pulls": "[]", "api --paginate --slurp repos/o/r/commits/abcdef5?per_page=100": json.dumps([{"files": [{"patch": "+x"}]}]),
                     "api repos/o/r/pulls/10": json.dumps({"title": "feat: y"}), "pr diff 10 -R o/r": "+y",
                     "api --paginate --slurp repos/o/r/pulls/10/files?per_page=100": json.dumps([[{"filename": "a"}]])}
         self.go(fake, [])
@@ -580,9 +580,24 @@ class RefetchRevertWindow(Run):
         old = {"key": "o/r@abcdef9", "repo": "o/r", "kind": "revert", "sha": "abcdef9", "date": "2026-08-01T00:00:00Z",
                "message": "Revert", "verdict": "unjudged", "serious": False, "suspects": []}
         fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
-        fake.api = {"api --paginate --slurp repos/o/r/commits/abcdef9?per_page=100": json.dumps([{"commit": {"message": 'Revert "x"\n\nThis reverts commit 1234567.'}, "files": []}]),
+        fake.api = {"api repos/o/r/commits/abcdef9/pulls": "[]", "api --paginate --slurp repos/o/r/commits/abcdef9?per_page=100": json.dumps([{"commit": {"message": 'Revert "x"\n\nThis reverts commit 1234567.'}, "files": []}]),
                     "api repos/o/r/commits/1234567/pulls": json.dumps([{"number": 10}]),
                     "api repos/o/r/pulls/10": json.dumps({"title": "feat: x", "merged_at": "2026-06-18T00:00:00Z"})}  # 44 日前
+        lm.gh = fake
+        lm.collect = lambda owner, exclude: ([], [])
+        lm.run(lm.argparse.Namespace(owner="o", ledger="o/ledger", exclude="", dry_run=False))
+        rec = fake.ledgers()["[漏れの記録] 2026-08"][0]
+        self.assertEqual(rec["verdict"], "no-suspect")
+        self.assertEqual(self.judged, [])
+
+
+class RefetchInsidePr(Run):
+    def test_refetched_commit_inside_a_pr_is_settled_without_judging(self):
+        old = {"key": "o/r@abcdefa", "repo": "o/r", "kind": "fix", "sha": "abcdefa", "date": "2026-08-01T00:00:00Z",
+               "message": "fix: x", "verdict": "unjudged", "serious": False, "suspects": [10]}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
+        fake.api = {"api --paginate --slurp repos/o/r/commits/abcdefa?per_page=100": json.dumps([{"files": [{"patch": "+x"}]}]),
+                    "api repos/o/r/commits/abcdefa/pulls": json.dumps([{"number": 11, "merge_commit_sha": "m11"}])}
         lm.gh = fake
         lm.collect = lambda owner, exclude: ([], [])
         lm.run(lm.argparse.Namespace(owner="o", ledger="o/ledger", exclude="", dry_run=False))
@@ -638,7 +653,7 @@ class RefetchRevert(Run):
         old = {"key": "o/r@abcdef8", "repo": "o/r", "kind": "revert", "sha": "abcdef8", "date": "2026-08-01T00:00:00Z",
                "message": "Revert", "verdict": "unjudged", "serious": False, "suspects": []}
         fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
-        fake.api = {"api --paginate --slurp repos/o/r/commits/abcdef8?per_page=100": json.dumps([{"commit": {"message": 'Revert "x"\n\nThis reverts commit 1234567.'},
+        fake.api = {"api repos/o/r/commits/abcdef8/pulls": "[]", "api --paginate --slurp repos/o/r/commits/abcdef8?per_page=100": json.dumps([{"commit": {"message": 'Revert "x"\n\nThis reverts commit 1234567.'},
                                                                  "files": [{"patch": "-x"}]}]),
                     "api repos/o/r/commits/1234567/pulls": json.dumps([{"number": 10}]),
                     "api repos/o/r/pulls/10": json.dumps({"title": "feat: x", "merged_at": "2026-07-25T00:00:00Z"}),
@@ -719,6 +734,13 @@ class Collect(unittest.TestCase):
 
     def test_suspect_diff_failure_is_counted_as_a_fetch_error(self):
         self.fake(self.base_routes([("f1", "fix: a")]), fail=("pr diff 10",))
+        cands, errors = lm.collect("o", set())
+        self.assertIn("incomplete", cands[0])
+        self.assertEqual(len(errors), 1)
+
+    def test_revert_lookup_failure_is_counted_as_a_fetch_error(self):
+        r = self.base_routes([("r1", 'Revert "x"\n\nThis reverts commit abcdef1.')])
+        self.fake(r, fail=("repos/o/r/commits/abcdef1/pulls",))
         cands, errors = lm.collect("o", set())
         self.assertIn("incomplete", cands[0])
         self.assertEqual(len(errors), 1)
