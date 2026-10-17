@@ -1006,6 +1006,25 @@ class Round3N(Run):
         self.assertGreaterEqual(lim, 1000)
 
 
+class RebuildSuspects(Run):
+    def test_record_without_suspects_gets_them_rebuilt_on_refetch(self):
+        old = {"key": "o/r@abcde22", "repo": "o/r", "kind": "fix", "sha": "abcde22", "date": "2026-08-10T00:00:00Z",
+               "message": "fix: a", "verdict": "unjudged", "serious": False, "suspects": [], "rebuild_suspects": True}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
+        fake.api = {"api repos/o/r/commits/abcde22/pulls": "[]",
+                    "api --paginate --slurp repos/o/r/commits/abcde22?per_page=100": json.dumps([{"commit": {"message": "fix: a"}, "files": [{"filename": "src/a.js", "patch": "-a"}]}]),
+                    "api --paginate --slurp repos/o/r/pulls?state=closed&sort=updated&direction=desc&per_page=50": json.dumps([[{"number": 10, "merged_at": "2026-08-05T00:00:00Z", "title": "feat: x"}]]),
+                    "api --paginate --slurp repos/o/r/pulls/10/files?per_page=100": json.dumps([[{"filename": "src/a.js"}]]),
+                    "api repos/o/r/pulls/10": json.dumps({"title": "feat: x"}),
+                    "pr diff 10 -R o/r": "+x"}
+        lm.gh = fake
+        lm.collect = lambda owner, exclude: ([], [])
+        lm.run(lm.argparse.Namespace(owner="o", ledger="o/ledger", exclude="", dry_run=False))
+        rec = fake.ledgers()["[漏れの記録] 2026-08"][0]
+        self.assertEqual(rec["verdict"], "judged")
+        self.assertEqual(rec["suspects"], [10])
+
+
 class Round3NCollect(Collect):
     def test_direct_commit_whose_detail_fails_is_kept_unjudged(self):  # N8
         r = self.base_routes([("f1", "fix: a")])

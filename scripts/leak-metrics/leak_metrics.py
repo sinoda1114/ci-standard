@@ -103,7 +103,8 @@ def fix_candidates(repo, commits, prs, revert_pr=None):
         out.append({"key": "%s@%s" % (repo, c["sha"]), "repo": repo, "kind": kind, "sha": c["sha"],
                     "date": c["date"], "message": c["message"].splitlines()[0][:200],
                     "diff": c.get("diff", ""), "suspects": suspects, **({"incomplete": incomplete} if incomplete else {}),
-                    **({"pr": c["pr"]} if c.get("pr") else {})})
+                    **({"pr": c["pr"]} if c.get("pr") else {}),
+                    **({"rebuild_suspects": True} if c.get("rebuild_suspects") else {})})
     return out
 
 
@@ -180,6 +181,8 @@ def base_record(c, why=""):
     rec = {k: c.get(k) for k in ("key", "repo", "kind", "sha", "date", "message")}
     if c.get("pr"):
         rec["pr"] = c["pr"]  # 修正の PR の候補（取り直しで PR 全体の差分を取るため）
+    if c.get("rebuild_suspects"):
+        rec["rebuild_suspects"] = True  # 原因の候補を作れなかった（取り直しで作り直す）
     rec["suspects"] = [s["number"] for s in c["suspects"]]
     rec.update({"verdict": "unjudged", "serious": False, "severity": None, "security": None,
                 "caused_by_pr": None, "rationale": why, "models": []})
@@ -317,7 +320,7 @@ def valid_shape(r):
         return False
     types = {"repo": str, "kind": str, "sha": str, "date": str, "message": str, "verdict": str, "rationale": str,
              "month": str, "severity": str, "is_leak": str, "serious": bool, "notified": bool, "security": bool,
-             "attempts": int, "part": int, "pr": int, "caused_by_pr": int, "suspects": list, "models": list}
+             "attempts": int, "part": int, "pr": int, "rebuild_suspects": bool, "caused_by_pr": int, "suspects": list, "models": list}
     for k, t in types.items():
         v = r.get(k)
         if v is not None and not (isinstance(v, t) and not (t is int and isinstance(v, bool))):
@@ -509,7 +512,8 @@ def collect(owner, exclude):
                     # 取れなくても台帳に未判定で残す（窓を出たあとも取り直せるように。材料が欠けているので判定はしない）
                     errors.append("%s@%s: %s" % (name, c["sha"][:7], str(e)[:200]))
                     commits.append({"sha": c["sha"], "date": min(c["commit"]["committer"]["date"], nowz), "message": msg,
-                                    "files": [], "prs": [], "diff": "", "incomplete": "コミットの詳細を取得できない"})
+                                    "files": [], "prs": [], "diff": "", "incomplete": "コミットの詳細を取得できない",
+                                    "rebuild_suspects": True})
                     continue
                 date = min(c["commit"]["committer"]["date"], nowz)  # 未来の日時は今に丸める
                 commits.append({"sha": c["sha"], "date": date, "message": msg,
@@ -570,6 +574,20 @@ def valid_record(r, owner, exclude):
     return False
 
 
+def rebuild_suspects(repo, r, files, msg):
+    """記録の日付の直前 14 日にマージされ、同じファイルを触った PR を、原因の候補として作り直す（PR の番号の配列）"""
+    when = _ts(r["date"])
+    prs = []
+    for p in _paged("repos/%s/pulls?state=closed&sort=updated&direction=desc&per_page=50" % repo):
+        m = p.get("merged_at")
+        if m and dt.timedelta(0) < when - _ts(m) <= dt.timedelta(days=WINDOW_DAYS):
+            pf = [f["filename"] for f in _paged("repos/%s/pulls/%d/files?per_page=100" % (repo, p["number"]))]
+            prs.append({"number": p["number"], "merged_at": m, "title": p.get("title", ""), "files": pf})
+    c = {"sha": r["sha"], "date": r["date"], "message": msg or r.get("message") or "", "files": files, "prs": []}
+    cands = fix_candidates(repo, [c], prs)
+    return [s["number"] for s in cands[0]["suspects"]] if cands else []
+
+
 def refetch(stale, owner, exclude, errors):
     """窓から外れた未判定の記録を、判定できる形に取り直す（試した回数の少ない順に、1 回の上限まで）。
     戻り値: (取り直せた候補, 取り直せなかった記録の key)。取り直せなかったものも「試した」に数える"""
@@ -616,6 +634,9 @@ def refetch(stale, owner, exclude, errors):
                     pages = [x for x in _paged("repos/%s/commits/%s?per_page=100" % (repo, r["sha"])) if isinstance(x, dict)]
                     diff = "\n".join(f.get("patch", "") for x in pages for f in x.get("files") or [])
                     msg = ((pages[0] if pages else {}).get("commit") or {}).get("message", "")
+                    if r.get("rebuild_suspects"):
+                        # 前回はコミットの詳細を取れず、原因の候補を作れなかった。通常の集め方（fix_candidates）で作り直す
+                        nums = rebuild_suspects(repo, r, [f["filename"] for x in pages for f in x.get("files") or []], msg)
                 target, target_pr = revert_target(msg), revert_pr_number(msg, repo)
                 if target_pr:
                     nums = [target_pr]
