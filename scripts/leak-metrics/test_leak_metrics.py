@@ -266,6 +266,8 @@ class FakeGitHub:
             return ""
         if args[:2] == ("label", "create"):
             return ""
+        if args[:2] == ("repo", "view"):
+            return json.dumps({"visibility": getattr(self, "visibility", "PRIVATE")})
         if args[0] in ("api", "pr"):
             key = " ".join(args)
             if key not in self.api:
@@ -606,6 +608,25 @@ class RefetchInsidePr(Run):
         self.assertEqual(self.judged, [])
 
 
+class Round2Lm(Run):
+    """2 周目の /ai-review の指摘 M2・M3"""
+    def test_record_that_can_never_be_refetched_stops_failing_the_run(self):
+        old = {"key": "o/r@abcde77", "repo": "o/r", "kind": "fix", "sha": "abcde77", "date": "2026-08-01T00:00:00Z",
+               "message": "fix: x", "verdict": "unjudged", "serious": False, "suspects": [10], "attempts": 3}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
+        rc = self.go(fake, [])  # 取り直しは 404（偽の API に応答が無い）
+        self.assertEqual(rc, 0)
+        self.assertEqual(fake.ledgers()["[漏れの記録] 2026-08"][0]["attempts"], 4)  # 取り直しは続ける
+
+    def test_ledger_that_is_not_private_is_never_written(self):
+        fake = FakeGitHub()
+        fake.visibility = "PUBLIC"
+        rc = self.go(fake, [cand("o/r@abcde78", "2026-09-30T00:00:00Z")])
+        self.assertNotEqual(rc, 0)
+        self.assertFalse([c for c in fake.calls if c[:2] in (("issue", "edit"), ("issue", "create"))])
+        self.assertEqual(self.judged, [])
+
+
 class Round2b(Run):
     def test_rejudged_record_is_not_lost_and_moves_only_backward(self):
         mk = lambda i, v: {"key": "o/r@%07x" % i, "repo": "o/r", "kind": "fix", "sha": "%07x" % i,
@@ -726,11 +747,24 @@ class Collect(unittest.TestCase):
         self.assertEqual([c["key"] for c in cands], ["o/r@f1"])
         self.assertEqual(errors, [])  # Issue を無効にしたリポジトリ（410）は失敗に数えない
 
-    def test_fix_commit_inside_a_merged_pr_is_not_a_candidate(self):
-        pulls = {"f2": [{"number": 11, "merge_commit_sha": "m11"}], "m11": [{"number": 11, "merge_commit_sha": "m11"}]}
+    def test_fix_commit_inside_a_feature_pr_is_not_a_candidate(self):
+        pulls = {"f2": [{"number": 11, "merge_commit_sha": "m11", "title": "feat: 新機能", "merged_at": "2026-10-18T00:00:00Z"}],
+                 "m11": [{"number": 11, "merge_commit_sha": "m11", "title": "fix: PR の squash", "merged_at": "2026-10-18T00:00:00Z"}]}
         self.fake(self.base_routes([("f2", "fix: レビュー中の直し"), ("m11", "fix: PR の squash")], pulls_of=pulls))
         cands, _ = lm.collect("o", set())
         self.assertEqual([c["key"] for c in cands], ["o/r@m11"])
+
+    def test_fix_pr_merged_with_a_merge_commit_is_one_candidate(self):
+        p12 = {"number": 12, "merge_commit_sha": "m12", "title": "fix: a を直す", "merged_at": "2026-10-18T00:00:00Z"}
+        pulls = {"c1": [p12], "c2": [p12]}
+        r = self.base_routes([("c1", "fix: a の 1"), ("c2", "fix: a の 2")], pulls_of=pulls)
+        r["repos/o/r/pulls/12/files"] = [[{"filename": "src/a.js"}]]
+        r["pr diff 12"] = "-a\n+b"
+        self.fake(r)
+        cands, _ = lm.collect("o", set())
+        self.assertEqual([c["key"] for c in cands], ["o/r@m12"])  # PR を 1 つの候補にする（コミットごとに重ねない）
+        self.assertEqual(cands[0]["message"], "fix: a を直す")
+        self.assertEqual([s["number"] for s in cands[0]["suspects"]], [10])
 
     def test_suspect_diff_failure_is_counted_as_a_fetch_error(self):
         self.fake(self.base_routes([("f1", "fix: a")]), fail=("pr diff 10",))

@@ -26,6 +26,7 @@ WINDOW_DAYS = 14
 STAGE1_MODEL = "claude-haiku-5-5"
 STAGE2_MODEL = "claude-opus-5-5"
 MAX_PER_RUN = 60            # 1 回の実行で判定する上限（料金の上限を決める）
+MAX_REFETCH_ERRORS = 3      # 取り直しの失敗を「取得失敗」に数える回数（以後は数えずに取り直しだけ続ける。毎日赤くし続けない）
 MAX_JUDGE_SECONDS = 20 * 60  # 判定に使う時間の上限。job の timeout-minutes（30）より前に保存まで終える
 MAX_PROMPT_CHARS = 60000    # 1 件の判定に渡すプロンプトの上限（文字）
 MAX_FIX_DIFF_CHARS = 25000  # そのうち修正の差分に使う分。残りを原因の候補で分ける（候補の節が切り詰めで消えないように）
@@ -66,7 +67,7 @@ def fix_candidates(repo, commits, prs, revert_pr=None):
         when = _ts(c["date"])
         target = revert_target(c["message"])
         kind = "revert" if target or c["message"].lower().startswith("revert") else "fix"
-        suspects, incomplete, known = [], "", False
+        suspects, incomplete, known = [], c.get("incomplete", ""), False
         if target and revert_pr:
             try:
                 n = revert_pr(target)
@@ -459,7 +460,7 @@ def collect(owner, exclude):
                 if p.get("merged_at") and _ts(p["merged_at"]) >= since_pr:
                     files = [f["filename"] for f in _paged("repos/%s/pulls/%d/files?per_page=100" % (name, p["number"]))]
                     prs.append({"number": p["number"], "merged_at": p["merged_at"], "title": p["title"], "files": files})
-            commits = []
+            commits, pr_level = [], {}
             for c in _paged("repos/%s/commits?sha=%s&since=%s&per_page=100" % (name, branch, since_fix)):
                 msg = c["commit"]["message"]
                 if not is_fix_message(msg):
@@ -473,12 +474,28 @@ def collect(owner, exclude):
                     errors.append("%s@%s: %s" % (name, c["sha"][:7], str(e)[:200]))
                     continue
                 own = [p["number"] for p in own_prs]
-                if own_prs and c["sha"] not in {p.get("merge_commit_sha") for p in own_prs}:
-                    continue  # PR の中で直したコミット（マージコミット方式で既定ブランチに入った）。マージ後の直しではない
                 date = min(c["commit"]["committer"]["date"], now.strftime("%Y-%m-%dT%H:%M:%SZ"))  # 未来の日時は今に丸める
+                if own_prs and c["sha"] not in {p.get("merge_commit_sha") for p in own_prs}:
+                    # PR の中のコミット（マージコミット方式・リベースで既定ブランチに入った）。直しの単位は PR にする:
+                    # PR の題名が fix なら PR を 1 つの候補に、そうでなければ（機能の PR の途中の直し）候補にしない
+                    p0 = own_prs[0]
+                    n0 = p0.get("number")
+                    if type(n0) is int and is_fix_message(p0.get("title") or "") and n0 not in pr_level:
+                        try:
+                            pf = [f["filename"] for f in _paged("repos/%s/pulls/%d/files?per_page=100" % (name, n0))]
+                        except Exception as e:
+                            errors.append("%s#%d: %s" % (name, n0, str(e)[:200]))
+                            continue
+                        pdiff, why = suspect_diff(name, {"number": n0, "files": pf})
+                        pr_level[n0] = {"sha": p0.get("merge_commit_sha") or c["sha"], "message": p0["title"],
+                                        "date": min(p0.get("merged_at") or date, now.strftime("%Y-%m-%dT%H:%M:%SZ")),
+                                        "files": pf, "prs": [n0], "diff": pdiff, **({"incomplete": why} if why else {})}
+                    continue
                 commits.append({"sha": c["sha"], "date": date, "message": msg,
                                 "files": [f["filename"] for f in files_all], "prs": own,
                                 "diff": "\n".join(f.get("patch", "") for f in files_all)})
+
+            commits += list(pr_level.values())
 
             def revert_pr(sha, name=name):
                 ps = json.loads(gh("api", "repos/%s/commits/%s/pulls" % (name, sha)))
@@ -579,7 +596,8 @@ def refetch(stale, owner, exclude, errors):
                         raise RuntimeError(why)
                     sus.append(s_)
         except Exception as e:  # 取り直せなければ未判定のまま残す
-            errors.append("%s: 取り直しに失敗: %s" % (r["key"], str(e)[:200]))
+            if int(r.get("attempts") or 0) + 1 < MAX_REFETCH_ERRORS:
+                errors.append("%s: 取り直しに失敗: %s" % (r["key"], str(e)[:200]))
             failed.append(r["key"])
             continue
         out.append({k: r.get(k) for k in ("key", "repo", "kind", "sha", "date", "message")} | {"diff": diff, "suspects": sus})
@@ -660,6 +678,16 @@ def report_errors(errors):
 def run(a):
     started = monotonic()
     now = utcnow()
+    # 台帳には private リポジトリの情報（判定の理由・候補）を書くので、Private でなければ何もせずに止める
+    try:
+        vis = json.loads(gh("repo", "view", a.ledger, "--json", "visibility")).get("visibility")
+    except Exception as e:
+        print("台帳（%s）の公開設定を確かめられません: %s" % (a.ledger, str(e)[:200]), file=sys.stderr)
+        return 1
+    if vis != "PRIVATE":
+        print("台帳（%s）が Private ではありません（%s）。private の情報を書かないよう、何もせずに止めます" % (a.ledger, vis),
+              file=sys.stderr)
+        return 1
     exclude = set(a.exclude.split(",")) | {a.ledger.split("/")[1]}
     known, slots = load_ledger(list_issues(a.ledger))  # 読めない台帳があれば止める（上書きで消さない）
     cands, errors = collect(a.owner, exclude)
