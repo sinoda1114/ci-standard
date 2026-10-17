@@ -567,6 +567,8 @@ def refetch(stale, owner, exclude, errors):
     戻り値: (取り直せた候補, 取り直せなかった記録の key)。取り直せなかったものも「試した」に数える"""
     out, failed = [], []
     for r in sorted(stale, key=lambda r: (int(r.get("attempts") or 0), r.get("date") or ""))[:MAX_PER_RUN]:
+        if isinstance(r.get("repo"), str) and r["repo"].split("/")[-1] in exclude:
+            continue  # 後から除外したリポジトリの記録は取り直さない（取得失敗にも数えない。記録はそのまま残す）
         if not valid_record(r, owner, exclude):
             errors.append("台帳の記録が不正なので取り直さない: %s" % str(r.get("key"))[:100])
             failed.append(r["key"])
@@ -582,15 +584,21 @@ def refetch(stale, owner, exclude, errors):
                 # 通常の集め方（collect・fix_candidates）とそろえる: 修正の PR は PR 全体の差分、コミットは変更ファイルの全ページ、
                 # revert は元の PR だけを窓の中で
                 nums = list(r["suspects"])
-                if r.get("pr"):
-                    pp = json.loads(gh("api", "repos/%s/pulls/%d" % (repo, r["pr"])))
-                    pf = [f["filename"] for f in _paged("repos/%s/pulls/%d/files?per_page=100" % (repo, r["pr"]))]
-                    diff, why = suspect_diff(repo, {"number": r["pr"], "files": pf})
+                pr_no = r.get("pr")
+                own_prs = None
+                if not pr_no:  # PR の番号を持たない記録でも、そのコミットが PR のマージのコミットなら PR の候補として扱う
+                    own_prs = json.loads(gh("api", "repos/%s/commits/%s/pulls" % (repo, r["sha"])))
+                    hit = [p for p in own_prs if p.get("merge_commit_sha") == r["sha"] and type(p.get("number")) is int]
+                    if hit:
+                        pr_no = hit[0]["number"]
+                if pr_no:
+                    pp = json.loads(gh("api", "repos/%s/pulls/%d" % (repo, pr_no)))
+                    pf = [f["filename"] for f in _paged("repos/%s/pulls/%d/files?per_page=100" % (repo, pr_no))]
+                    diff, why = suspect_diff(repo, {"number": pr_no, "files": pf})
                     if why:
                         raise RuntimeError(why)
                     msg = (pp.get("title") or "") + "\n\n" + (pp.get("body") or "")
                 else:
-                    own_prs = json.loads(gh("api", "repos/%s/commits/%s/pulls" % (repo, r["sha"])))
                     if own_prs and r["sha"] not in {p.get("merge_commit_sha") for p in own_prs}:
                         # PR の中のコミット（collect と同じく候補にしない）。台帳では判定済み扱いにして取り直しを止める
                         out.append({k: r.get(k) for k in ("key", "repo", "kind", "sha", "date", "message")} | {"diff": "", "suspects": []})

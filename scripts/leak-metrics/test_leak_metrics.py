@@ -645,6 +645,32 @@ class RefetchPr(Run):
         self.assertTrue(any("PR-WHOLE-DIFF" in p for p in self.prompts))
 
 
+class Round3Lm(Run):
+    """2 周目の確認役の却下の理由（M1・M2 の残り）"""
+    def test_old_record_without_pr_number_uses_the_pr_diff_when_it_is_a_merge_commit(self):
+        old = {"key": "o/r@abcde16", "repo": "o/r", "kind": "fix", "sha": "abcde16", "date": "2026-08-01T00:00:00Z",
+               "message": "fix: x", "verdict": "unjudged", "serious": False, "suspects": []}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
+        fake.api = {"api repos/o/r/commits/abcde16/pulls": json.dumps([{"number": 16, "merge_commit_sha": "abcde16"}]),
+                    "api repos/o/r/pulls/16": json.dumps({"title": "fix: x", "body": ""}),
+                    "api --paginate --slurp repos/o/r/pulls/16/files?per_page=100": json.dumps([[{"filename": "a.js"}]]),
+                    "pr diff 16 -R o/r": "+WHOLE"}
+        lm.gh = fake
+        lm.collect = lambda owner, exclude: ([], [])
+        lm.run(lm.argparse.Namespace(owner="o", ledger="o/ledger", exclude="", dry_run=False))
+        self.assertFalse([c for c in fake.calls if c[0] == "api" and "commits/abcde16?per_page" in c[-1]])
+
+    def test_records_of_a_later_excluded_repo_are_not_errors(self):
+        old = {"key": "o/gone@abcde17", "repo": "o/gone", "kind": "fix", "sha": "abcde17", "date": "2026-08-01T00:00:00Z",
+               "message": "fix: x", "verdict": "unjudged", "serious": False, "suspects": [10]}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
+        lm.gh = fake
+        lm.collect = lambda owner, exclude: ([], [])
+        rc = lm.run(lm.argparse.Namespace(owner="o", ledger="o/ledger", exclude="gone", dry_run=False))
+        self.assertEqual(rc, 0)
+        self.assertEqual(fake.ledgers()["[漏れの記録] 2026-08"][0]["verdict"], "unjudged")
+
+
 class Round2b(Run):
     def test_rejudged_record_is_not_lost_and_moves_only_backward(self):
         mk = lambda i, v: {"key": "o/r@%07x" % i, "repo": "o/r", "kind": "fix", "sha": "%07x" % i,
