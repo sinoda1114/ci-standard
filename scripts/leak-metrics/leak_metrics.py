@@ -548,8 +548,9 @@ def utcnow():
     return dt.datetime.now(dt.timezone.utc)
 
 
-class TimeBudget(Exception):
-    """集める処理・取り直しの時間の上限を越えた"""
+class TimeBudget(BaseException):
+    """集める処理・取り直しの時間の上限を越えた。取得の失敗（Exception）とは別に扱うので、
+    途中の except Exception に飲まれないよう BaseException の子にする"""
 
 
 _DEADLINE = None  # 集める処理・取り直しの間だけ入る期限（monotonic の値）。gh の呼び出しとページのループが確かめる
@@ -634,7 +635,10 @@ def suspect_diff(repo, s):
 def collect(owner, exclude, skip=frozenset()):
     """skip: 判定済みの候補の key。その候補の原因の候補の差分は取り直さない（取得の失敗で赤くもしない）"""
     with time_budget(MAX_COLLECT_SECONDS) as started:
-        return _collect(owner, exclude, skip, started)
+        try:
+            return _collect(owner, exclude, skip, started)
+        except TimeBudget:  # リポジトリの一覧を取る前に上限に達した
+            return [], ["時間の上限で、リポジトリの一覧を取れなかった"]
 
 
 def _collect(owner, exclude, skip, started):

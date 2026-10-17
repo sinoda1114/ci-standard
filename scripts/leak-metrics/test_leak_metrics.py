@@ -1379,6 +1379,27 @@ class Round4Lm(Run):
         self.assertFalse(rec.get("refetch_failures"))
         self.assertFalse(rec.get("attempts"))
 
+    def test_deadline_inside_suspect_diff_is_not_a_refetch_failure(self):  # D5 の直し直し 3 回目
+        old = {"key": "o/r@abcde19", "repo": "o/r", "kind": "fix", "sha": "abcde19", "date": "2026-08-01T00:00:00Z",
+               "message": "fix: x", "verdict": "unjudged", "serious": False, "suspects": [10], "pr": 19}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
+        fake.api = {"api repos/o/r/pulls/19": json.dumps({"title": "fix: x", "body": "", "merged_at": "2026-08-01T00:00:00Z",
+                                                          "merge_commit_sha": "abcde19", "base": {"ref": "main"}}),
+                    "api --paginate --slurp repos/o/r/pulls/19/files?per_page=100": json.dumps([[{"filename": "a.js"}]])}
+        real = fake.__call__
+
+        def gh(*args, input_text=None):  # suspect_diff の中（pr diff）で期限を越える
+            if args[:3] == ("pr", "diff", "19"):
+                raise lm.TimeBudget("時間の上限")
+            return real(*args, input_text=input_text)
+        fake_gh = gh
+        lm.gh = fake_gh
+        lm.collect = lambda owner, exclude, skip=frozenset(): ([], [])
+        lm.run(lm.argparse.Namespace(owner="o", ledger="o/ledger", exclude="", dry_run=False))
+        rec = fake.ledgers()["[漏れの記録] 2026-08"][0]
+        self.assertFalse(rec.get("refetch_failures"))
+        self.assertFalse(rec.get("attempts"))
+
     def test_owner_match_ignores_case(self):  # D7
         r = {"repo": "O/r", "kind": "fix", "sha": "abcdef1", "key": "O/r@abcdef1", "suspects": [10]}
         self.assertTrue(lm.valid_record(r, "o", set()))
