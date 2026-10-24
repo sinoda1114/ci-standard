@@ -1597,6 +1597,28 @@ class PrBotsGate(Run):
         self.assertTrue([c for c in fake.calls if c[:3] == ("pr", "diff", "12")])
         self.assertTrue(self.judged)
 
+    def test_refetched_revert_after_two_renames_uses_the_pr(self):  # 確認役の却下（名前を 2 回変えた）
+        old = {"key": "o/r@abcde28", "repo": "o/r", "kind": "revert", "sha": "abcde28", "date": "2026-08-01T00:00:00Z",
+               "message": "Revert", "verdict": "unjudged", "serious": False, "suspects": [], "pr": 28}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
+        fake.api = {"api repos/o/r": json.dumps({"full_name": "o/new-name", "owner": {"login": "o"}, "archived": False, "default_branch": "main"}),
+                    "api repos/o/r/pulls/28": json.dumps({"title": "Revert \"feat: y\"", "body": "Reverts o/old-name#12",
+                                                          "merged_at": "2026-08-01T00:00:00Z", "merge_commit_sha": "abcde28",
+                                                          "base": {"ref": "main"}}),
+                    "api --paginate --slurp repos/o/r/pulls/28/files?per_page=100": json.dumps([[{"filename": "a.js"}]]),
+                    "pr diff 28 -R o/r": "-y",
+                    "api repos/o/old-name": json.dumps({"full_name": "o/new-name", "owner": {"login": "o"}}),
+                    "api repos/o/r/pulls/12": json.dumps({"title": "feat: y", "merged_at": "2026-07-25T00:00:00Z", "base": {"ref": "main"}}),
+                    "api --paginate --slurp repos/o/r/pulls/12/files?per_page=100": json.dumps([[{"filename": "a.js"}]]),
+                    "pr diff 12 -R o/r": "+y"}
+        self.go(fake, [])
+        self.assertTrue([c for c in fake.calls if c[:3] == ("pr", "diff", "12")])
+
+    def test_missing_revert_ref_is_another_repo(self):
+        lm.gh = lambda *a, input_text=None: (_ for _ in ()).throw(RuntimeError("gh api repos/x/gone: HTTP 404"))
+        lm._REPO_INFO.clear()
+        self.assertFalse(lm.same_repo("x/gone", "o/r"))
+
     def test_revert_of_renamed_repo_uses_the_pr(self):  # own-review（名前を変えたリポジトリ）
         msg = "Revert \"feat: y\"\n\nReverts o/old-name#12"
         same = lambda ref: ref.lower() == "o/old-name"
