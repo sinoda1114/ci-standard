@@ -13,6 +13,20 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import leak_metrics as lm  # noqa: E402
 
 
+def with_base(text):
+    """PR の一覧の応答の、base の無い PR に既定ブランチ main を補う（本物の API の一覧は必ず base を持つ）"""
+    try:
+        d = json.loads(text)
+    except ValueError:
+        return text
+    pages = d if d and all(isinstance(x, list) for x in d) else [d]
+    for page in pages:
+        for x in page if isinstance(page, list) else []:
+            if isinstance(x, dict) and "base" not in x:
+                x["base"] = {"ref": "main"}
+    return json.dumps(d)
+
+
 def pr(n, merged, files, title="feat: x"):
     return {"number": n, "merged_at": merged, "files": files, "title": title}
 
@@ -278,7 +292,7 @@ class FakeGitHub:
                 return json.dumps({"owner": {"login": args[1].split("/")[1]}, "archived": False, "default_branch": "main"})
             if key not in self.api:
                 raise RuntimeError("gh %s: HTTP 404" % key)
-            return self.api[key]
+            return with_base(self.api[key]) if "pulls?state=closed" in key else self.api[key]
         raise AssertionError(args)
 
     def ledgers(self):
@@ -767,7 +781,8 @@ class Collect(unittest.TestCase):
                 return json.dumps([{"nameWithOwner": "o/r", "defaultBranchRef": {"name": "main"}}])
             for k, v in routes.items():
                 if k in key:
-                    return v if isinstance(v, str) else json.dumps(v)
+                    out = v if isinstance(v, str) else json.dumps(v)
+                    return with_base(out) if "pulls?state=closed" in key else out
             if "--paginate" in args:
                 return "[[]]"
             raise RuntimeError("gh %s: HTTP 404" % key)
@@ -1022,7 +1037,7 @@ class RebuildSuspects(Run):
         fake.api = {"api repos/o/r/commits/abcde22/pulls": "[]",
                     "api --paginate --slurp repos/o/r/commits/abcde22?per_page=100": json.dumps([{"commit": {"message": "fix: a"}, "files": [{"filename": "src/a.js", "patch": "-a"}]}]),
                     "api repos/o/r": json.dumps({"owner": {"login": "o"}, "archived": False, "default_branch": "main"}),
-                    "api repos/o/r/pulls?state=closed&base=main&sort=updated&direction=desc&per_page=50&page=1": json.dumps([{"number": 10, "merged_at": "2026-08-05T00:00:00Z", "title": "feat: x"}]),
+                    "api repos/o/r/pulls?state=closed&sort=updated&direction=desc&per_page=50&page=1": json.dumps([{"number": 10, "merged_at": "2026-08-05T00:00:00Z", "title": "feat: x"}]),
                     "api --paginate --slurp repos/o/r/pulls/10/files?per_page=100": json.dumps([[{"filename": "src/a.js"}]]),
                     "api repos/o/r/pulls/10": json.dumps({"title": "feat: x", "merged_at": "2026-08-05T00:00:00Z", "base": {"ref": "main"}}),
                     "pr diff 10 -R o/r": "+x"}
@@ -1042,7 +1057,7 @@ class RebuildPr(Run):
         fake.api = {"api repos/o/r/pulls/34": json.dumps({"title": "fix: a", "body": "", "merged_at": "2026-08-10T00:00:00Z", "merge_commit_sha": "abcde34", "base": {"ref": "main"}}),
                     "api --paginate --slurp repos/o/r/pulls/34/files?per_page=100": json.dumps([[{"filename": "src/a.js"}]]),
                     "pr diff 34 -R o/r": "-a",
-                    "api repos/o/r/pulls?state=closed&base=main&sort=updated&direction=desc&per_page=50&page=1": json.dumps([{"number": 10, "merged_at": "2026-08-05T00:00:00Z", "title": "feat: x"}]),
+                    "api repos/o/r/pulls?state=closed&sort=updated&direction=desc&per_page=50&page=1": json.dumps([{"number": 10, "merged_at": "2026-08-05T00:00:00Z", "title": "feat: x"}]),
                     "api --paginate --slurp repos/o/r/pulls/10/files?per_page=100": json.dumps([[{"filename": "src/a.js"}]]),
                     "api repos/o/r/pulls/10": json.dumps({"title": "feat: x", "merged_at": "2026-08-05T00:00:00Z", "base": {"ref": "main"}}), "pr diff 10 -R o/r": "+x"}
         lm.gh = fake
@@ -1110,7 +1125,7 @@ class FinalP(Run):
     """最後の全体レビューの指摘 P1〜P6"""
     def test_closed_prs_stop_at_old_pages(self):  # P1
         calls = []
-        old = [{"number": i, "updated_at": "2026-01-01T00:00:00Z", "merged_at": "2026-01-01T00:00:00Z"} for i in range(50)]
+        old = [{"number": i, "updated_at": "2026-01-01T00:00:00Z", "merged_at": "2026-01-01T00:00:00Z", "base": {"ref": "main"}} for i in range(50)]
 
         def gh(*args, input_text=None):
             calls.append(args)
@@ -1457,7 +1472,7 @@ class Round4Collect(Collect):
             pages["n"] += 1
             if "repos/o/r/pulls?state=closed" in " ".join(args):
                 return json.dumps([{"number": i, "merged_at": "2026-10-15T00:00:00Z", "updated_at": "2026-10-19T00:00:00Z",
-                                    "title": "feat"} for i in range(50)])
+                                    "title": "feat", "base": {"ref": "main"}} for i in range(50)])
             if args[:2] == ("api", "repos/o/r"):
                 return json.dumps({"default_branch": "main"})
             return "[[]]"
@@ -2058,6 +2073,51 @@ class ReopenRestored(Run):
         lm.collect = lambda owner, exclude, skip=frozenset(): ([], [])
         lm.run(lm.argparse.Namespace(owner="o", ledger="o/ledger", exclude="skip", dry_run=False))
         self.assertFalse([c for c in fake.calls if c[:2] == ("issue", "edit")])  # 書き換えも保存もしない
+
+
+
+class DefaultBranchRename(Run):
+    """既定ブランチの名前を変えた後も、変える前にマージされた PR を既定ブランチへの PR とみなす（Issue #28 の 2）"""
+    def test_old_base_name_that_redirects_to_default_counts(self):
+        fake = FakeGitHub()
+        fake.api = {"api repos/o/r/branches/master": json.dumps({"name": "main"}),
+                    "api repos/o/r/branches/release": json.dumps({"name": "release"})}
+        lm.gh = fake
+        lm._BRANCH_NAMES.clear()
+        self.assertTrue(lm.default_base("o/r", "main", "main"))
+        self.assertTrue(lm.default_base("o/r", "master", "main"))      # 名前を変える前の既定ブランチ
+        self.assertFalse(lm.default_base("o/r", "release", "main"))    # 別のブランチ
+        self.assertFalse(lm.default_base("o/r", "gone", "main"))       # 消したブランチ（404）
+        self.assertFalse(lm.default_base("o/r", None, "main"))
+
+    def test_recent_prs_lists_without_base_filter_and_keeps_renamed(self):
+        fake = FakeGitHub()
+        items = [{"number": 1, "base": {"ref": "main"}, "updated_at": "2026-10-20T00:00:00Z"},
+                 {"number": 2, "base": {"ref": "master"}, "updated_at": "2026-10-19T00:00:00Z"},
+                 {"number": 3, "base": {"ref": "release"}, "updated_at": "2026-10-18T00:00:00Z"}]
+        fake.api = {"api repos/o/r/pulls?state=closed&sort=updated&direction=desc&per_page=50&page=1": json.dumps(items),
+                    "api repos/o/r/branches/master": json.dumps({"name": "main"}),
+                    "api repos/o/r/branches/release": json.dumps({"name": "release"})}
+        lm.gh = fake
+        lm._BRANCH_NAMES.clear()
+        since = lm.dt.datetime(2026, 10, 1, tzinfo=lm.dt.timezone.utc)
+        self.assertEqual([p["number"] for p in lm.recent_prs("o/r", "main", since)], [1, 2])
+
+    def test_refetched_pr_on_renamed_default_branch_is_judged(self):
+        old = {"key": "o/r@abcde47", "repo": "o/r", "kind": "fix", "sha": "abcde47", "date": "2026-08-01T00:00:00Z",
+               "message": "fix: x", "verdict": "unjudged", "serious": False, "suspects": [10], "pr": 47}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
+        fake.api = {"api repos/o/r/pulls/47": json.dumps({"title": "fix: x", "body": "", "merged_at": "2026-08-01T00:00:00Z",
+                                                          "merge_commit_sha": "abcde47", "base": {"ref": "master"}}),
+                    "api --paginate --slurp repos/o/r/pulls/47/files?per_page=100": json.dumps([[{"filename": "a.js"}]]),
+                    "pr diff 47 -R o/r": "+x",
+                    "api repos/o/r/pulls/10": json.dumps({"title": "feat", "merged_at": "2026-07-25T00:00:00Z", "base": {"ref": "master"}}),
+                    "api --paginate --slurp repos/o/r/pulls/10/files?per_page=100": json.dumps([[{"filename": "a.js"}]]),
+                    "pr diff 10 -R o/r": "+y",
+                    "api repos/o/r/branches/master": json.dumps({"name": "main"})}
+        lm._BRANCH_NAMES.clear()
+        self.go(fake, [])
+        self.assertTrue(self.judged)
 
 
 if __name__ == "__main__":
