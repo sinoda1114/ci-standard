@@ -1262,7 +1262,7 @@ def run(a):
             normalized.add(month_of(known[k], now))
         if (r.get("verdict") == "secret" and r.get("rationale") == RESTORED_SECRET_RATIONALE_V1 and has_key
                 and valid_record(r, a.owner, exclude)):  # 実際に移し替える記録だけ、数え直す
-            r = dict(r, rationale=OLD_SECRET_RATIONALE, attempts=0)  # 試した回数を 0 から数え直す
+            r = dict(known[k], rationale=OLD_SECRET_RATIONALE, attempts=0)  # 合わせ込みの後の記録から、試した回数を 0 に
             known[k] = r
             normalized.add(month_of(r, now))
         if (r.get("verdict") == "secret" and r.get("rationale") == OLD_SECRET_RATIONALE and has_key
