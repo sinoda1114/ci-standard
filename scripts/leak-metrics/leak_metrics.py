@@ -253,6 +253,16 @@ def redact(text):
     return t
 
 
+def git_path(prefix, name):
+    """git と同じく、制御文字（改行など）・引用符・バックスラッシュを含むパスは引用符で囲んでエスケープする
+    （ファイル名の改行で、偽の diff --git の見出しを作らせない）"""
+    if not re.search(r'[\x00-\x1f\x7f"\\]', name):
+        return prefix + name
+    esc = "".join({"\\": "\\\\", '"': '\\"', "\n": "\\n", "\t": "\\t", "\r": "\\r"}.get(ch)
+                  or ("\\%03o" % ord(ch) if ord(ch) < 0x20 or ord(ch) == 0x7f else ch) for ch in name)
+    return '"%s%s"' % (prefix, esc)
+
+
 def commit_diff(entries):
     """コミットの変更ファイルの patch を、ファイルごとに diff --git の見出しを付けて連結する。名前を変えたファイルは
     変更前のパスも見出しに入れる（秘密情報のファイルを見分けられるように）"""
@@ -261,7 +271,8 @@ def commit_diff(entries):
         if isinstance(f, dict):
             name = f.get("filename") or ""
             old = f.get("previous_filename") or name
-            head = "diff --git a/%s b/%s\n" % (old, name) + ("rename from %s\nrename to %s\n" % (old, name) if old != name else "")
+            head = ("diff --git %s %s\n" % (git_path("a/", old), git_path("b/", name))
+                    + ("rename from %s\nrename to %s\n" % (git_path("", old), git_path("", name)) if old != name else ""))
             parts.append(head + f.get("patch", ""))
     return "\n".join(parts)
 
@@ -312,7 +323,10 @@ def withhold_secret_files(text, split=True):
             continue
         if split and part.startswith("diff --git "):
             head = part.split("\n", 1)[0]
-            path = head.rsplit(" b/", 1)[-1] if " b/" in head else head[len("diff --git "):]
+            m = re.fullmatch(r"diff --git a/([\w./ -]+) b/([\w./ -]+)", head)
+            # パスは、見出しが単純な形（引用符やエスケープの無いパス）で、疑いも無いときだけ書く
+            # （見出しの中に書かれた偽の「 b/」で切り出させない）
+            path = m.group(2) if m and m.group(1) == m.group(2) and not has_secret(m.group(2)) else "（パスは省く）"
             out.append("%s: %s）\n" % (WITHHELD_MARK, path))
             withheld.append(path)
         else:
@@ -397,7 +411,9 @@ def judge(c, api, has_key):
         return secret_record(rec, "修正の差分がすべて秘密情報の疑いのあるファイルなので、AI に送らずに判定しない")
     c = dict(c, diff=fix_diff, suspects=[dict(s, diff=withhold_secret_files(s.get("diff"))[0]) for s in c["suspects"]])
     prompt = build_prompt(c)
-    if has_secret(prompt):  # 最後の守り: 組み立てたプロンプトに疑いが残っていれば送らない
+    # 最後の守り: 外した後の材料（伏せ字をかける前）と、組み立てたプロンプトに疑いが残っていれば送らない
+    # （伏せ字で疑いが消えて見えても、伏せきれていない値が残ることがあるので、伏せ字の前で確かめる）
+    if any(has_secret(x) for x in [c.get("diff")] + [s.get("diff") for s in c["suspects"]]) or has_secret(prompt):
         return secret_record(rec, "送る文に秘密情報の疑いが残ったので、AI に送らずに判定しない")
     if not has_key:
         rec["rationale"] = "API キーが無い"

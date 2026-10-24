@@ -1720,6 +1720,15 @@ class SecretsPerFile(unittest.TestCase):
         out = lm.judge(c, api=lambda m, p: self.fail("送った"), has_key=True)
         self.assertEqual(out["verdict"], "secret")
 
+    def test_newline_in_file_name_cannot_fake_a_header(self):  # 確認役の却下（ファイル名の改行）
+        name = 'x\npassword = """\ndiff --git a/x b/x\nREALSECRETVALUE\n"""'
+        d = lm.commit_diff([{"filename": "src/a.js", "patch": "-  bug()\n+  ok()"}, {"filename": name, "patch": "+y"}])
+        self.assertEqual(len(re.findall(r"(?m)^diff --git ", d)), 2)  # 見出しは本物の 2 つだけ
+        sent = []
+        out = lm.judge(self.cand(diff=d), api=lambda m, p: sent.append(p) or MINOR, has_key=True)
+        self.assertTrue(all("REALSECRETVALUE" not in p for p in sent))
+        self.assertIn('diff --git "a/x\\npassword', lm.commit_diff([{"filename": name, "patch": ""}]))
+
     def test_final_guard_blocks_a_prompt_that_still_looks_secret(self):
         saved = lm.build_prompt
         lm.build_prompt = lambda c: saved(c) + '\npassword = "leftover"'
