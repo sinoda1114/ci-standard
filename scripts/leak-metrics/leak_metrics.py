@@ -463,11 +463,11 @@ def drop_errors_of(errors, keys):
 
 
 def unjudged_reasons(records):
-    """未判定の記録の理由の種類（最初の「:」より前、60 文字まで）ごとの件数"""
+    """未判定の記録の理由の種類（最初の「:」より前、100 文字まで）ごとの件数"""
     out = {}
     for r in records:
         if r.get("verdict") == "unjudged":
-            k = re.split(r"[:：]", str(r.get("rationale") or "（理由なし）"), 1)[0].strip()[:60] or "（理由なし）"
+            k = re.split(r"[:：]", str(r.get("rationale") or "（理由なし）"), 1)[0].strip()[:100] or "（理由なし）"
             out[k] = out.get(k, 0) + 1
     return out
 
@@ -525,7 +525,7 @@ def judge(c, api, has_key):
             return rec
         rec["models"].append(model)
         if j is None:
-            # 止まった理由と長さは理由の種類に入れる（公開ログの内訳に出る）。返事の先頭は、非公開の台帳にだけ残る
+            # 止まった理由は理由の種類に入れる（公開ログの内訳に出る）。返事の長さと先頭は、非公開の台帳にだけ残る
             head = re.sub(r"\s+", " ", str(text or "")).strip()
             stop = str(LAST_RESPONSE.get("stop_reason") or "")
             stop = stop if re.fullmatch(r"[a-z_]{1,30}", stop) else "不明"  # 公開ログに出るので、決まった形だけ
