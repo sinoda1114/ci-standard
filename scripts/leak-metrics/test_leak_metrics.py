@@ -1729,6 +1729,16 @@ class SecretsPerFile(unittest.TestCase):
         self.assertTrue(all("REALSECRETVALUE" not in p for p in sent))
         self.assertIn('diff --git "a/x\\npassword', lm.commit_diff([{"filename": name, "patch": ""}]))
 
+    def test_secret_in_raw_file_name_is_not_sent(self):  # 確認役の却下（エスケープで代入の形が隠れる）
+        name = "password\n=REALSECRETVALUE"
+        ents = [{"filename": "src/a.js", "patch": "-  bug()\n+  ok()"}, {"filename": name, "patch": "+y"}]
+        c = dict(self.cand(diff=lm.commit_diff(ents)), files=lm.file_names(ents))
+        out = lm.judge(c, api=lambda m, p: self.fail("送った"), has_key=True)
+        self.assertEqual(out["verdict"], "secret")
+        sus = [dict(self.cand()["suspects"][0], files=[name])]
+        out = lm.judge(dict(self.cand(), suspects=sus), api=lambda m, p: self.fail("送った"), has_key=True)
+        self.assertEqual(out["verdict"], "secret")
+
     def test_final_guard_blocks_a_prompt_that_still_looks_secret(self):
         saved = lm.build_prompt
         lm.build_prompt = lambda c: saved(c) + '\npassword = "leftover"'

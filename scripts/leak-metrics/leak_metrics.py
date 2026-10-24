@@ -341,8 +341,10 @@ def only_withheld(text):
 
 
 def secret_files(files):
-    """API から取った生のパスの一覧に、秘密情報のファイルがあるか（差分の見出しの書き方に左右されない）"""
-    return any(isinstance(f, str) and SECRET_PATH_RE.search(f) for f in files or [])
+    """API から取った生のパスの一覧に、秘密情報のファイルがあるか、パスそのものが秘密情報の疑いの形か
+    （差分の見出しの書き方・エスケープに左右されない）"""
+    names = [f for f in files or [] if isinstance(f, str)]
+    return any(SECRET_PATH_RE.search(f) for f in names) or has_secret("\n".join(names))
 
 
 def file_names(entries):
