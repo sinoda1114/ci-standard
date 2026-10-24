@@ -369,9 +369,12 @@ def withheld_values(text, split=True):
             if v:
                 vals.add(v.group(1) or v.group(2))
             # 空白を含む値も丸ごと照合する: 代入の後ろから行の終わりまで（長さに上限）を、引用符と区切りを外して使う
-            rhs = part[a.end():min(line_end, a.end() + SECRET_VALUE_MAX)].strip().strip("'\"`,;)").strip()
+            seg = part[a.end():min(line_end, a.end() + SECRET_VALUE_MAX)]
+            rhs = seg.strip().strip("'\"`,;)").strip()
             if len(rhs) >= 6:
                 vals.add(rhs)
+            # 型や式の後ろの値も拾う（apiKey: string = "…"、process.env.T || "…"）: = || ?? or の直後の引用符の文字列
+            vals.update(q.group(1) for q in re.finditer(r"""(?:=|\|\||\?\?|\bor)\s*['"`]([^'"`\n]{6,})['"`]""", seg))
     return vals
 
 
@@ -434,9 +437,16 @@ def base_record(c, why=""):
     return rec
 
 
+def secret_file_header(diff):
+    """差分の見出しの行（diff --git・---・+++・rename）に、秘密情報のファイルの名前があるか（files の一覧が無い経路でも）"""
+    return any(SECRET_NAME_RE.search(m.group(0)) for m in DIFF_PATH_LINE_RE.finditer(str(diff or "")))
+
+
 def drop_errors_of(errors, keys):
     """記録の key に結び付いた取得の失敗だけを消す（部分一致で、名前の似た別の記録の失敗を消さない）"""
-    return [e for e in errors if not any(e.startswith(k + ":") or e.endswith(": " + k) for k in keys)]
+    # エラーの中のキーは 100 文字で切ってあることがあるので、切った形とも比べる
+    return [e for e in errors if not any(e.startswith(k + ":") or e.endswith(": " + k) or e.endswith(": " + k[:100])
+                                         for k in keys)]
 
 
 def secret_record(rec, why):
@@ -457,6 +467,7 @@ def judge(c, api, has_key):
     # 題名と、秘密情報のファイル（.env・鍵など）を含む候補は丸ごと送らない。差分は、疑いのあるファイルだけ中身を外し、
     # 残りで判定する（ユーザーの判断 2026-10-24）。修正の差分が全部外れたら、材料が無いので判定せずに確定する
     if (secret_files(c.get("files")) or has_secret(c.get("message_full", c.get("message")))
+            or secret_file_header(c.get("diff")) or any(secret_file_header(s.get("diff")) for s in c["suspects"])
             or any(secret_files(s.get("files")) or has_secret(s.get("title")) for s in c["suspects"])):
         return secret_record(rec, "題名か変更ファイルに秘密情報（のファイル・形）を含むので、AI に送らずに判定しない")
     fix_diff, withheld = withhold_secret_files(c.get("diff"), split=c.get("kind") != "issue")

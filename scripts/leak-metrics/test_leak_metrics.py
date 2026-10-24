@@ -1772,6 +1772,18 @@ class SecretsPerFile(unittest.TestCase):
         self.assertLess(time.monotonic() - t0, 1.0)
         self.assertLess(sum(len(v) for v in vals), 100000)
 
+    def test_typed_or_fallback_value_is_cross_checked(self):  # own-security の V1
+        for decl, use in (('+  private apiKey: string = "Zq81xPw0Lm33"', '+  fetch(url, {headers: {"x-k": "Zq81xPw0Lm33"}})'),
+                          ('+  token = process.env.T || "fallbackS3cret99"', '+  use("fallbackS3cret99")')):
+            sus = "diff --git a/src/config.ts b/src/config.ts\n%s\ndiff --git a/src/client.ts b/src/client.ts\n%s\n" % (decl, use)
+            out = lm.judge(self.cand(sus=sus), api=lambda m, p: self.fail("送った"), has_key=True)
+            self.assertEqual(out["verdict"], "secret", decl)
+
+    def test_secret_file_header_in_diff_blocks_the_candidate(self):  # own-review #1
+        d = self.FIX + "diff --git a/.env.production b/.env.production\n-X=1\n"
+        out = lm.judge(self.cand(diff=d), api=lambda m, p: self.fail("送った"), has_key=True)
+        self.assertEqual(out["verdict"], "secret")
+
     def test_final_guard_blocks_a_prompt_that_still_looks_secret(self):
         saved = lm.build_prompt
         lm.build_prompt = lambda c: saved(c) + '\npassword = "leftover"'
@@ -1818,6 +1830,11 @@ class SecretsPerFileMigrate(Run):
         lm.run(args)
         self.assertEqual(len([c for c in fake.calls if c[:2] == ("api", "repos/o/r")]), n)  # 2 回目は取り直さない
         self.assertTrue(rec and rec[0]["verdict"] == "secret")
+
+    def test_error_cleanup_matches_cut_key(self):  # own-review #2（エラーの中のキーは 100 文字で切ってある）
+        k = "o/" + "r" * 80 + "@" + "a" * 40
+        errs = ["台帳の記録のリポジトリが対象外なので取り直さない: %s" % k[:100], "o/x@b: 取り直しに失敗: y"]
+        self.assertEqual(lm.drop_errors_of(errs, [k]), ["o/x@b: 取り直しに失敗: y"])
 
     def test_error_cleanup_matches_whole_key(self):  # ゲートの Low
         errs = ["o/r@abc: 取り直しに失敗: x", "o/r@abcdef: 取り直しに失敗: y"]
