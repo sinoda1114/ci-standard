@@ -1614,15 +1614,32 @@ class PrBotsGate(Run):
         self.go(fake, [])
         self.assertTrue([c for c in fake.calls if c[:3] == ("pr", "diff", "12")])
 
-    def test_unreadable_revert_ref_is_not_decided(self):  # 404 は権限が無いときにも返るので、別のリポジトリと決めつけない
-        lm.gh = lambda *a, input_text=None: (_ for _ in ()).throw(RuntimeError("gh api repos/x/gone: HTTP 404"))
-        lm._REPO_INFO.clear()
-        with self.assertRaises(RuntimeError):
-            lm.same_repo("x/gone", "o/r")
+    def test_missing_revert_ref_is_another_repo_but_5xx_is_not_decided(self):  # ゲートの指摘（404 は自分のリポジトリではない）
         msg = "Revert \"feat: y\"\n\nReverts x/gone#12"
+        calls = []
+
+        def gh404(*a, input_text=None):
+            calls.append(a)
+            raise RuntimeError("gh api repos/x/gone: HTTP 404")
+        lm.gh = gh404
+        lm._REPO_INFO.clear()
+        same = lambda ref: lm.same_repo(ref, "o/r")
         c = lm.fix_candidates("o/r", [commit("abcdef5", "2026-10-10T00:00:00Z", msg, ["a"])],
-                              [pr(12, "2026-10-05T00:00:00Z", ["a"])], same_repo=lambda ref: lm.same_repo(ref, "o/r"))[0]
+                              [pr(12, "2026-10-05T00:00:00Z", ["a"])], same_repo=same)[0]
+        self.assertFalse(c.get("incomplete"))
+        self.assertEqual(c["suspects"], [])
+        self.assertFalse(lm.same_repo("x/gone", "o/r"))
+        self.assertEqual(len(calls), 1)  # 404 も覚えて、同じ参照先を問い合わせ直さない
+        lm.gh = lambda *a, input_text=None: (_ for _ in ()).throw(RuntimeError("gh api repos/x/busy: HTTP 502"))
+        c = lm.fix_candidates("o/r", [commit("abcdef6", "2026-10-10T00:00:00Z", msg.replace("gone", "busy"), ["a"])],
+                              [pr(12, "2026-10-05T00:00:00Z", ["a"])], same_repo=same)[0]
         self.assertTrue(c.get("incomplete"))
+
+    def test_kind_of_renamed_repo_revert_is_revert(self):  # ゲートの指摘
+        msg = "fix: y を戻す\n\nReverts o/old-name#12"
+        c = lm.fix_candidates("o/r", [commit("abcdef7", "2026-10-10T00:00:00Z", msg, ["a"])],
+                              [pr(12, "2026-10-05T00:00:00Z", ["a"])], same_repo=lambda ref: True)[0]
+        self.assertEqual(c["kind"], "revert")
 
     def test_revert_of_renamed_repo_uses_the_pr(self):  # own-review（名前を変えたリポジトリ）
         msg = "Revert \"feat: y\"\n\nReverts o/old-name#12"

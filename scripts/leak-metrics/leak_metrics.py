@@ -109,7 +109,6 @@ def fix_candidates(repo, commits, prs, revert_pr=None, same_repo=None):
         target_pr = revert_pr_number(c["message"], repo)
         ref = REVERT_PR_RE.search(c["message"])
         foreign = bool(ref) and not target_pr  # 別のリポジトリの PR の revert
-        kind = "revert" if target or target_pr or c["message"].lower().startswith("revert") else "fix"
         suspects, incomplete, known = [], c.get("incomplete", ""), foreign  # 別のリポジトリの revert は、ファイルの重なりで付け替えない
         if foreign and same_repo:  # 名前を変える前のこのリポジトリなら、その PR が元の PR
             try:
@@ -117,6 +116,7 @@ def fix_candidates(repo, commits, prs, revert_pr=None, same_repo=None):
                     target_pr = int(ref.group(2))
             except Exception as e:  # 確かめられなければ確定させない（次回に取り直す）
                 incomplete = "revert 元のリポジトリを確かめられない: %s" % str(e)[:150]
+        kind = "revert" if target or target_pr or c["message"].lower().startswith("revert") else "fix"  # 元の PR が決まってから
         if target_pr:  # 本文が「Reverts owner/repo#12」なら、元の PR の番号がそのまま分かる
             known = True
             suspects = [p for p in prs if p["number"] == target_pr and p.get("merged_at")
@@ -652,11 +652,19 @@ def suspect_diff(repo, s):
 
 def same_repo(ref, name):
     """「Reverts owner/repo#N」の参照先が、name と同じリポジトリか。両方を API で今の名前（full_name）に引き直して比べる
-    （名前を何度変えても合うように）。引き直せなければ例外のまま返す（GitHub は権限が無いときも 404 を返すので、
-    「別のリポジトリ」と決めつけず、候補を確定させずに次回へ回す）"""
+    （名前を何度変えても合うように）。参照先が 404 なら別のリポジトリ（名前を変えた自分のリポジトリなら、古い名前は
+    転送され、自分のトークンで読めるので 404 にならない）。それ以外の失敗（5xx・時間切れ）は例外のまま返し、確定させない"""
     if any(x in (".", "..") for x in ref.split("/")):
         return False
-    a = repo_info(ref).get("full_name") or ref
+    try:
+        a = repo_info(ref).get("full_name") or ref
+    except Exception as e:
+        if "HTTP 404" not in str(e):
+            raise
+        _REPO_INFO[ref] = {"missing": True}  # 同じ参照先を問い合わせ直さない
+        return False
+    if repo_info(ref).get("missing"):
+        return False
     b = repo_info(name).get("full_name") or name
     return str(a).lower() == str(b).lower()
 
