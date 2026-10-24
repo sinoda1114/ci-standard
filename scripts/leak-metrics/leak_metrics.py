@@ -790,8 +790,9 @@ def _paged(path):
 
 
 # Haiku 5.5・Opus 5.5 は、thinking を指定しないと思考が有効で、思考のトークンも max_tokens に数える。
-# 800 では思考で使い切って返事が切れた（stop_reason=max_tokens）ので、ストリーミングなしの推奨の上限まで空ける
-MAX_OUTPUT_TOKENS = 16000
+# 800 では思考で使い切って返事が切れた（stop_reason=max_tokens）ので、判定の思考に十分な余裕を空ける。
+# 16000 だと Opus の速さでは API_TIMEOUT_SECONDS に収まらないことがあるので、2 分ほどで出し切れる 8000 にする
+MAX_OUTPUT_TOKENS = 8000
 # 思考が長くなる分、1 回の呼び出しの待ち時間を延ばす。1 件で 2 回呼んでも 6 分なので、MAX_JUDGE_SECONDS（20 分）の後に
 # 始めた最後の 1 件が終わっても、job の timeout-minutes（30）より前に保存できる
 API_TIMEOUT_SECONDS = 180

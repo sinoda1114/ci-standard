@@ -2005,7 +2005,7 @@ class UnreadableDetail(unittest.TestCase):
             lm.anthropic_api("m", "p")
         finally:
             lm.urllib.request.urlopen = saved
-        self.assertGreaterEqual(seen["max_tokens"], 16000)
+        self.assertGreaterEqual(seen["max_tokens"], 8000)
         self.assertNotIn("thinking", seen)  # 思考は既定（有効）のまま
         self.assertGreater(seen["timeout"], 120)
         self.assertLessEqual(lm.MAX_JUDGE_SECONDS + 2 * lm.API_TIMEOUT_SECONDS, 27 * 60)  # job の 30 分に保存の余裕を残す
