@@ -1929,5 +1929,35 @@ class SecretsPerFileMigrate(Run):
         self.assertEqual(recs["o/r@abcde31"]["verdict"], "secret")
 
 
+class UnjudgedReasons(Run):
+    """未判定の理由の内訳を、公開ログに件数だけ出す（非公開のリポジトリ名や PR の番号は出さない）"""
+    def test_reasons_are_counted_without_details(self):
+        import io, contextlib
+        self.replies = ["読めない返事"]
+        c2 = dict(cand("o/r@abcde42", "2026-09-30T00:00:00Z"), incomplete="PR #12 の差分を取得できない: o/private-repo HTTP 502")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.go(FakeGitHub(), [cand("o/r@abcde41", "2026-09-30T00:00:00Z"), c2])
+        text = out.getvalue()
+        self.assertIn("未判定の理由:", text)
+        self.assertIn("claude-haiku-5-5 の出力を読めない 1", text)
+        self.assertIn("材料が欠けている 1", text)
+        self.assertNotIn("private-repo", text)
+        self.assertNotIn("#12", text)
+
+
+    def test_refetch_failures_are_in_the_breakdown(self):  # Devin
+        import io, contextlib
+        old = {"key": "o/r@abcde43", "repo": "o/r", "kind": "fix", "sha": "abcde43", "date": "2026-08-01T00:00:00Z",
+               "message": "fix: x", "verdict": "secret", "serious": False, "suspects": [10], "pr": 43,
+               "rationale": lm.OLD_SECRET_RATIONALE}
+        gone = dict(old, key="o/r@abcde44", sha="abcde44", verdict="unjudged", rationale="")
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old, gone], "2026-08")}])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.go(fake, [])
+        self.assertIn("取り直しの失敗 2", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
