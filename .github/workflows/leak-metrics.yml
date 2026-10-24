@@ -9,7 +9,9 @@
 # 必要な secret:
 #   ADMIN_TOKEN               sweeper と共用の fine-grained PAT（全リポジトリの読み取りと、台帳への Issue の起票）
 #   LEAK_JUDGE_ANTHROPIC_KEY  判定に使う Anthropic API キー。無ければ全件を「未判定」として記録し、次回に再判定する
-# 料金の上限: 1 回の判定は最大 60 件（leak_metrics.py の MAX_PER_RUN）。このリポジトリは Public なので Actions の分数は消費しない。
+# 料金の上限: 1 回の判定は最大 60 件（leak_metrics.py の MAX_PER_RUN）。1 件は Haiku 5.5 と、必要なときだけ Opus 5.5 に
+# 送り、出力は 1 回 8000 トークンまで（MAX_OUTPUT_TOKENS）。最悪の場合（60 件すべてが 2 段目まで進み、入力 3 万・出力 8000
+# トークンを使い切る）でおよそ 17 ドル（2026-10 の単価）。普段はずっと少ない。このリポジトリは Public なので Actions の分数は消費しない。
 # ログ: このリポジトリは Public なので、ログと要約には件数の合計と、取得失敗の種類（HTTP の番号ごとの件数）だけを出す。
 #   private のリポジトリ名・重大の件数・エラーの文は台帳（Private）にだけ残す。手元で詳しく見るときは LEAK_METRICS_LOG_DETAILS=1
 # 外部への送信: 判定のため、private リポジトリの差分を Anthropic の API に送る（この仕組みの前提）。

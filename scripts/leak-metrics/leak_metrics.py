@@ -789,17 +789,24 @@ def _paged(path):
     return [x for page in pages for x in (page if isinstance(page, list) else [page])]
 
 
+# Haiku 5.5・Opus 5.5 は、thinking を指定しないと思考が有効で、思考のトークンも max_tokens に数える。
+# 800 では思考で使い切って返事が切れた（stop_reason=max_tokens）ので、判定の思考に十分な余裕を空ける。
+# 16000 だと Opus の速さでは API_TIMEOUT_SECONDS に収まらないことがあるので、2 分ほどで出し切れる 8000 にする
+MAX_OUTPUT_TOKENS = 8000
+# 思考が長くなる分、1 回の呼び出しの待ち時間を延ばす。1 件で 2 回呼んでも 6 分なので、MAX_JUDGE_SECONDS（20 分）の後に
+# 始めた最後の 1 件が終わっても、job の timeout-minutes（30）より前に保存できる
+API_TIMEOUT_SECONDS = 180
 LAST_RESPONSE = {"stop_reason": None}  # 最後の AI の呼び出しの止まった理由
 
 
 def anthropic_api(model, prompt):
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
-        data=json.dumps({"model": model, "max_tokens": 800,
+        data=json.dumps({"model": model, "max_tokens": MAX_OUTPUT_TOKENS,
                          "messages": [{"role": "user", "content": prompt}]}).encode(),
         headers={"x-api-key": os.environ["ANTHROPIC_API_KEY"], "anthropic-version": "2023-06-01",
                  "content-type": "application/json"})
-    with urllib.request.urlopen(req, timeout=120) as r:
+    with urllib.request.urlopen(req, timeout=API_TIMEOUT_SECONDS) as r:
         d = json.load(r)
     LAST_RESPONSE["stop_reason"] = d.get("stop_reason")  # 返事を読めないときの手がかり（max_tokens で切れた、など）
     return "".join(b.get("text", "") for b in d.get("content", []) if b.get("type") == "text")
