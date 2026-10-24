@@ -457,9 +457,7 @@ def restore_migrated(orig, tried=True):
 
 def drop_errors_of(errors, keys):
     """記録の key に結び付いた取得の失敗だけを消す（部分一致で、名前の似た別の記録の失敗を消さない）"""
-    # エラーの中のキーは 100 文字で切ってあることがあるので、切った形とも比べる
-    return [e for e in errors if not any(e.startswith(k + ":") or e.endswith(": " + k) or e.endswith(": " + k[:100])
-                                         for k in keys)]
+    return [e for e in errors if not any(e.startswith(k + ":") or e.endswith(": " + k) for k in keys)]
 
 
 def secret_record(rec, why):
@@ -1030,7 +1028,7 @@ def _refetch(live, owner, exclude, errors, out, failed, started):
             info = repo_info(repo)  # 台帳の値だけで取り直す先を決めない: 今の持ち主のもので、アーカイブされていないこと
             if ((info.get("owner") or {}).get("login") or "").lower() != owner.lower() or info.get("archived"):
                 if counts:
-                    errors.append("台帳の記録のリポジトリが対象外なので取り直さない: %s" % str(r.get("key"))[:100])
+                    errors.append("台帳の記録のリポジトリが対象外なので取り直さない: %s" % r["key"])  # valid_record を通ったキーなので切らない
                 failed.append(r["key"])
                 continue
             if r["kind"] == "issue":
@@ -1225,12 +1223,13 @@ def run(a):
     known, slots = load_ledger(list_issues(a.ledger))  # 読めない台帳があれば止める（上書きで消さない）
     normalized = set()  # 古い基準（unclear も重大）で書いた記録を今の基準に合わせ、その月を保存し直す
     migrated = {}       # 古い方式の secret から未判定に戻した記録（元の記録）
+    has_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
     for k, r in list(known.items()):
         if r.get("serious") and r.get("is_leak") == "unclear":
             known[k] = dict(r, serious=False)
             normalized.add(month_of(known[k], now))
-        if (r.get("verdict") == "secret" and r.get("rationale") == OLD_SECRET_RATIONALE
-                and valid_record(r, a.owner, exclude)):
+        if (r.get("verdict") == "secret" and r.get("rationale") == OLD_SECRET_RATIONALE and has_key
+                and valid_record(r, a.owner, exclude)):  # キーが無い実行では移し替えない（試せないので、回数も減らさない）
             # 古い方式（疑いが 1 か所でもあれば候補を丸ごと送らない）で確定した記録は、ファイルごとに外す今の方式で判定し直す。
             # 取り直せる記録だけ（除外したリポジトリなどは戻さない）。取り直しに失敗したら、元の secret に戻す
             migrated[k] = known[k]  # 上の合わせ込み（unclear の重大）の後の記録を覚える
@@ -1251,7 +1250,6 @@ def run(a):
         known[k] = dict(known[k], attempts=int(known[k].get("attempts") or 0) + 1,
                         refetch_failures=int(known[k].get("refetch_failures") or 0) + 1)
     todo = prioritize(pending(cands, list(known.values())), list(known.values()))
-    has_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
     new, skipped = [], set()
     for c in todo[:MAX_PER_RUN]:
         if monotonic() - started > MAX_JUDGE_SECONDS:

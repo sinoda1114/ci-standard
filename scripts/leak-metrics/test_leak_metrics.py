@@ -1855,6 +1855,16 @@ class SecretsPerFileMigrate(Run):
         self.assertEqual(rec["verdict"], "secret")
         self.assertEqual(rec.get("attempts"), 2)
 
+    def test_no_api_key_does_not_migrate(self):  # ゲートの指摘（キーが無いと試したことに数える）
+        old = dict(self.OLD, key="o/r@abcde40", sha="abcde40", date="2026-09-30T00:00:00Z")
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month([old], "2026-09")}])
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+        for _ in range(lm.MIGRATE_MAX_ATTEMPTS + 1):
+            self.go(fake, [cand("o/r@abcde40", "2026-09-30T00:00:00Z")])
+        rec = fake.ledgers()["[漏れの記録] 2026-09"][0]
+        self.assertEqual((rec["verdict"], rec["rationale"]), ("secret", lm.OLD_SECRET_RATIONALE))
+        self.assertFalse(rec.get("attempts"))
+
     def test_migration_is_retried_up_to_three_times(self):  # Devin（一時的な失敗で打ち切らない）
         gone = dict(self.OLD, key="o/r@abcde37", sha="abcde37")
         fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([gone], "2026-08")}])
@@ -1884,10 +1894,11 @@ class SecretsPerFileMigrate(Run):
         self.assertEqual(len([c for c in fake.calls if c[:2] == ("api", "repos/o/r")]), n)  # 上限の後は取り直さない
         self.assertTrue(rec and rec[0]["verdict"] == "secret")
 
-    def test_error_cleanup_matches_cut_key(self):  # own-review #2（エラーの中のキーは 100 文字で切ってある）
-        k = "o/" + "r" * 80 + "@" + "a" * 40
-        errs = ["台帳の記録のリポジトリが対象外なので取り直さない: %s" % k[:100], "o/x@b: 取り直しに失敗: y"]
-        self.assertEqual(lm.drop_errors_of(errs, [k]), ["o/x@b: 取り直しに失敗: y"])
+    def test_error_cleanup_matches_whole_long_key_only(self):  # ゲートの指摘（切ったキーで別の記録まで消す）
+        k1 = "o/" + "r" * 97 + "@" + "a" * 40
+        k2 = "o/" + "r" * 97 + "@" + "b" * 40
+        errs = ["台帳の記録のリポジトリが対象外なので取り直さない: %s" % k1, "台帳の記録のリポジトリが対象外なので取り直さない: %s" % k2]
+        self.assertEqual(lm.drop_errors_of(errs, [k1]), [errs[1]])
 
     def test_error_cleanup_matches_whole_key(self):  # ゲートの Low
         errs = ["o/r@abc: 取り直しに失敗: x", "o/r@abcdef: 取り直しに失敗: y"]
