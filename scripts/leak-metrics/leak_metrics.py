@@ -520,8 +520,6 @@ def load_ledger(issues):
         slots.setdefault(month, {}).setdefault(part, i["number"])
         for r in parse_month(i.get("body") or ""):
             r = dict(r, month=month, part=part)  # 入っている本を覚え、書き直しでも動かさない
-            if r.get("serious") and r.get("is_leak") == "unclear":  # 古い基準（unclear も重大）で書いた記録を、今の基準に合わせる
-                r["serious"] = False
             old = recs.get(r["key"])
             if old is None or rank.get(r.get("verdict"), 2) < rank.get(old.get("verdict"), 2):
                 recs[r["key"]] = r
@@ -652,6 +650,13 @@ def suspect_diff(repo, s):
         return "", "PR #%s の差分を取得できない: %s" % (s["number"], str(e)[:150])
 
 
+def same_repo(ref, name):
+    """「Reverts owner/repo#N」の参照先が、名前を変える前の name か（API のリダイレクト先の full_name で確かめる）"""
+    if any(x in (".", "..") for x in ref.split("/")):
+        return False
+    return str(json.loads(gh("api", "repos/%s" % ref)).get("full_name") or "").lower() == name.lower()
+
+
 def collect(owner, exclude, skip=frozenset()):
     """skip: 判定済みの候補の key。その候補の原因の候補の差分は取り直さない（取得の失敗で赤くもしない）"""
     with time_budget(MAX_COLLECT_SECONDS) as started:
@@ -731,11 +736,7 @@ def _collect(owner, exclude, skip, started):
             def revert_pr(sha, name=name):
                 ps = json.loads(gh("api", "repos/%s/commits/%s/pulls" % (name, sha)))
                 return ps[0]["number"] if ps else None
-            def same_repo(ref, name=name):
-                if any(x in (".", "..") for x in ref.split("/")):
-                    return False
-                return str(json.loads(gh("api", "repos/%s" % ref)).get("full_name") or "").lower() == name.lower()
-            fc = fix_candidates(name, commits, prs, revert_pr=revert_pr, same_repo=same_repo)
+            fc = fix_candidates(name, commits, prs, revert_pr=revert_pr, same_repo=lambda ref, name=name: same_repo(ref, name))
             seen_why = set()
             for c in fc:  # revert 元の PR を取れなかった候補も、取得の失敗に数える
                 if c.get("incomplete") and c["key"] not in skip and c["incomplete"] not in seen_why:
@@ -918,6 +919,9 @@ def _refetch(live, owner, exclude, errors, out, failed, started):
                         nums = rebuild_suspects(repo, r, file_names([f for x in pages for f in x.get("files") or []]), msg)
                 fetched_msg = msg
                 target, target_pr = revert_target(msg), revert_pr_number(msg, repo)
+                ref = REVERT_PR_RE.search(msg or "")
+                if ref and not target_pr and same_repo(ref.group(1), repo):  # 名前を変える前のこのリポジトリの PR
+                    target_pr = int(ref.group(2))
                 if target_pr:
                     nums = [target_pr]
                 elif target:  # revert は元の PR を探し直す（前回は取得に失敗して、ファイルの重なりで代えていたかもしれない）
@@ -1041,6 +1045,11 @@ def run(a):
         return 1
     exclude = set(a.exclude.split(",")) | {a.ledger.split("/")[1]}
     known, slots = load_ledger(list_issues(a.ledger))  # 読めない台帳があれば止める（上書きで消さない）
+    normalized = set()  # 古い基準（unclear も重大）で書いた記録を今の基準に合わせ、その月を保存し直す
+    for k, r in list(known.items()):
+        if r.get("serious") and r.get("is_leak") == "unclear":
+            known[k] = dict(r, serious=False)
+            normalized.add(month_of(known[k], now))
     done = {k for k, r in known.items() if r.get("verdict") in ("judged", "no-suspect", "secret")}
     cands, errors = collect(a.owner, exclude, done)
     stale = [r for r in known.values() if r.get("verdict") == "unjudged" and r["key"] not in {c["key"] for c in cands}]
@@ -1083,7 +1092,7 @@ def run(a):
     if a.dry_run:
         report_errors(errors)
         return 0
-    changed = {month_of(r, now) for r in new} | {month_of(known[k], now) for k in failed}
+    changed = {month_of(r, now) for r in new} | {month_of(known[k], now) for k in failed} | normalized
     save_months(a.ledger, known, slots, changed, now)  # 起票の前に判定を保存する
     notified = notify(a.ledger, known, errors)
     if notified:  # 起票できたものだけ notified を保存する（失敗したものは次回に起票し直す）

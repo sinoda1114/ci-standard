@@ -1575,11 +1575,27 @@ class PrBotsGate(Run):
         old = {"key": "o/r@abcde26", "repo": "o/r", "kind": "fix", "sha": "abcde26", "date": "2026-09-30T00:00:00Z",
                "message": "fix: x", "verdict": "judged", "serious": True, "is_leak": "unclear", "severity": "high",
                "security": False, "suspects": [10], "caused_by_pr": 10, "rationale": "r", "models": []}
-        recs, _ = lm.load_ledger([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month([old], "2026-09")}])
-        self.assertFalse(recs["o/r@abcde26"]["serious"])
         fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month([old], "2026-09")}])
         self.go(fake, [])
         self.assertEqual(fake.leak_issues(), [])
+        self.assertFalse(fake.ledgers()["[漏れの記録] 2026-09"][0]["serious"])  # 台帳にも保存する
+
+    def test_refetched_revert_of_renamed_repo_uses_the_pr(self):  # 確認役の却下（取り直しの経路）
+        old = {"key": "o/r@abcde27", "repo": "o/r", "kind": "revert", "sha": "abcde27", "date": "2026-08-01T00:00:00Z",
+               "message": "Revert", "verdict": "unjudged", "serious": False, "suspects": [], "pr": 27}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
+        fake.api = {"api repos/o/r/pulls/27": json.dumps({"title": "Revert \"feat: y\"", "body": "Reverts o/old-name#12",
+                                                          "merged_at": "2026-08-01T00:00:00Z", "merge_commit_sha": "abcde27",
+                                                          "base": {"ref": "main"}}),
+                    "api --paginate --slurp repos/o/r/pulls/27/files?per_page=100": json.dumps([[{"filename": "a.js"}]]),
+                    "pr diff 27 -R o/r": "-y",
+                    "api repos/o/old-name": json.dumps({"full_name": "o/r", "owner": {"login": "o"}}),
+                    "api repos/o/r/pulls/12": json.dumps({"title": "feat: y", "merged_at": "2026-07-25T00:00:00Z", "base": {"ref": "main"}}),
+                    "api --paginate --slurp repos/o/r/pulls/12/files?per_page=100": json.dumps([[{"filename": "a.js"}]]),
+                    "pr diff 12 -R o/r": "+y"}
+        self.go(fake, [])
+        self.assertTrue([c for c in fake.calls if c[:3] == ("pr", "diff", "12")])
+        self.assertTrue(self.judged)
 
     def test_revert_of_renamed_repo_uses_the_pr(self):  # own-review（名前を変えたリポジトリ）
         msg = "Revert \"feat: y\"\n\nReverts o/old-name#12"
