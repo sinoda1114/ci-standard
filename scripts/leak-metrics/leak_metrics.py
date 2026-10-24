@@ -462,6 +462,16 @@ def drop_errors_of(errors, keys):
     return [e for e in errors if not any(e.startswith(k + ":") or e.endswith(": " + k) for k in keys)]
 
 
+def unjudged_reasons(records):
+    """未判定の記録の理由の種類（最初の「:」より前、30 文字まで）ごとの件数"""
+    out = {}
+    for r in records:
+        if r.get("verdict") == "unjudged":
+            k = re.split(r"[:：]", str(r.get("rationale") or "（理由なし）"), 1)[0].strip()[:30] or "（理由なし）"
+            out[k] = out.get(k, 0) + 1
+    return out
+
+
 def secret_record(rec, why):
     rec["verdict"] = "secret"
     rec["rationale"] = why
@@ -1289,6 +1299,9 @@ def run(a):
     # このログは公開リポジトリの Actions に出るので、件数の合計だけを出す（重大の件数・リポジトリ名は台帳にだけ残す）
     print("候補 %d / 今回判定 %d / 未判定 %d / 取得失敗 %d" % (
         len(cands), sum(1 for r in new if r["verdict"] != "unjudged"), sum(1 for r in new if r["verdict"] == "unjudged"), len(errors)))
+    reasons = unjudged_reasons(new)
+    if reasons:  # 理由の種類（最初の「:」より前）と件数だけ。詳しい理由には非公開のリポジトリ名や PR の番号が入りうる
+        print("未判定の理由: %s" % "、".join("%s %d" % kv for kv in sorted(reasons.items())))
     if a.dry_run:
         report_errors(errors)
         return 0

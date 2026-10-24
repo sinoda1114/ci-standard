@@ -1929,5 +1929,22 @@ class SecretsPerFileMigrate(Run):
         self.assertEqual(recs["o/r@abcde31"]["verdict"], "secret")
 
 
+class UnjudgedReasons(Run):
+    """未判定の理由の内訳を、公開ログに件数だけ出す（非公開のリポジトリ名や PR の番号は出さない）"""
+    def test_reasons_are_counted_without_details(self):
+        import io, contextlib
+        self.replies = ["読めない返事"]
+        c2 = dict(cand("o/r@abcde42", "2026-09-30T00:00:00Z"), incomplete="PR #12 の差分を取得できない: o/private-repo HTTP 502")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.go(FakeGitHub(), [cand("o/r@abcde41", "2026-09-30T00:00:00Z"), c2])
+        text = out.getvalue()
+        self.assertIn("未判定の理由:", text)
+        self.assertIn("claude-haiku-5-5 の出力を読めない 1", text)
+        self.assertIn("材料が欠けている 1", text)
+        self.assertNotIn("private-repo", text)
+        self.assertNotIn("#12", text)
+
+
 if __name__ == "__main__":
     unittest.main()
