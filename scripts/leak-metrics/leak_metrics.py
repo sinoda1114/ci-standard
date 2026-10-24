@@ -463,11 +463,11 @@ def drop_errors_of(errors, keys):
 
 
 def unjudged_reasons(records):
-    """未判定の記録の理由の種類（最初の「:」より前、30 文字まで）ごとの件数"""
+    """未判定の記録の理由の種類（最初の「:」より前、100 文字まで）ごとの件数"""
     out = {}
     for r in records:
         if r.get("verdict") == "unjudged":
-            k = re.split(r"[:：]", str(r.get("rationale") or "（理由なし）"), 1)[0].strip()[:30] or "（理由なし）"
+            k = re.split(r"[:：]", str(r.get("rationale") or "（理由なし）"), 1)[0].strip()[:100] or "（理由なし）"
             out[k] = out.get(k, 0) + 1
     return out
 
@@ -517,13 +517,20 @@ def judge(c, api, has_key):
     final = None
     for model in (STAGE1_MODEL, STAGE2_MODEL):
         try:
-            j = parse_judgement(api(model, prompt))
+            LAST_RESPONSE["stop_reason"] = None
+            text = api(model, prompt)
+            j = parse_judgement(text)
         except Exception as e:  # API の失敗は unjudged（次回に再判定）
             rec["rationale"] = "API の失敗: %s" % str(e)[:200]
             return rec
         rec["models"].append(model)
         if j is None:
-            rec["rationale"] = "%s の出力を読めない" % model
+            # 止まった理由は理由の種類に入れる（公開ログの内訳に出る）。返事の長さと先頭は、非公開の台帳にだけ残る
+            head = re.sub(r"\s+", " ", str(text or "")).strip()
+            stop = str(LAST_RESPONSE.get("stop_reason") or "")
+            stop = stop if re.fullmatch(r"[a-z_]{1,30}", stop) else "不明"  # 公開ログに出るので、決まった形だけ
+            rec["rationale"] = ("%s の出力を読めない（stop_reason=%s）: %d 文字: %s"
+                                % (model, stop, len(str(text or "")), head))[:MAX_RATIONALE_CHARS]
             return rec
         final = j
         if model == STAGE1_MODEL and not needs_stage2(j):
@@ -782,6 +789,9 @@ def _paged(path):
     return [x for page in pages for x in (page if isinstance(page, list) else [page])]
 
 
+LAST_RESPONSE = {"stop_reason": None}  # 最後の AI の呼び出しの止まった理由
+
+
 def anthropic_api(model, prompt):
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
@@ -791,6 +801,7 @@ def anthropic_api(model, prompt):
                  "content-type": "application/json"})
     with urllib.request.urlopen(req, timeout=120) as r:
         d = json.load(r)
+    LAST_RESPONSE["stop_reason"] = d.get("stop_reason")  # 返事を読めないときの手がかり（max_tokens で切れた、など）
     return "".join(b.get("text", "") for b in d.get("content", []) if b.get("type") == "text")
 
 
