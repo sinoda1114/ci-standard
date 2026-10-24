@@ -442,6 +442,16 @@ def secret_file_header(diff):
     return any(SECRET_NAME_RE.search(m.group(0)) for m in DIFF_PATH_LINE_RE.finditer(str(diff or "")))
 
 
+MIGRATE_MAX_ATTEMPTS = 3  # 古い secret の移し替えを試す回数（一時的な失敗で打ち切らない。毎回いちばん先に試し続けもしない）
+
+
+def restore_migrated(orig):
+    """移し替えた記録を、判定まで進めなかったので secret に戻す。試した回数（attempts）を 1 増やし、
+    MIGRATE_MAX_ATTEMPTS に達したら理由の文を変えて、それ以降は移し替えない"""
+    att = int(orig.get("attempts") or 0) + 1
+    return dict(orig, attempts=att, **({"rationale": RESTORED_SECRET_RATIONALE} if att >= MIGRATE_MAX_ATTEMPTS else {}))
+
+
 def drop_errors_of(errors, keys):
     """記録の key に結び付いた取得の失敗だけを消す（部分一致で、名前の似た別の記録の失敗を消さない）"""
     # エラーの中のキーは 100 文字で切ってあることがあるので、切った形とも比べる
@@ -1220,7 +1230,7 @@ def run(a):
                 and valid_record(r, a.owner, exclude)):
             # 古い方式（疑いが 1 か所でもあれば候補を丸ごと送らない）で確定した記録は、ファイルごとに外す今の方式で判定し直す。
             # 取り直せる記録だけ（除外したリポジトリなどは戻さない）。取り直しに失敗したら、元の secret に戻す
-            migrated[k] = r
+            migrated[k] = known[k]  # 上の合わせ込み（unclear の重大）の後の記録を覚える
             known[k] = dict(r, verdict="unjudged")
     done = {k for k, r in known.items() if r.get("verdict") in ("judged", "no-suspect", "secret")}
     cands, errors = collect(a.owner, exclude, done)
@@ -1229,7 +1239,7 @@ def run(a):
     cands += again
     back = [k for k in failed if k in migrated]  # 移し替えの記録を取り直せなかった: 元の secret に戻し、失敗に数えない
     for k in back:
-        known[k] = dict(migrated[k], rationale=RESTORED_SECRET_RATIONALE)
+        known[k] = restore_migrated(migrated[k])
         normalized.add(month_of(known[k], now))
     errors[:] = drop_errors_of(errors, back)
     failed = [k for k in failed if k not in migrated]
@@ -1268,7 +1278,7 @@ def run(a):
         # 移し替えた記録が、今回の方式でも判定まで進めなかったら（材料が欠けた・上限で見送った・取り直せないなど、
         # どの経路でも）、元の secret に戻す
         if known[k].get("verdict") == "unjudged":
-            known[k] = dict(orig, rationale=RESTORED_SECRET_RATIONALE)  # 理由を変えて、次の実行で移し替え直さない
+            known[k] = restore_migrated(orig)
             normalized.add(month_of(known[k], now))
     # このログは公開リポジトリの Actions に出るので、件数の合計だけを出す（重大の件数・リポジトリ名は台帳にだけ残す）
     print("候補 %d / 今回判定 %d / 未判定 %d / 取得失敗 %d" % (

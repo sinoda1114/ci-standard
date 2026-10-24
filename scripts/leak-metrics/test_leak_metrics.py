@@ -1818,17 +1818,33 @@ class SecretsPerFileMigrate(Run):
         recs = {r["key"]: r for rs in fake.ledgers().values() for r in rs}
         self.assertIn(recs["o/r@abcde35"]["verdict"], ("secret", "judged"))
 
+    def test_migration_is_retried_up_to_three_times(self):  # Devin（一時的な失敗で打ち切らない）
+        gone = dict(self.OLD, key="o/r@abcde37", sha="abcde37")
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([gone], "2026-08")}])
+        lm.gh = fake
+        lm.collect = lambda owner, exclude, skip=frozenset(): ([], [])
+        args = lm.argparse.Namespace(owner="o", ledger="o/ledger", exclude="", dry_run=False)
+        seen = []
+        for _ in range(4):
+            lm.run(args)
+            rec = [r for rs in fake.ledgers().values() for r in rs if r["key"] == "o/r@abcde37"][0]
+            seen.append((rec["verdict"], rec["rationale"] == lm.OLD_SECRET_RATIONALE, rec.get("attempts")))
+        self.assertEqual([v for v, _, _ in seen], ["secret"] * 4)
+        self.assertEqual([o for _, o, _ in seen], [True, True, False, False])  # 3 回目で打ち切る
+        self.assertEqual(seen[0][2], 1)
+
     def test_restored_secret_is_not_migrated_again(self):  # ゲートの指摘（試した回数が増えず、毎回取り直す）
         gone = dict(self.OLD, key="o/r@abcde36", sha="abcde36")
         fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([gone], "2026-08")}])
         lm.gh = fake
         lm.collect = lambda owner, exclude, skip=frozenset(): ([], [])
         args = lm.argparse.Namespace(owner="o", ledger="o/ledger", exclude="", dry_run=False)
-        lm.run(args)
+        for _ in range(lm.MIGRATE_MAX_ATTEMPTS):
+            lm.run(args)
         n = len([c for c in fake.calls if c[:2] == ("api", "repos/o/r")])
         rec = [r for rs in fake.ledgers().values() for r in rs if r["key"] == "o/r@abcde36"]
         lm.run(args)
-        self.assertEqual(len([c for c in fake.calls if c[:2] == ("api", "repos/o/r")]), n)  # 2 回目は取り直さない
+        self.assertEqual(len([c for c in fake.calls if c[:2] == ("api", "repos/o/r")]), n)  # 上限の後は取り直さない
         self.assertTrue(rec and rec[0]["verdict"] == "secret")
 
     def test_error_cleanup_matches_cut_key(self):  # own-review #2（エラーの中のキーは 100 文字で切ってある）
