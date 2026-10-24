@@ -459,10 +459,25 @@ def restore_migrated(orig, tried=True):
     return dict(orig, attempts=att, **({"rationale": RESTORED_SECRET_RATIONALE} if att >= MIGRATE_MAX_ATTEMPTS else {}))
 
 
+def renamed_to(old, new, strict=False):
+    """古い名前のリポジトリが、今は new という名前か（GitHub は古い名前で問い合わせると今のリポジトリを返す）。
+    確かめられなければ False。strict なら、404 以外の失敗は例外のまま返す（呼び出し元が次回に回せるように）"""
+    if str(old).lower() == str(new).lower():
+        return True
+    try:
+        return str(repo_info(old).get("full_name") or "").lower() == str(new).lower()
+    except Exception as e:
+        if strict and "HTTP 404" not in str(e):
+            raise
+        return False
+
+
 def reconcile_renamed(known, cands, owner, now):
     """名前を変えたリポジトリの記録を、集めた候補の名前（今の名前）に付け替える（Issue #28 の 1）。
-    集めた候補と同じ SHA の記録が、別の名前（同じ持ち主）で台帳にあれば、その記録の repo と key を候補のものに
-    付け替える（判定・通知済みの印などはそのまま）。新しい名前で二重に判定・起票しないため。API の問い合わせはしない。
+    集めた候補と同じ SHA の記録が、別の名前（同じ持ち主）で台帳にあれば、古い名前を API で問い合わせ、今の名前
+    （候補の名前）が返ったときだけ、その記録の repo と key を候補のものに付け替える（判定・通知済みの印などはそのまま）。
+    新しい名前で二重に判定・起票しないため。SHA が同じというだけでは付け替えない（同じ履歴を持つ別のリポジトリが
+    ありうる）。問い合わせは SHA がぶつかったときだけで、確かめられなければ付け替えない。
     既知の限界: 窓の外の記録は古い名前のまま残る（取り直しは GitHub の転送で通る）。Issue の候補（#番号）は SHA を
     持たないので付け替えない。戻り値: (付け替えた後の記録, 保存し直す月, 新しいキー → 古いキーの集合)"""
     by_sha = {}
@@ -476,6 +491,7 @@ def reconcile_renamed(known, cands, owner, now):
             continue
         olds = [o for o in by_sha.get(c.get("sha"), []) if o in out and o != k
                 and out[o]["repo"].split("/")[0].lower() == str(owner).lower()]
+        olds = [o for o in olds if renamed_to(out[o]["repo"], c["repo"])]
         if not olds:
             continue
         r = out.pop(olds[0])
@@ -1251,12 +1267,14 @@ def save_months(ledger, records, slots, months, now):
 
 def already_marked(r, done, aliases=None):
     """[漏れ] Issue の目印がすでにあるか。名前を変える前のキーの目印とも照合する: この回に付け替えたもの（aliases）と、
-    修正のコミット（キーが @SHA で終わるもの）は SHA でも照合する（付け替えた回より後の再試行でも立て直さない）"""
+    修正のコミット（キーが @SHA で終わるもの）の、同じ SHA で別の名前の目印のうち、その名前が今は同じリポジトリだと
+    確かめられたもの（付け替えた回より後の再試行でも立て直さない）"""
     if r["key"] in done or (aliases or {}).get(r["key"], set()) & done:
         return True
     if "@" in r["key"]:
         sha = r["key"].rsplit("@", 1)[1]
-        return any(d.rsplit("@", 1)[-1] == sha for d in done if "@" in d)
+        # 確かめられなければ例外のまま返す（notify はその記録の起票を次回に回す。二重に立てない）
+        return any(renamed_to(d.rsplit("@", 1)[0], r["repo"], strict=True) for d in done if "@" in d and d.rsplit("@", 1)[1] == sha)
     return False
 
 
@@ -1344,6 +1362,10 @@ def run(a):
     done = {k for k, r in known.items() if r.get("verdict") in ("judged", "no-suspect", "secret")}
     cands, errors = collect(a.owner, exclude, done)
     known, renamed_months, aliases = reconcile_renamed(known, cands, a.owner, now)  # 名前を変えたリポジトリの記録を付け替える
+    for new_key, olds in aliases.items():  # 移し替えの途中の記録は、覚え書きのキーも付け替える
+        for o in olds:
+            if o in migrated:
+                migrated[new_key] = dict(migrated.pop(o), repo=known[new_key]["repo"], key=new_key)
     normalized |= renamed_months
     stale = [r for r in known.values() if r.get("verdict") == "unjudged" and r["key"] not in {c["key"] for c in cands}]
     again, failed = refetch(stale, a.owner, exclude, errors)  # 窓から外れた未判定も判定し直す
