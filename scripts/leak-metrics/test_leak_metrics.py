@@ -315,6 +315,8 @@ def cand(key, date, suspects=(10,)):
 class Run(unittest.TestCase):
     def setUp(self):
         lm._BRANCH_NAMES.clear()
+        lm._REPO_INFO.clear()
+        lm._RENAMED.clear()
         self.saved = (lm.gh, lm.collect, lm.anthropic_api, lm.utcnow, os.environ.get("ANTHROPIC_API_KEY"))
         os.environ["ANTHROPIC_API_KEY"] = "k"
         self.now = lm.dt.datetime(2026, 10, 1, 3, 0, tzinfo=lm.dt.timezone.utc)
@@ -765,6 +767,7 @@ class Collect(unittest.TestCase):
 
     def setUp(self):
         lm._BRANCH_NAMES.clear()
+        lm._REPO_INFO.clear()
         self.saved = (lm.gh, lm.utcnow)
         lm.utcnow = lambda: self.NOW
         self.calls = []
@@ -2133,6 +2136,138 @@ class DefaultBranchRename(Run):
         lm._BRANCH_NAMES.clear()
         self.go(fake, [])
         self.assertTrue(self.judged)
+
+
+
+class RepoRename(Run):
+    """名前を変えたリポジトリの記録を、集めた候補の名前に付け替える（Issue #28 の 1）"""
+    def rec(self, key, **kw):
+        repo, sha = key.split("@")
+        return dict({"key": key, "repo": repo, "kind": "fix", "sha": sha, "date": "2026-09-30T00:00:00Z", "message": "fix: x",
+                     "verdict": "judged", "serious": False, "suspects": [10]}, **kw)
+
+    def test_record_is_rekeyed_to_the_collected_name(self):
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month([self.rec("o/old@abcdef1")], "2026-09")}])
+        fake.api = {"api repos/o/old": json.dumps({"full_name": "o/new", "owner": {"login": "o"}})}
+        self.go(fake, [cand("o/new@abcdef1", "2026-09-30T00:00:00Z")])
+        got = {r["key"]: r for rs in fake.ledgers().values() for r in rs}
+        self.assertEqual(list(got), ["o/new@abcdef1"])
+        self.assertEqual((got["o/new@abcdef1"]["repo"], got["o/new@abcdef1"]["verdict"]), ("o/new", "judged"))
+        self.assertEqual(self.judged, [])  # 判定済みなので判定し直さない
+
+    def test_case_only_rename_is_rekeyed(self):
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month([self.rec("o/Repo@abcdef2")], "2026-09")}])
+        fake.api = {"api repos/o/Repo": json.dumps({"full_name": "o/repo", "owner": {"login": "o"}})}
+        self.go(fake, [cand("o/repo@abcdef2", "2026-09-30T00:00:00Z")])
+        self.assertEqual([r["key"] for rs in fake.ledgers().values() for r in rs], ["o/repo@abcdef2"])
+
+    def test_old_mark_prevents_a_second_leak_issue_in_later_runs(self):  # 付け替えた回より後でも、SHA の目印で照合する
+        rec = self.rec("o/new@abcdef3", serious=True, notified=False)
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month([rec], "2026-09")},
+                           {"number": 2, "title": "[漏れ] o/old: fix: x", "body": "本文\n" + lm.leak_mark("o/old@abcdef3"),
+                            "labels": ["type:fix"]}])
+        fake.api = {"api repos/o/old": json.dumps({"full_name": "o/new", "owner": {"login": "o"}}), "api repos/o/new": json.dumps({"full_name": "o/new", "owner": {"login": "o"}})}
+        self.go(fake, [])
+        self.assertEqual(len(fake.leak_issues()), 1)
+        self.assertTrue(fake.ledgers()["[漏れの記録] 2026-09"][0]["notified"])
+
+    def test_same_sha_in_another_live_repo_is_not_rekeyed(self):  # Codex（SHA だけで名前の変更と決めない）
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month([self.rec("o/other@abcdef6")], "2026-09")}])
+        fake.api = {"api repos/o/other": json.dumps({"full_name": "o/other", "owner": {"login": "o"}})}
+        self.go(fake, [cand("o/new@abcdef6", "2026-09-30T00:00:00Z")])
+        self.assertEqual(sorted(r["key"] for rs in fake.ledgers().values() for r in rs), ["o/new@abcdef6", "o/other@abcdef6"])
+
+    def test_mark_of_an_unrelated_repo_with_same_sha_does_not_suppress(self):  # Codex（目印の照合も名前の変更に限る）
+        rec = self.rec("o/new@abcdef8", serious=True, notified=False)
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month([rec], "2026-09")},
+                           {"number": 2, "title": "[漏れ] o/other: fix: x", "body": "本文\n" + lm.leak_mark("o/other@abcdef8"),
+                            "labels": ["type:fix"]}])
+        fake.api = {"api repos/o/other": json.dumps({"full_name": "o/other", "owner": {"login": "o"}}),
+                    "api repos/o/new": json.dumps({"full_name": "o/new", "owner": {"login": "o"}})}
+        self.go(fake, [])
+        self.assertEqual(len(fake.leak_issues()), 2)
+
+    def test_unconfirmable_mark_defers_the_leak_issue(self):  # 目印の名前を確かめられないときは、起票を次回に見送る
+        rec = self.rec("o/new@abcdefa", serious=True, notified=False)
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month([rec], "2026-09")},
+                           {"number": 2, "title": "[漏れ] o/old: fix: x", "body": "本文\n" + lm.leak_mark("o/old@abcdefa"),
+                            "labels": ["type:fix"]}])
+        real = fake.__call__
+
+        def gh(*args, input_text=None):
+            if args == ("api", "repos/o/old"):
+                raise RuntimeError("gh api: HTTP 502")
+            return real(*args, input_text=input_text)
+        lm.gh = gh
+        lm.collect = lambda owner, exclude, skip=frozenset(): ([], [])
+        lm.run(lm.argparse.Namespace(owner="o", ledger="o/ledger", exclude="", dry_run=False))
+        self.assertEqual(len(fake.leak_issues()), 1)
+        self.assertFalse(fake.ledgers()["[漏れの記録] 2026-09"][0].get("notified"))  # 次回に再試行
+
+    def test_both_keys_already_present_are_merged(self):  # 両方（途中で二重になっても、次の回でまとめる）
+        old = self.rec("o/old@abcdefb", serious=True, notified=True)
+        new = self.rec("o/new@abcdefb", verdict="unjudged")
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month([old, new], "2026-09")}])
+        fake.api = {"api repos/o/old": json.dumps({"full_name": "o/new", "owner": {"login": "o"}})}
+        self.go(fake, [cand("o/new@abcdefb", "2026-09-30T00:00:00Z")])
+        got = {r["key"]: r for rs in fake.ledgers().values() for r in rs}
+        self.assertEqual(list(got), ["o/new@abcdefb"])
+        self.assertEqual(got["o/new@abcdefb"]["verdict"], "judged")
+        self.assertTrue(got["o/new@abcdefb"]["notified"])
+
+    def test_merge_prefers_a_real_judgement_over_secret(self):  # Codex（secret より実際の判定を優先する）
+        old = self.rec("o/old@abcdefc", verdict="secret")
+        new = self.rec("o/new@abcdefc", verdict="judged", is_leak="no")
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month([old, new], "2026-09")}])
+        fake.api = {"api repos/o/old": json.dumps({"full_name": "o/new", "owner": {"login": "o"}})}
+        self.go(fake, [cand("o/new@abcdefc", "2026-09-30T00:00:00Z")])
+        self.assertEqual([r["verdict"] for rs in fake.ledgers().values() for r in rs], ["judged"])
+
+    def test_name_lookup_result_is_cached_even_on_failure(self):  # Codex（同じ問い合わせを繰り返さない）
+        calls = []
+
+        def gh(*args, input_text=None):
+            calls.append(args)
+            raise RuntimeError("gh api: HTTP 502")
+        lm.gh = gh
+        lm._REPO_INFO.clear()
+        lm._RENAMED.clear()
+        for _ in range(3):
+            self.assertFalse(lm.renamed_to("o/old", "o/new"))
+        self.assertEqual(len(calls), 1)
+
+    def test_issue_mark_of_renamed_repo_is_matched(self):  # own-review（Issue の候補の目印も照合する）
+        rec = {"key": "o/new#5", "repo": "o/new", "kind": "issue", "sha": "", "date": "2026-09-30T00:00:00Z", "message": "bug",
+               "verdict": "judged", "serious": True, "notified": False, "suspects": [10]}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month([rec], "2026-09")},
+                           {"number": 2, "title": "[漏れ] o/old: bug", "body": "本文\n" + lm.leak_mark("o/old#5"), "labels": ["type:fix"]}])
+        fake.api = {"api repos/o/old": json.dumps({"full_name": "o/new", "owner": {"login": "o"}})}
+        self.go(fake, [])
+        self.assertEqual(len(fake.leak_issues()), 1)
+
+    def test_migrated_record_follows_the_rekey(self):  # Codex P1（移し替えの覚え書きも付け替える）
+        old = self.rec("o/old@abcdef9", verdict="secret", rationale=lm.OLD_SECRET_RATIONALE)
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month([old], "2026-09")}])
+        fake.api = {"api repos/o/old": json.dumps({"full_name": "o/new", "owner": {"login": "o"}})}
+        c = dict(cand("o/new@abcdef9", "2026-09-30T00:00:00Z"), incomplete="材料が欠けている")
+        self.go(fake, [c])
+        got = {r["key"]: r for rs in fake.ledgers().values() for r in rs}
+        self.assertEqual(list(got), ["o/new@abcdef9"])
+        self.assertEqual(got["o/new@abcdef9"]["verdict"], "secret")  # 判定まで進めなかったので secret に戻る
+
+    def test_other_owner_or_other_sha_is_left(self):
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month(
+            [self.rec("x/old@abcdef4"), self.rec("o/old@abcdef5")], "2026-09")}])
+        self.go(fake, [cand("o/new@abcdef4", "2026-09-30T00:00:00Z")])
+        self.assertIn("x/old@abcdef4", {r["key"] for rs in fake.ledgers().values() for r in rs})
+
+    def test_emptied_extra_part_is_rewritten(self):  # 記録が無くなった 2 本目以降の本も書き直す
+        fake = FakeGitHub([{"number": 1, "title": lm.ledger_title("2026-08", 1), "body": ""},
+                           {"number": 2, "title": lm.ledger_title("2026-08", 2), "body": "古い"}])
+        lm.gh = fake
+        rec = dict(self.rec("o/r@abcdef7"), month="2026-08", part=1)
+        lm.save_months("o/ledger", {rec["key"]: rec}, {"2026-08": {1: 1, 2: 2}}, {"2026-08"}, self.now)
+        self.assertEqual(lm.parse_month(fake.issues[2]["body"]), [])
 
 
 if __name__ == "__main__":
