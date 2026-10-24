@@ -652,15 +652,11 @@ def suspect_diff(repo, s):
 
 def same_repo(ref, name):
     """「Reverts owner/repo#N」の参照先が、name と同じリポジトリか。両方を API で今の名前（full_name）に引き直して比べる
-    （名前を何度変えても合うように）。参照先が無い（HTTP 404）なら、別のリポジトリとして扱う"""
+    （名前を何度変えても合うように）。引き直せなければ例外のまま返す（GitHub は権限が無いときも 404 を返すので、
+    「別のリポジトリ」と決めつけず、候補を確定させずに次回へ回す）"""
     if any(x in (".", "..") for x in ref.split("/")):
         return False
-    try:
-        a = repo_info(ref).get("full_name") or ref
-    except Exception as e:
-        if "HTTP 404" in str(e):
-            return False
-        raise
+    a = repo_info(ref).get("full_name") or ref
     b = repo_info(name).get("full_name") or name
     return str(a).lower() == str(b).lower()
 
