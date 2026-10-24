@@ -2026,5 +2026,28 @@ class UnreadableDetail(unittest.TestCase):
         self.assertEqual(lm.LAST_RESPONSE["stop_reason"], "end_turn")
 
 
+
+class ReopenRestored(Run):
+    """max_tokens の不具合（#32 で直した）で打ち切った古い secret を、1 度だけ移し替え直す"""
+    def test_restored_v1_is_migrated_again_once(self):
+        old = {"key": "o/r@abcde45", "repo": "o/r", "kind": "fix", "sha": "abcde45", "date": "2026-08-01T00:00:00Z",
+               "message": "fix: x", "verdict": "secret", "serious": False, "suspects": [10], "attempts": 3,
+               "rationale": lm.RESTORED_SECRET_RATIONALE_V1}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
+        lm.gh = fake
+        lm.collect = lambda owner, exclude, skip=frozenset(): ([], [])
+        args = lm.argparse.Namespace(owner="o", ledger="o/ledger", exclude="", dry_run=False)
+        lm.run(args)
+        rec = fake.ledgers()["[漏れの記録] 2026-08"][0]
+        self.assertEqual(rec["verdict"], "secret")
+        self.assertEqual(rec["rationale"], lm.OLD_SECRET_RATIONALE)  # 試した回数を 0 から数え直す（取り直しに失敗したので 1 回目）
+        self.assertEqual(rec.get("attempts"), 1)
+        for _ in range(lm.MIGRATE_MAX_ATTEMPTS):
+            lm.run(args)
+        rec = fake.ledgers()["[漏れの記録] 2026-08"][0]
+        self.assertEqual(rec["rationale"], lm.RESTORED_SECRET_RATIONALE)  # 新しい打ち切りの文は、もう移し替えない
+        self.assertNotEqual(lm.RESTORED_SECRET_RATIONALE, lm.RESTORED_SECRET_RATIONALE_V1)
+
+
 if __name__ == "__main__":
     unittest.main()

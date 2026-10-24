@@ -307,7 +307,9 @@ def first_line(text):
     return lines[0] if lines else ""
 
 
-RESTORED_SECRET_RATIONALE = "古い方式で秘密情報の疑いとして送らなかった（今の方式でも判定まで進めなかった）"
+RESTORED_SECRET_RATIONALE = "古い方式で秘密情報の疑いとして送らなかった（今の方式で 3 回試しても判定まで進めなかった）"
+# 2026-10-24 の #32 より前の打ち切りの文。max_tokens=800 で返事が切れて打ち切った記録なので、1 度だけ移し替え直す
+RESTORED_SECRET_RATIONALE_V1 = "古い方式で秘密情報の疑いとして送らなかった（今の方式でも判定まで進めなかった）"
 OLD_SECRET_RATIONALE = "差分に秘密情報（のファイル・形）を含むので、AI に送らずに判定しない"  # 2026-10-24 より前の方式の理由
 WITHHELD_MARK = "（秘密情報の疑いがあるので、中身は送らない"
 
@@ -1258,6 +1260,10 @@ def run(a):
         if r.get("serious") and r.get("is_leak") == "unclear":
             known[k] = dict(r, serious=False)
             normalized.add(month_of(known[k], now))
+        if r.get("verdict") == "secret" and r.get("rationale") == RESTORED_SECRET_RATIONALE_V1 and has_key:
+            r = dict(r, rationale=OLD_SECRET_RATIONALE, attempts=0)  # 試した回数を 0 から数え直す
+            known[k] = r
+            normalized.add(month_of(r, now))
         if (r.get("verdict") == "secret" and r.get("rationale") == OLD_SECRET_RATIONALE and has_key
                 and valid_record(r, a.owner, exclude)):  # キーが無い実行では移し替えない（試せないので、回数も減らさない）
             # 古い方式（疑いが 1 か所でもあれば候補を丸ごと送らない）で確定した記録は、ファイルごとに外す今の方式で判定し直す。
