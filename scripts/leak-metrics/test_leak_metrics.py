@@ -1987,6 +1987,29 @@ class UnreadableDetail(unittest.TestCase):
         out = lm.judge(dict(self.CAND), api=api, has_key=True)
         self.assertIn("stop_reason=不明", out["rationale"])
 
+    def test_api_leaves_room_for_thinking(self):  # max_tokens=800 では、見えない思考で使い切って返事が切れた
+        import io
+        saved = lm.urllib.request.urlopen
+        seen = {}
+
+        class R(io.BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def fake(req, timeout=None):
+            seen.update(json.loads(req.data), timeout=timeout)
+            return R(json.dumps({"stop_reason": "end_turn", "content": [{"type": "text", "text": "{}"}]}).encode())
+        lm.urllib.request.urlopen = fake
+        os.environ.setdefault("ANTHROPIC_API_KEY", "k")
+        try:
+            lm.anthropic_api("m", "p")
+        finally:
+            lm.urllib.request.urlopen = saved
+        self.assertGreaterEqual(seen["max_tokens"], 16000)
+        self.assertNotIn("thinking", seen)  # 思考は既定（有効）のまま
+        self.assertGreater(seen["timeout"], 120)
+        self.assertLessEqual(lm.MAX_JUDGE_SECONDS + 2 * lm.API_TIMEOUT_SECONDS, 27 * 60)  # job の 30 分に保存の余裕を残す
+
     def test_api_records_stop_reason(self):
         import io
         saved = lm.urllib.request.urlopen
