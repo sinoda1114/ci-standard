@@ -1220,10 +1220,6 @@ def run(a):
         if c["key"] not in known:
             new.append(base_record(c, "1 回の上限で見送り"))
         skipped.add(c["key"])
-    # 移し替えた記録が、今回の方式でも判定まで進めなかったら（材料が欠けた・見送ったなど）、元の secret に戻す
-    new = [migrated[r["key"]] if r["key"] in migrated and r["verdict"] == "unjudged" else r for r in new]
-    for k in set(migrated) - {r["key"] for r in new} - {c["key"] for c in cands}:
-        known[k] = migrated[k]  # 集め直されず取り直しにも出なかった記録も戻す
     for r in new:
         old = known.get(r["key"]) or {}
         # 見送った分（判定していない）は「試した回数」に数えない
@@ -1237,6 +1233,11 @@ def run(a):
         if r["verdict"] == "unjudged" and old.get("refetch_failures"):  # まだ未判定なら、取り直しの失敗の回数も引き継ぐ
             r["refetch_failures"] = old["refetch_failures"]
         known[r["key"]] = r
+    for k, orig in migrated.items():
+        # 移し替えた記録が、今回の方式でも判定まで進めなかったら（材料が欠けた・上限で見送った・取り直せないなど、
+        # どの経路でも）、元の secret に戻す
+        if known[k].get("verdict") == "unjudged":
+            known[k] = orig
     # このログは公開リポジトリの Actions に出るので、件数の合計だけを出す（重大の件数・リポジトリ名は台帳にだけ残す）
     print("候補 %d / 今回判定 %d / 未判定 %d / 取得失敗 %d" % (
         len(cands), sum(1 for r in new if r["verdict"] != "unjudged"), sum(1 for r in new if r["verdict"] == "unjudged"), len(errors)))

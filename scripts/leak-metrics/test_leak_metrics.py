@@ -1779,6 +1779,19 @@ class SecretsPerFileMigrate(Run):
         self.go(fake, [c])
         self.assertEqual(fake.ledgers()["[漏れの記録] 2026-09"][0]["verdict"], "secret")
 
+    def test_migrated_record_skipped_by_caps_returns_to_secret(self):  # 確認役の却下（件数・時間の上限で見送り）
+        old = dict(self.OLD, key="o/r@abcde35", sha="abcde35", date="2026-09-30T00:00:00Z")
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month([old], "2026-09")}])
+        cands = [cand("o/r@abcde35", "2026-09-30T00:00:00Z")] + [cand("o/r@%07x" % i, "2026-09-29T00:00:00Z") for i in range(lm.MAX_PER_RUN + 2)]
+        saved = lm.MAX_PER_RUN
+        lm.MAX_PER_RUN = 1
+        try:
+            self.go(fake, cands)
+        finally:
+            lm.MAX_PER_RUN = saved
+        recs = {r["key"]: r for rs in fake.ledgers().values() for r in rs}
+        self.assertIn(recs["o/r@abcde35"]["verdict"], ("secret", "judged"))
+
     def test_unrefetchable_old_secret_stays_secret(self):  # ゲートの指摘 2
         gone = dict(self.OLD, key="o/r@abcde32", sha="abcde32")
         excl = dict(self.OLD, key="o/skip@abcde33", repo="o/skip", sha="abcde33")
