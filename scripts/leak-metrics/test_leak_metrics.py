@@ -639,7 +639,7 @@ class RefetchPr(Run):
         old = {"key": "o/r@abcde15", "repo": "o/r", "kind": "fix", "sha": "abcde15", "date": "2026-08-01T00:00:00Z",
                "message": "fix: x", "verdict": "unjudged", "serious": False, "suspects": [10], "pr": 15}
         fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
-        fake.api = {"api repos/o/r/pulls/15": json.dumps({"title": "fix: x", "body": "", "merged_at": "2026-08-01T00:00:00Z", "merge_commit_sha": "abcde15"}),
+        fake.api = {"api repos/o/r/pulls/15": json.dumps({"title": "fix: x", "body": "", "merged_at": "2026-08-01T00:00:00Z", "merge_commit_sha": "abcde15", "base": {"ref": "main"}}),
                     "api --paginate --slurp repos/o/r/pulls/15/files?per_page=100": json.dumps([[{"filename": "a.js"}]]),
                     "pr diff 15 -R o/r": "+PR-WHOLE-DIFF",
                     "api repos/o/r/pulls/10": json.dumps({"title": "feat: y", "merged_at": "2026-07-25T00:00:00Z", "base": {"ref": "main"}}),
@@ -1039,7 +1039,7 @@ class RebuildPr(Run):
         old = {"key": "o/r@abcde34", "repo": "o/r", "kind": "fix", "sha": "abcde34", "date": "2026-08-10T00:00:00Z",
                "message": "fix", "verdict": "unjudged", "serious": False, "suspects": [], "pr": 34, "rebuild_suspects": True}
         fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
-        fake.api = {"api repos/o/r/pulls/34": json.dumps({"title": "fix: a", "body": "", "merged_at": "2026-08-10T00:00:00Z", "merge_commit_sha": "abcde34"}),
+        fake.api = {"api repos/o/r/pulls/34": json.dumps({"title": "fix: a", "body": "", "merged_at": "2026-08-10T00:00:00Z", "merge_commit_sha": "abcde34", "base": {"ref": "main"}}),
                     "api --paginate --slurp repos/o/r/pulls/34/files?per_page=100": json.dumps([[{"filename": "src/a.js"}]]),
                     "pr diff 34 -R o/r": "-a",
                     "api repos/o/r/pulls?state=closed&base=main&sort=updated&direction=desc&per_page=50&page=1": json.dumps([{"number": 10, "merged_at": "2026-08-05T00:00:00Z", "title": "feat: x"}]),
@@ -1500,6 +1500,46 @@ class Round4Collect(Collect):
             lm.monotonic = saved
         self.assertEqual(cands, [])
         self.assertTrue(any("時間の上限" in e for e in errors))
+
+
+class PrBots(Run):
+    """PR #26 のボットの指摘（手元の /ai-review をすり抜けた分）"""
+    def test_refetched_pr_without_base_is_not_sent(self):  # Amazon Q
+        old = {"key": "o/r@abcde21", "repo": "o/r", "kind": "fix", "sha": "abcde21", "date": "2026-08-01T00:00:00Z",
+               "message": "fix: x", "verdict": "unjudged", "serious": False, "suspects": [], "pr": 21}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
+        fake.api = {"api repos/o/r/pulls/21": json.dumps({"title": "fix: x", "body": "", "merged_at": "2026-08-01T00:00:00Z",
+                                                          "merge_commit_sha": "abcde21"}),
+                    "api --paginate --slurp repos/o/r/pulls/21/files?per_page=100": json.dumps([[{"filename": "a.js"}]]),
+                    "pr diff 21 -R o/r": "+unknown-branch"}
+        self.go(fake, [])
+        self.assertFalse([c for c in fake.calls if c[0] == "pr"])
+
+    def test_judgement_is_read_from_the_first_valid_object(self):  # Amazon Q
+        j = lm.parse_judgement('前置き {"a": 1} の後に ' + MINOR)
+        self.assertIsNotNone(j)
+        self.assertEqual(j["is_leak"], "no")
+        k = lm.parse_judgement('{"is_leak":"no","caused_by_pr":null,"severity":"other","security":false,"rationale":"} を含む"}')
+        self.assertIsNotNone(k)
+
+    def test_revert_of_another_repos_pr_has_no_suspects(self):  # Devin
+        msg = "Revert \"feat: y\"\n\nReverts other/project#10"
+        c = lm.fix_candidates("o/r", [commit("abcdef2", "2026-10-10T00:00:00Z", msg, ["a"])],
+                              [pr(12, "2026-10-05T00:00:00Z", ["a"])])[0]
+        self.assertEqual(c["suspects"], [])
+
+    def test_secret_file_names_ignore_case(self):  # Codex P1
+        self.assertTrue(lm.secret_files(["config/.ENV", "PROD.KEY"]))
+        self.assertTrue(lm.secret_files(["ID_RSA"]))
+        self.assertTrue(lm.has_secret("diff --git a/.ENV.production b/.ENV.production\n+X=1"))
+
+    def test_judged_count_excludes_unjudged(self):  # Codex P2
+        import io, contextlib
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.go(FakeGitHub(), [cand("o/r@abcde22", "2026-09-30T00:00:00Z")])
+        self.assertIn("今回判定 0", out.getvalue())
 
 
 if __name__ == "__main__":

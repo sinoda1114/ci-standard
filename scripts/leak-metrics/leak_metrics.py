@@ -63,11 +63,11 @@ SECRET_KEY_RE = re.compile(r"(?i)(password|passwd|secret|api[_-]?key|token|crede
 # 引用符の値は長さの上限を付けない（長い鍵も見逃さない）。引用符の無い値は、数字を含み、関数の呼び出しでないものだけ
 SECRET_VALUE_RE = re.compile(r"""[\w.-]{0,100}['"]?\s*[:=]\s*(['"][^'"\n]{8,}['"]|(?=[A-Za-z0-9_\-/+=]*\d)[A-Za-z0-9_\-/+=]{16,}(?![A-Za-z0-9_\-/+=])(?!\s*\())""")
 SECRET_KEYS_PER_LINE = 20  # 1 行の中で調べるキーワードの数（同じ行を何度も読み直して遅くならないように）
-SECRET_PATH_RE = re.compile(r"(^|/)(\.env[^/]*|[^/]*\.pem|[^/]*\.key|id_rsa[^/]*|id_ed25519[^/]*|credentials[^/]*|\.npmrc|\.netrc)$")
+SECRET_PATH_RE = re.compile(r"(^|/)(\.env[^/]*|[^/]*\.pem|[^/]*\.key|id_rsa[^/]*|id_ed25519[^/]*|credentials[^/]*|\.npmrc|\.netrc)$", re.I)
 # 差分の中のファイルのパスの行（空白を含むパスも、名前の変更の前後も見る）
 DIFF_PATH_LINE_RE = re.compile(r"(?m)^(?:diff --git |--- |\+\+\+ |rename (?:from|to) ).*$")
 # 見出しの行のどこかにある秘密情報のファイルの名前（git が引用符で囲んだパス・空白やタブを含むパスでも見つかるように）
-SECRET_NAME_RE = re.compile(r"""(?:^|[/"\s\\])(\.env[^/"\s\\]*|[^/"\s\\]*\.pem|[^/"\s\\]*\.key|id_rsa[^/"\s\\]*|id_ed25519[^/"\s\\]*|credentials[^/"\s\\]*|\.npmrc|\.netrc)(?=["\s\\]|$)""")
+SECRET_NAME_RE = re.compile(r"""(?:^|[/"\s\\])(\.env[^/"\s\\]*|[^/"\s\\]*\.pem|[^/"\s\\]*\.key|id_rsa[^/"\s\\]*|id_ed25519[^/"\s\\]*|credentials[^/"\s\\]*|\.npmrc|\.netrc)(?=["\s\\]|$)""", re.I)
 STATE_BEGIN = "<!-- leak-metrics-state"
 STATE_END = "leak-metrics-state -->"
 MAX_BODY_CHARS = 60000      # 台帳 Issue 1 本の本文の上限（GitHub の上限 65,536 文字より小さく取る）
@@ -106,8 +106,9 @@ def fix_candidates(repo, commits, prs, revert_pr=None):
         when = _ts(c["date"])
         target = revert_target(c["message"])
         target_pr = revert_pr_number(c["message"], repo)
+        foreign = bool(REVERT_PR_RE.search(c["message"])) and not target_pr  # 別のリポジトリの PR の revert
         kind = "revert" if target or target_pr or c["message"].lower().startswith("revert") else "fix"
-        suspects, incomplete, known = [], c.get("incomplete", ""), False
+        suspects, incomplete, known = [], c.get("incomplete", ""), foreign  # 別のリポジトリの revert は、ファイルの重なりで付け替えない
         if target_pr:  # 本文が「Reverts owner/repo#12」なら、元の PR の番号がそのまま分かる
             known = True
             suspects = [p for p in prs if p["number"] == target_pr and p.get("merged_at")
@@ -156,13 +157,21 @@ def issue_candidates(repo, issues, prs):
 
 
 def parse_judgement(text):
-    m = re.search(r"\{.*\}", text or "", re.S)
-    if not m:
-        return None
-    try:
-        d = json.loads(m.group(0))
-    except ValueError:
-        return None
+    """返事の中の、判定の形をした最初の JSON（前置きの別の JSON や、rationale の中の } に惑わされない）"""
+    t = str(text or "")
+    dec = json.JSONDecoder()
+    for m in re.finditer(r"\{", t):
+        try:
+            d, _ = dec.raw_decode(t, m.start())
+        except ValueError:
+            continue
+        j = _judgement(d)
+        if j is not None:
+            return j
+    return None
+
+
+def _judgement(d):
     if not isinstance(d, dict):
         return None
     if d.get("is_leak") not in LEAK_VALUES or d.get("severity") not in SEVERITIES:
@@ -860,7 +869,7 @@ def _refetch(live, owner, exclude, errors, out, failed, started):
                     tick()
                     pp = json.loads(gh("api", "repos/%s/pulls/%d" % (repo, pr_no)))
                     if (not pp.get("merged_at") or pp.get("merge_commit_sha") != r["sha"]
-                            or (pp.get("base") or {}).get("ref", info.get("default_branch")) != info.get("default_branch")):
+                            or (pp.get("base") or {}).get("ref") != info.get("default_branch")):  # base が無い PR も通さない
                         # 台帳の pr を信じない: マージされていて、マージのコミットが記録の SHA と同じ PR だけを取り直す
                         raise RuntimeError("台帳の pr（#%s）が記録のコミットと合わない" % pr_no)
                     if not is_fix_message(pp.get("title")):  # collect と同じく、題名が fix・revert の PR だけ
@@ -1053,7 +1062,7 @@ def run(a):
         known[r["key"]] = r
     # このログは公開リポジトリの Actions に出るので、件数の合計だけを出す（重大の件数・リポジトリ名は台帳にだけ残す）
     print("候補 %d / 今回判定 %d / 未判定 %d / 取得失敗 %d" % (
-        len(cands), len(new), sum(1 for r in new if r["verdict"] == "unjudged"), len(errors)))
+        len(cands), sum(1 for r in new if r["verdict"] != "unjudged"), sum(1 for r in new if r["verdict"] == "unjudged"), len(errors)))
     if a.dry_run:
         report_errors(errors)
         return 0
