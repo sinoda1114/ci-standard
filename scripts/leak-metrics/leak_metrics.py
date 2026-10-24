@@ -1,0 +1,1152 @@
+#!/usr/bin/env python3
+"""マージ後の「漏れ」を集計し、台帳リポジトリに残す（/ai-review の効果を結果で測るための記録）。
+
+漏れの候補: 既定ブランチに入った fix・revert のコミット（直近 14 日）と、type:fix の Issue。
+原因の候補: その 14 日前までにマージされ、同じファイルを触った PR（revert は元の PR）。
+判定: 2 段。1 段目（安いモデル）で全件を見て、重大・セキュリティ・不明のものだけ 2 段目（上位モデル）で判定し直す。
+     判定できなかったもの（キー無し・API の失敗・読めない出力）は「漏れなし」にせず unjudged として残し、次回に再判定する。
+記録: 台帳リポジトリの月ごとの Issue（[漏れの記録] YYYY-MM）の本文に全件を JSON で持つ。
+     重大・セキュリティのものは、別に Issue（[漏れ] ...、type:fix）を立てる。
+標準ライブラリと gh CLI だけで動く。テスト: test_leak_metrics.py
+使い方: leak_metrics.py run --owner <owner> --ledger <owner/repo> [--dry-run]
+環境変数: GH_TOKEN（全リポジトリの読み取りと台帳への起票）、ANTHROPIC_API_KEY（判定。無ければ全件 unjudged）
+"""
+import argparse
+import contextlib
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+WINDOW_DAYS = 14
+STAGE1_MODEL = "claude-haiku-5-5"
+STAGE2_MODEL = "claude-opus-5-5"
+MAX_PER_RUN = 60            # 1 回の実行で判定する上限（料金の上限を決める）
+MAX_REPOS = 1000            # 集めるリポジトリの上限（超えたら取得失敗として知らせる）
+MAX_REFETCH_ERRORS = 3      # 取り直しの失敗を「取得失敗」に数える回数（以後は数えずに取り直しだけ続ける。毎日赤くし続けない）
+MAX_JUDGE_SECONDS = 20 * 60  # 判定に使う時間の上限。job の timeout-minutes（30）より前に保存まで終える
+MAX_COLLECT_SECONDS = 10 * 60  # 集める処理の時間の上限（残りのリポジトリは見送り、取得の失敗に数える）
+MAX_REFETCH_SECONDS = 5 * 60   # 取り直しの時間の上限（残りは台帳に未判定のまま残し、次回に回す）
+GH_TIMEOUT_SECONDS = 120       # gh の呼び出し 1 回の上限（1 回の呼び出しで時間の上限を越えないように）
+MAX_PROMPT_CHARS = 60000    # 1 件の判定に渡すプロンプトの上限（文字）
+MAX_FIX_DIFF_CHARS = 25000  # そのうち修正の差分に使う分。残りを原因の候補で分ける（候補の節が切り詰めで消えないように）
+MAX_SUSPECTS = 5
+SEVERITIES = ("critical", "high", "other")
+LEAK_VALUES = ("yes", "no", "unclear")
+FIX_RE = re.compile(r"^(fix|hotfix|revert)(\([^)]*\))?!?:|^Revert\b", re.I)
+REVERT_RE = re.compile(r"This reverts commit ([0-9a-f]{7,40})")
+REVERT_PR_RE = re.compile(r"^Reverts ([\w.-]+/[\w.-]+)#(\d+)\s*$", re.M)  # GitHub の Revert ボタンで作った PR の本文
+# 外部の API に送る前に伏せる秘密情報（scripts/pr-triage/triage.py と同じ）
+SECRET_RE = re.compile(
+    r"(-----BEGIN [A-Z ]*PRIVATE KEY"                     # PEM・PGP（PRIVATE KEY BLOCK）
+    r"|AKIA[0-9A-Z]{16}"                                  # AWS access key
+    r"|AIza[0-9A-Za-z_\-]{35}"                            # Google API key
+    r"|sk-[A-Za-z0-9_\-]{20,}"                            # OpenAI 系
+    r"|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}"  # GitHub classic / fine-grained
+    r"|xox[abprs]-[A-Za-z0-9\-]{10,}"                     # Slack
+    r"|apikey_[A-Za-z0-9_]{30,}"
+    r")")
+# 代入の形（password = "…"・"api_key": "…" など）は 2 段で確かめる: キーワードを探し、その直後の決まった長さだけを調べる
+# （1 つの正規表現で書くと、長い英数字の行で二乗の時間になる）
+# 送るかどうかの判定（has_secret）は、値の形を見ない。キーワードの直後に : か = があれば、疑わしいので送らない
+# （値の書き方の抜け道をふさぎきれないため。ユーザーの判断 2026-10-17）
+# config["password"] = … の ] も、キーと : の間の改行（差分の行頭の + - も）も許す
+SECRET_ASSIGN_RE = re.compile(r"""[\w.-]{0,100}['"]?\]?(?:\s|(?<=\n)[+-])*[:=]""")
+# SECRET_ASSIGN_RE と同じ判定を、英数字の並び（[\w.-]*）の終わりを使い回して線形の時間で行うための部品
+SECRET_WORD_RUN_RE = re.compile(r"[\w.-]*")
+SECRET_ASSIGN_TAIL_RE = re.compile(r"""['"]?\]?(?:\s|(?<=\n)[+-])*[:=]""")
+SECRET_ASSIGN_MAX_WORD = 100
+MAX_SECRET_SCAN_CHARS = 2000000  # これより長い文字列は調べきらずに、秘密情報を含むものとして扱う
+# 伏せる（redact）ときは、値の形まで見て範囲を決める
+SECRET_KEY_RE = re.compile(r"(?i)(password|passwd|secret|api[_-]?key|token|credential)")
+# 引用符の値は長さの上限を付けない（長い鍵も見逃さない）。引用符の無い値は、数字を含み、関数の呼び出しでないものだけ
+SECRET_VALUE_RE = re.compile(r"""[\w.-]{0,100}['"]?\s*[:=]\s*(['"][^'"\n]{8,}['"]|(?=[A-Za-z0-9_\-/+=]*\d)[A-Za-z0-9_\-/+=]{16,}(?![A-Za-z0-9_\-/+=])(?!\s*\())""")
+SECRET_KEYS_PER_LINE = 20  # 1 行の中で調べるキーワードの数（同じ行を何度も読み直して遅くならないように）
+SECRET_PATH_RE = re.compile(r"(^|/)(\.env[^/]*|[^/]*\.pem|[^/]*\.key|id_rsa[^/]*|id_ed25519[^/]*|credentials[^/]*|\.npmrc|\.netrc)$", re.I)
+# 差分の中のファイルのパスの行（空白を含むパスも、名前の変更の前後も見る）
+DIFF_PATH_LINE_RE = re.compile(r"(?m)^(?:diff --git |--- |\+\+\+ |rename (?:from|to) ).*$")
+# 見出しの行のどこかにある秘密情報のファイルの名前（git が引用符で囲んだパス・空白やタブを含むパスでも見つかるように）
+SECRET_NAME_RE = re.compile(r"""(?:^|[/"\s\\])(\.env[^/"\s\\]*|[^/"\s\\]*\.pem|[^/"\s\\]*\.key|id_rsa[^/"\s\\]*|id_ed25519[^/"\s\\]*|credentials[^/"\s\\]*|\.npmrc|\.netrc)(?=["\s\\]|$)""", re.I)
+STATE_BEGIN = "<!-- leak-metrics-state"
+STATE_END = "leak-metrics-state -->"
+MAX_BODY_CHARS = 60000      # 台帳 Issue 1 本の本文の上限（GitHub の上限 65,536 文字より小さく取る）
+MAX_RATIONALE_CHARS = 500
+MAX_SERIOUS_LISTED = 20     # 台帳の 1 本目に一覧で載せる重大の件数（残りは件数だけ。全件は状態に入っている）
+SUMMARY_RESERVE = 12000     # 1 本目に集計と重大の一覧を載せるために空けておく文字数（一覧は 1 行 約 450 文字 × 20 件まで）
+
+
+# ------------------------------------------------------------ 純粋な判断（テスト対象）
+
+def is_fix_message(msg):
+    return bool(FIX_RE.match((msg or "").strip()))
+
+
+def revert_target(msg):
+    m = REVERT_RE.search(msg or "")
+    return m.group(1) if m else None
+
+
+def revert_pr_number(msg, repo):
+    """本文の「Reverts owner/repo#N」の N。別のリポジトリの PR なら None（このリポジトリの PR と取り違えない）"""
+    m = REVERT_PR_RE.search(msg or "")
+    return int(m.group(2)) if m and m.group(1).lower() == str(repo).lower() else None
+
+
+def _ts(s):
+    return dt.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+
+
+def fix_kind(msg, target, target_pr):
+    """修正の種類。revert 元（コミット・PR）が分かったものと、題名が Revert のものは revert"""
+    return "revert" if target or target_pr or str(msg or "").lower().startswith("revert") else "fix"
+
+
+def fix_candidates(repo, commits, prs, revert_pr=None, same_repo=None):
+    """fix・revert のコミットを候補にし、原因の候補（suspects）を付ける。
+    same_repo: 「Reverts owner/repo#N」の参照先が、名前を変える前のこのリポジトリかを確かめる関数（無ければ別のリポジトリと見なす）"""
+    out = []
+    for c in commits:
+        if not is_fix_message(c["message"]):
+            continue
+        when = _ts(c["date"])
+        target = revert_target(c["message"])
+        target_pr = revert_pr_number(c["message"], repo)
+        ref = REVERT_PR_RE.search(c["message"])
+        foreign = bool(ref) and not target_pr  # 別のリポジトリの PR の revert
+        suspects, incomplete, known = [], c.get("incomplete", ""), foreign  # 別のリポジトリの revert は、ファイルの重なりで付け替えない
+        if foreign and same_repo:  # 名前を変える前のこのリポジトリなら、その PR が元の PR
+            try:
+                if same_repo(ref.group(1)):
+                    target_pr = int(ref.group(2))
+            except Exception as e:  # 確かめられなければ確定させない（次回に取り直す）
+                incomplete = "revert 元のリポジトリを確かめられない: %s" % str(e)[:150]
+        kind = fix_kind(c["message"], target, target_pr)  # 元の PR が決まってから
+        if target_pr:  # 本文が「Reverts owner/repo#12」なら、元の PR の番号がそのまま分かる
+            known = True
+            suspects = [p for p in prs if p["number"] == target_pr and p.get("merged_at")
+                        and dt.timedelta(0) < when - _ts(p["merged_at"]) <= dt.timedelta(days=WINDOW_DAYS)]
+        elif target and revert_pr:
+            try:
+                n = revert_pr(target)
+                known = True  # revert 元が分かった（PR が無いことが分かった場合も含む）
+            except Exception as e:  # 取れなければ、この候補だけを次回に回す（リポジトリ全体を落とさない）
+                n, incomplete = None, "revert 元の PR を取得できない: %s" % str(e)[:150]
+            # 原因の候補は revert 元の PR だけ。窓（直前 14 日）の外や一覧に無いなら候補なし（ファイルの重なりで付け替えない）
+            suspects = [p for p in prs if p["number"] == n and p.get("merged_at")
+                        and dt.timedelta(0) < when - _ts(p["merged_at"]) <= dt.timedelta(days=WINDOW_DAYS)]
+        if not suspects and not known:
+            files = set(c.get("files") or [])
+            own = set(c.get("prs") or [])
+            for p in prs:
+                if p["number"] in own or not p.get("merged_at"):
+                    continue
+                age = when - _ts(p["merged_at"])
+                if dt.timedelta(0) < age <= dt.timedelta(days=WINDOW_DAYS) and files & set(p.get("files") or []):
+                    suspects.append(p)
+        suspects = [dict(p) for p in sorted(suspects, key=lambda p: p["merged_at"], reverse=True)[:MAX_SUSPECTS]]  # 候補ごとに別の写し
+        out.append({"key": "%s@%s" % (repo, c["sha"]), "repo": repo, "kind": kind, "sha": c["sha"], "files": list(c.get("files") or []),
+                    "date": c["date"], "message": first_line(c["message"])[:200],
+                    "message_full": first_line(c["message"]),  # 秘密情報は、切る前の 1 行目の全文で確かめる
+                    "diff": c.get("diff", ""), "suspects": suspects, **({"incomplete": incomplete} if incomplete else {}),
+                    **({"pr": c["pr"]} if c.get("pr") else {}),
+                    **({"rebuild_suspects": True} if c.get("rebuild_suspects") else {})})
+    return out
+
+
+def issue_candidates(repo, issues, prs):
+    """type:fix の Issue を候補にする。原因の候補は直前 14 日にマージされた PR（題名だけで判定する）"""
+    out = []
+    for i in issues:
+        when = _ts(i["created_at"])
+        sus = [p for p in prs if p.get("merged_at")
+               and dt.timedelta(0) < when - _ts(p["merged_at"]) <= dt.timedelta(days=WINDOW_DAYS)]
+        sus = sorted(sus, key=lambda p: p["merged_at"], reverse=True)[:MAX_SUSPECTS]
+        out.append({"key": "%s#%d" % (repo, i["number"]), "repo": repo, "kind": "issue", "sha": "",
+                    "date": i["created_at"], "message": i["title"][:200], "message_full": i["title"],
+                    "diff": i.get("body") or "",  # 切らずに持つ（秘密情報は全文で確かめ、プロンプトを作るときにだけ切る）
+                    "suspects": [{"number": p["number"], "title": p["title"], "diff": ""} for p in sus]})
+    return out
+
+
+def parse_judgement(text):
+    """返事の中の、判定の形をした最初の JSON（前置きの別の JSON や、rationale の中の } に惑わされない）"""
+    t = str(text or "")
+    dec = json.JSONDecoder()
+    for m in re.finditer(r"\{", t):
+        try:
+            d, _ = dec.raw_decode(t, m.start())
+        except ValueError:
+            continue
+        j = _judgement(d)
+        if j is not None:
+            return j
+    return None
+
+
+def _judgement(d):
+    if not isinstance(d, dict):
+        return None
+    if d.get("is_leak") not in LEAK_VALUES or d.get("severity") not in SEVERITIES:
+        return None
+    if not isinstance(d.get("security"), bool) or "caused_by_pr" not in d:
+        return None
+    d["caused_by_pr"] = pr_number(d.get("caused_by_pr"))
+    d["rationale"] = str(d.get("rationale") or "")[:MAX_RATIONALE_CHARS]
+    return d
+
+
+def pr_number(v):
+    """AI が返した PR 番号を int か None にそろえる（"10"・"#10" は読む。それ以外は None）"""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v if v > 0 else None
+    m = re.fullmatch(r"\s*#?(\d{1,9})\s*", str(v)) if isinstance(v, str) else None
+    return int(m.group(1)) if m else None
+
+
+def needs_stage2(j):
+    if j["is_leak"] == "no":
+        return False
+    return j["is_leak"] == "unclear" or j["severity"] in ("critical", "high") or j["security"]
+
+
+def secret_assignments(text):
+    """代入の形の秘密情報の位置（始まり, 終わり）。引用符の無い値は数字を含むときだけ（関数名のような識別子を外す）"""
+    t = str(text or "")
+    line_end, seen = -1, 0
+    for m in SECRET_KEY_RE.finditer(t):
+        if m.start() > line_end:  # 次の行に入った（行の終わりを覚えておき、探し直さない）
+            line_end = t.find("\n", m.start())
+            line_end = len(t) if line_end < 0 else line_end
+            seen = 0
+        seen += 1
+        if seen > SECRET_KEYS_PER_LINE:
+            continue
+        v = SECRET_VALUE_RE.match(t, m.end())
+        if v:
+            yield m.start(), v.end()
+
+
+def redact(text):
+    """外部の API に送る文字列から秘密情報を伏せる。秘密情報のファイル（.env・鍵など）の差分は中身ごと送らない"""
+    out = []
+    for part in re.split(r"(?m)^(?=diff --git )", str(text or "")):
+        head = part.split("\n", 1)[0]
+        if head.startswith("diff --git ") and SECRET_NAME_RE.search(head):
+            part = part.split("\n", 1)[0] + "\n（秘密情報のファイルなので、差分は送らない）\n"
+        out.append(part)
+    t = SECRET_RE.sub("（秘密情報を伏せた）", "".join(out))
+    spans = []
+    for a, b in sorted(secret_assignments(t)):  # 重なる範囲はまとめる（後ろから置き換えたときに、位置がずれないように）
+        if spans and a <= spans[-1][1]:
+            spans[-1] = (spans[-1][0], max(spans[-1][1], b))
+        else:
+            spans.append((a, b))
+    for a, b in reversed(spans):
+        t = t[:a] + "（秘密情報を伏せた）" + t[b:]
+    return t
+
+
+def commit_diff(entries):
+    """コミットの変更ファイルの patch を、ファイルごとに diff --git の見出しを付けて連結する。名前を変えたファイルは
+    変更前のパスも見出しに入れる（秘密情報のファイルを見分けられるように）"""
+    parts = []
+    for f in entries or []:
+        if isinstance(f, dict):
+            name = f.get("filename") or ""
+            old = f.get("previous_filename") or name
+            head = "diff --git a/%s b/%s\n" % (old, name) + ("rename from %s\nrename to %s\n" % (old, name) if old != name else "")
+            parts.append(head + f.get("patch", ""))
+    return "\n".join(parts)
+
+
+def has_secret(text):
+    """秘密情報のファイル（.env・鍵など。名前の変更の前後・空白を含むパスも）か、秘密情報の形か、
+    キーワードへの代入（値の形は問わない）を含むか。長すぎて調べきれないものも、含むものとして扱う"""
+    t = str(text or "")
+    if len(t) > MAX_SECRET_SCAN_CHARS:
+        return True
+    for m in DIFF_PATH_LINE_RE.finditer(t):
+        if SECRET_NAME_RE.search(m.group(0)):
+            return True
+    if SECRET_RE.search(t):
+        return True
+    run_start, run_end, tails = -1, -1, {}
+    for m in SECRET_KEY_RE.finditer(t):
+        i = m.end()
+        if not run_start <= i <= run_end:  # 同じ並びの中のキーワードは、並びの終わりが同じ
+            run_start, run_end = i, SECRET_WORD_RUN_RE.match(t, i).end()
+        if run_end - i > SECRET_ASSIGN_MAX_WORD:  # 並びが長すぎると、SECRET_ASSIGN_RE の {0,100} では届かない
+            continue
+        if run_end not in tails:
+            tails[run_end] = bool(SECRET_ASSIGN_TAIL_RE.match(t, run_end))
+        if tails[run_end]:
+            return True
+    return False
+
+
+def first_line(text):
+    lines = str(text or "").splitlines()
+    return lines[0] if lines else ""
+
+
+def secret_files(files):
+    """API から取った生のパスの一覧に、秘密情報のファイルがあるか（差分の見出しの書き方に左右されない）"""
+    return any(isinstance(f, str) and SECRET_PATH_RE.search(f) for f in files or [])
+
+
+def file_names(entries):
+    """PR・コミットの変更ファイルの一覧。名前を変えたファイルは変更前のパスも入れる（原因の PR と結び付けるため）"""
+    names = []
+    for f in entries or []:
+        for k in ("filename", "previous_filename"):
+            if isinstance(f, dict) and f.get(k) and f[k] not in names:
+                names.append(f[k])
+    return names
+
+
+def build_prompt(c):
+    """修正の差分と原因の候補に別々の予算を持たせる（末尾で一括に切ると、候補の節が丸ごと消えることがある）"""
+    head = ("次の修正（%s）が、直前にマージされた PR が入れた不具合を直したものかを判定してください。\n"
+            "判定は次の JSON 1 つだけで返してください。\n"
+            '{"is_leak": "yes|no|unclear", "caused_by_pr": <PR 番号か null>, '
+            '"severity": "critical|high|other", "security": true|false, "rationale": "<1 文>"}\n'
+            "- is_leak: 候補の PR が入れた不具合を直したものなら yes。仕様変更・機能追加・候補と無関係なら no。\n"
+            "- severity: critical はデータ消失・認証の迂回・任意コード実行などの大事故、high は利用者に明確な害がある不具合、"
+            "other はそれ以外（見た目・軽微な性能など）。\n"
+            "- security: 脆弱性（注入・認可・秘密情報の漏えいなど）の修正なら true。\n\n" % c["kind"])
+    fix = "## 修正: %s\n```diff\n%s\n```\n\n## 原因の候補\n" % (redact(str(c["message"])[:200]), redact(c.get("diff") or "")[:MAX_FIX_DIFF_CHARS])
+    sus_list = c["suspects"][:MAX_SUSPECTS]
+    wrap = [("### PR #%s: %s\n```diff\n" % (s["number"], redact(str(s.get("title", ""))[:200])), "\n```") for s in sus_list]
+    room = MAX_PROMPT_CHARS - len(head) - len(fix) - sum(len(a) + len(b) for a, b in wrap) - len(wrap)  # 枠と改行の分を正確に引く
+    per = max(0, room // max(1, len(sus_list)))
+    sus = [a + redact(s.get("diff") or "")[:per] + b for (a, b), s in zip(wrap, sus_list)]  # 題名の % を書式として読まない
+    return (head + fix + "\n".join(sus))[:MAX_PROMPT_CHARS]
+
+
+def base_record(c, why=""):
+    rec = {k: c.get(k) for k in ("key", "repo", "kind", "sha", "date", "message")}
+    if c.get("pr"):
+        rec["pr"] = c["pr"]  # 修正の PR の候補（取り直しで PR 全体の差分を取るため）
+    if c.get("rebuild_suspects"):
+        rec["rebuild_suspects"] = True  # 原因の候補を作れなかった（取り直しで作り直す）
+    rec["suspects"] = [s["number"] for s in c["suspects"]]
+    rec.update({"verdict": "unjudged", "serious": False, "severity": None, "security": None,
+                "caused_by_pr": None, "rationale": why, "models": []})
+    return rec
+
+
+def judge(c, api, has_key):
+    rec = base_record(c)
+    if c.get("incomplete"):  # 材料が欠けたまま判定しない。候補が無くても確定させない（次回に取り直す）
+        rec["rationale"] = "材料が欠けている: %s" % c["incomplete"]
+        return rec
+    if not c["suspects"]:
+        rec["verdict"] = "no-suspect"
+        return rec
+    # 秘密情報を見つけたら、伏せて送るのではなく、送らない（正規表現で伏せきることはできないため。判定はしないで確定する）
+    if (secret_files(c.get("files")) or has_secret(c.get("diff")) or has_secret(c.get("message_full", c.get("message")))
+            or any(secret_files(s.get("files")) or has_secret(s.get("diff")) or has_secret(s.get("title")) for s in c["suspects"])):
+        rec["verdict"] = "secret"
+        rec["rationale"] = "差分に秘密情報（のファイル・形）を含むので、AI に送らずに判定しない"
+        return rec
+    if not has_key:
+        rec["rationale"] = "API キーが無い"
+        return rec
+    prompt = build_prompt(c)
+    final = None
+    for model in (STAGE1_MODEL, STAGE2_MODEL):
+        try:
+            j = parse_judgement(api(model, prompt))
+        except Exception as e:  # API の失敗は unjudged（次回に再判定）
+            rec["rationale"] = "API の失敗: %s" % str(e)[:200]
+            return rec
+        rec["models"].append(model)
+        if j is None:
+            rec["rationale"] = "%s の出力を読めない" % model
+            return rec
+        final = j
+        if model == STAGE1_MODEL and not needs_stage2(j):
+            break
+    pr = final["caused_by_pr"] if final["caused_by_pr"] in rec["suspects"] else None  # 候補にない番号は書かない
+    rec.update({"verdict": "judged", "severity": final["severity"], "security": final["security"],
+                "caused_by_pr": pr, "rationale": final["rationale"],
+                "is_leak": final["is_leak"]})
+    # 重大は、漏れと判定したもの（yes）だけ。unclear は台帳に残すが、集計の重大にも [漏れ] Issue にもしない（ユーザーの判断 2026-10-24）
+    rec["serious"] = final["is_leak"] == "yes" and (final["severity"] in ("critical", "high") or final["security"])
+    return rec
+
+
+class LedgerError(ValueError):
+    """台帳の状態を読めない。空として上書きすると記録が消えるので、実行を止める"""
+
+
+def md_text(v):
+    """コミットの題名など外から来る文字列を、台帳の Markdown に安全に載せる（リンク・メンション・HTML を効かせない）"""
+    t = re.sub(r"[\r\n`]", " ", str(v or ""))[:200]
+    return "`%s`" % t.replace("<", "‹").replace(">", "›")
+
+
+def state_json(records):
+    """状態の JSON。< > & を \\u エスケープするので、どんな値を入れても区切り（<!-- / -->）にならない"""
+    return (json.dumps(records, ensure_ascii=False)
+            .replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026"))
+
+
+def render_month(records, month, part=1, parts=1, summary_of=None):
+    """台帳 Issue 1 本の本文。集計は 1 本目にだけ、月の全件（summary_of）について書く"""
+    lines = ["# 漏れの記録 %s%s" % (month, "（%d/%d）" % (part, parts) if parts > 1 else ""), ""]
+    if part == 1:
+        allr = summary_of if summary_of is not None else records
+        judged = [r for r in allr if r.get("verdict") == "judged"]
+        serious = [r for r in allr if r.get("serious")]
+        lines += ["| 項目 | 件数 |", "|---|---|",
+                  "| 候補 | %d |" % len(allr), "| 判定済み | %d |" % len(judged),
+                  "| 漏れ（yes） | %d |" % sum(1 for r in judged if r.get("is_leak") == "yes"),
+                  "| 重大・セキュリティ | %d |" % len(serious),
+                  "| 未判定（次回に再判定） | %d |" % sum(1 for r in allr if r.get("verdict") == "unjudged"), ""]
+        if serious:
+            lines += ["## 重大・セキュリティ", ""]
+            lines += ["- %s %s（%s）" % (md_text(r["key"]), md_text(r.get("message")), md_text(r.get("severity")))
+                      for r in serious[:MAX_SERIOUS_LISTED]]
+            if len(serious) > MAX_SERIOUS_LISTED:
+                lines.append("- ほか %d 件" % (len(serious) - MAX_SERIOUS_LISTED))
+            lines.append("")
+    lines += ["自動で更新します（ci-standard の leak-metrics）。手で編集しないでください。", "",
+              STATE_BEGIN, state_json(records), STATE_END]
+    return "\n".join(lines)
+
+
+def fits(recs, month, part, summary_of):
+    room = MAX_BODY_CHARS - (SUMMARY_RESERVE if part == 1 else 0)  # 1 本目の集計は SUMMARY_RESERVE で見込む
+    # 保存するときに足される month・part の分も含めて測る（part は大きめの番号で見積もる）
+    return len(render_month([dict(r, month=month, part=999) for r in recs], month, 2, 2)) <= room
+
+
+def place(records, month):
+    """月の記録を本（1 本目・2 本目…）に分ける。戻り値: 番 → 記録の配列。
+    既に本に入っている記録は、その本が上限に収まる限り動かさない。新しい記録は最後の本に入れ、あふれたら次の本を作る。
+    判定し直しで記録が大きくなって本があふれたときは、あふれた分を後ろの本へ移す。移す先はいつも番の大きい本なので、
+    番の大きい本から順に書けば（save_months）、途中で書き込みが失敗しても、記録はどこかの本に必ず残る"""
+    parts = {}
+    for r in records:
+        if r.get("part"):
+            parts.setdefault(int(r["part"]), []).append(r)
+    parts.setdefault(max(parts, default=1), [])
+    moving = [r for r in records if not r.get("part")]
+    for n in sorted(parts):  # あふれた本からは、後ろの記録を移す
+        while len(parts[n]) > 1 and not fits(parts[n], month, n, records):
+            moving.insert(0, parts[n].pop())
+    last = max(parts)
+    for r in moving:
+        if parts[last] and not fits(parts[last] + [r], month, last, records):
+            last += 1
+            parts[last] = []
+        parts[last].append(r)
+    for n, rs in parts.items():
+        for r in rs:
+            r["month"], r["part"] = month, n
+    return parts
+
+
+def parse_month(body):
+    """台帳 Issue の本文から状態を読む。状態は必ず本文の最後の 3 行（開始の区切り・1 行の JSON・終わりの区切り）にある。
+    JSON は改行を含まないので、値の中に区切りの文字列があっても（旧形式の台帳でも）、そこを状態と取り違えない。
+    本文が空なら空。台帳 Issue なのに最後の 3 行が状態の形でない（区切りが壊れた・消えた）、または読めなければ
+    LedgerError（空として読むと、次の書き込みで記録を消すので止める）"""
+    if not (body or "").strip():
+        return []
+    lines = body.replace("\r\n", "\n").rstrip("\n").split("\n")  # ブラウザで保存すると CRLF になる
+    if len(lines) < 3 or lines[-3] != STATE_BEGIN or lines[-1] != STATE_END:
+        raise LedgerError("状態が本文の最後の 3 行にない")
+    try:
+        d = json.loads(lines[-2])
+    except ValueError as e:
+        raise LedgerError("状態の JSON を読めない: %s" % e)
+    if not isinstance(d, list) or not all(valid_shape(r) for r in d):
+        raise LedgerError("状態の形が違う")
+    return d
+
+
+def valid_shape(r):
+    """台帳の 1 件の記録の型（人の編集で壊れていたら、別の例外で落ちる前に LedgerError にする）"""
+    if not isinstance(r, dict) or not isinstance(r.get("key"), str):
+        return False
+    types = {"repo": str, "kind": str, "sha": str, "date": str, "message": str, "verdict": str, "rationale": str,
+             "month": str, "severity": str, "is_leak": str, "serious": bool, "notified": bool, "security": bool,
+             "attempts": int, "part": int, "pr": int, "rebuild_suspects": bool, "refetch_failures": int, "caused_by_pr": int, "suspects": list, "models": list}
+    for k, t in types.items():
+        v = r.get(k)
+        if v is not None and not (isinstance(v, t) and not (t is int and isinstance(v, bool))):
+            return False
+    return all(type(n) is int for n in r.get("suspects") or []) and all(isinstance(m, str) for m in r.get("models") or [])
+
+
+def pending(candidates, known):
+    done = {r["key"] for r in known if r.get("verdict") in ("judged", "no-suspect", "secret")}
+    return [c for c in candidates if c["key"] not in done]
+
+
+def merge(known, new):
+    idx = {r["key"]: r for r in known}
+    for r in new:
+        idx[r["key"]] = r
+    return list(idx.values())
+
+
+def cap(todo):
+    return todo[:MAX_PER_RUN]
+
+
+def prioritize(todo, known):
+    """試した回数が少ないもの・古いものから選ぶ（毎回同じ先頭の候補だけが枠を使い続けないように）"""
+    tries = {r["key"]: int(r.get("attempts") or 0) for r in known}
+    return sorted(todo, key=lambda c: (tries.get(c["key"], 0), c.get("date") or "", c["key"]))
+
+
+def month_of(rec, now):
+    """記録を入れる月。一度入った月（month）からは動かさない。初めての記録は日付の月で、未来なら今の月"""
+    if re.fullmatch(r"\d{4}-\d{2}", str(rec.get("month") or "")):
+        return rec["month"]
+    d = str(rec.get("date") or "")[:7]
+    cur = now.strftime("%Y-%m")
+    return d if re.fullmatch(r"\d{4}-\d{2}", d) and d <= cur else cur
+
+
+LEDGER_TITLE_RE = re.compile(r"^\[漏れの記録\] (\d{4}-\d{2})(?: \((\d+)\))?$")
+
+
+def ledger_title(month, part):
+    return "[漏れの記録] %s" % month + (" (%d)" % part if part > 1 else "")
+
+
+def load_ledger(issues):
+    """台帳リポジトリの Issue（number・title・body）から、全部の月の記録と、月ごとの台帳 Issue を読む。
+    同じ月・同じ番の Issue が 2 本あっても（過去の重複）、両方の記録を読む（判定済みを優先）。
+    戻り値: (key → 記録, 月 → {番: Issue 番号}) 。読めない台帳があれば LedgerError"""
+    recs, slots = {}, {}
+    rank = {"judged": 0, "no-suspect": 0, "secret": 0, "unjudged": 1}
+    for i in sorted(issues, key=lambda i: i["number"]):
+        m = LEDGER_TITLE_RE.match(i.get("title") or "")
+        if not m:
+            continue
+        month, part = m.group(1), int(m.group(2) or 1)
+        slots.setdefault(month, {}).setdefault(part, i["number"])
+        for r in parse_month(i.get("body") or ""):
+            r = dict(r, month=month, part=part)  # 入っている本を覚え、書き直しでも動かさない
+            old = recs.get(r["key"])
+            if old is None or rank.get(r.get("verdict"), 2) < rank.get(old.get("verdict"), 2):
+                recs[r["key"]] = r
+    return recs, slots
+
+
+def leak_mark(key):
+    return "<!-- ai-review-leak:%s -->" % key
+
+
+def marked_keys(issues):
+    """[漏れ] Issue の本文の最終行の目印だけを読む（本文の途中に書かれた目印は、AI の出力などから入りうるので信じない）"""
+    keys = set()
+    for i in issues:
+        last = (i.get("body") or "").replace("\r\n", "\n").rstrip("\n").split("\n")[-1]  # ブラウザで保存すると CRLF になる
+        m = re.fullmatch(r"<!-- ai-review-leak:(\S+) -->", last)
+        if m:
+            keys.add(m.group(1))
+    return keys
+
+
+def serious_issue(r):
+    title = ("[漏れ] %s: %s" % (r["repo"], re.sub(r"[\r\n]", " ", r.get("message") or "")))[:200]
+    why = re.sub(r"`", "'", str(r.get("rationale") or ""))[:MAX_RATIONALE_CHARS]
+    body = "\n".join([
+        "マージ後 %d 日以内に、重大またはセキュリティの修正が入りました。" % WINDOW_DAYS, "",
+        "- 修正: %s %s（%s）" % (r["repo"], r.get("sha") or r["key"], r.get("kind")),
+        "- 原因と判定された PR: %s" % ("%s#%s" % (r["repo"], r["caused_by_pr"]) if r.get("caused_by_pr") else "不明"),
+        "- 重大度: %s / セキュリティ: %s" % (r.get("severity"), r.get("security")),
+        "- 判定の理由（AI の出力。そのまま載せる）:", "", "```text", why, "```",
+        "- 判定したモデル: %s" % ", ".join(r.get("models") or []), "",
+        "push 前の /ai-review で止められたはずかを確かめ、必要なら設計を見直してください。", "",
+        leak_mark(r["key"])])
+    return title, body
+
+
+# ------------------------------------------------------------ 外部との入出力
+
+def monotonic():
+    return time.monotonic()
+
+
+def utcnow():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+class TimeBudget(BaseException):
+    """集める処理・取り直しの時間の上限を越えた。取得の失敗（Exception）とは別に扱うので、
+    途中の except Exception に飲まれないよう BaseException の子にする"""
+
+
+_DEADLINE = None  # 集める処理・取り直しの間だけ入る期限（monotonic の値）。gh の呼び出しとページのループが確かめる
+
+
+def tick():
+    if _DEADLINE is not None and monotonic() > _DEADLINE:
+        raise TimeBudget("時間の上限")
+
+
+@contextlib.contextmanager
+def time_budget(limit):
+    """この間の gh の呼び出しに期限を付ける（どの経路の呼び出しも、期限を越えて続けない）"""
+    global _DEADLINE
+    started = monotonic()
+    _DEADLINE = started + limit
+    try:
+        yield started
+    finally:
+        _DEADLINE = None
+
+
+def gh(*args, input_text=None):
+    tick()
+    try:
+        r = subprocess.run(["gh", *args], capture_output=True, text=True, input=input_text, timeout=GH_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("gh %s: %d 秒で応答が無い" % (" ".join(args[:3]), GH_TIMEOUT_SECONDS))
+    if r.returncode != 0:
+        raise RuntimeError("gh %s: %s" % (" ".join(args[:3]), r.stderr.strip()[:300]))
+    return r.stdout
+
+
+def _paged(path):
+    """ページ分けされた一覧を 1 つの配列にする（--slurp はページごとの配列の配列を返す）"""
+    pages = json.loads(gh("api", "--paginate", "--slurp", path))
+    return [x for page in pages for x in (page if isinstance(page, list) else [page])]
+
+
+def anthropic_api(model, prompt):
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=json.dumps({"model": model, "max_tokens": 800,
+                         "messages": [{"role": "user", "content": prompt}]}).encode(),
+        headers={"x-api-key": os.environ["ANTHROPIC_API_KEY"], "anthropic-version": "2023-06-01",
+                 "content-type": "application/json"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        d = json.load(r)
+    return "".join(b.get("text", "") for b in d.get("content", []) if b.get("type") == "text")
+
+
+def recent_prs(repo, base, since):
+    """閉じた PR を、更新日の新しい順にページごとに読み、ページの最後が since より古くなったら打ち切る
+    （_paged は全履歴を読むので、履歴の多いリポジトリで毎日全部を取ってしまう）"""
+    page = 1
+    while True:
+        tick()
+        if page > 200:  # 黙って打ち切らない（候補を欠いたまま進めない）
+            raise RuntimeError("閉じた PR が 200 ページを超えた（%s）" % repo)
+        items = json.loads(gh("api", "repos/%s/pulls?state=closed&base=%s&sort=updated&direction=desc&per_page=50&page=%d"
+                              % (repo, base, page)))
+        items = [x for x in (items if isinstance(items, list) else []) if isinstance(x, dict)]
+        for p in items:
+            yield p
+        last = items[-1].get("updated_at") if items else None
+        if len(items) < 50 or (last and _ts(last) < since):
+            return
+        page += 1
+
+
+def suspect_diff(repo, s):
+    """原因の候補の PR の差分。(差分, 欠けた理由)。大きすぎて取れない（HTTP 406）ものは、取り直しても同じなので
+    変更ファイルの一覧で代えて判定を続ける。一時的な失敗は欠けた理由を返す（その候補は次回に判定し直す）"""
+    try:
+        return gh("pr", "diff", str(s["number"]), "-R", repo), ""  # 切らずに返す（秘密情報は全文で確かめ、プロンプトを作るときにだけ切る）
+    except Exception as e:
+        if re.search(r"\bHTTP 406\b", str(e)) or "too large" in str(e).lower():
+            return "（差分が大きすぎて取得できない。変更ファイル: %s）" % ", ".join((s.get("files") or [])[:50]), ""
+        return "", "PR #%s の差分を取得できない: %s" % (s["number"], str(e)[:150])
+
+
+def same_repo(ref, name):
+    """「Reverts owner/repo#N」の参照先が、name と同じリポジトリか。両方を API で今の名前（full_name）に引き直して比べる
+    （名前を何度変えても合うように）。参照先が 404 なら別のリポジトリ（名前を変えた自分のリポジトリなら、古い名前は
+    転送され、自分のトークンで読めるので 404 にならない）。それ以外の失敗（5xx・時間切れ）は例外のまま返し、確定させない"""
+    if any(x in (".", "..") for x in ref.split("/")):
+        return False
+    try:
+        a = repo_info(ref).get("full_name") or ref
+    except Exception as e:
+        if "HTTP 404" not in str(e):
+            raise
+        _REPO_INFO[ref] = {"missing": True}  # 同じ参照先を問い合わせ直さない
+        return False
+    if repo_info(ref).get("missing"):
+        return False
+    b = repo_info(name).get("full_name") or name
+    return str(a).lower() == str(b).lower()
+
+
+def collect(owner, exclude, skip=frozenset()):
+    """skip: 判定済みの候補の key。その候補の原因の候補の差分は取り直さない（取得の失敗で赤くもしない）"""
+    with time_budget(MAX_COLLECT_SECONDS) as started:
+        try:
+            return _collect(owner, exclude, skip, started)
+        except TimeBudget:  # リポジトリの一覧を取る前に上限に達した
+            return [], ["時間の上限で、リポジトリの一覧を取れなかった"]
+
+
+def _collect(owner, exclude, skip, started):
+    now = utcnow()
+    since_fix = (now - dt.timedelta(days=WINDOW_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    since_pr = now - dt.timedelta(days=WINDOW_DAYS * 2)
+    repos = json.loads(gh("repo", "list", owner, "--limit", str(MAX_REPOS), "--no-archived", "--source",
+                          "--json", "nameWithOwner,defaultBranchRef"))
+    cands, errors = [], []
+    if len(repos) >= MAX_REPOS:  # 上限で黙って打ち切らない
+        errors.append("リポジトリが %d 件以上あり、一覧を打ち切った（MAX_REPOS を上げる）" % MAX_REPOS)
+    for k, r in enumerate(repos):
+        if monotonic() - started > MAX_COLLECT_SECONDS:  # 黙って打ち切らない（窓を出た候補は二度と集まらない）
+            errors.append("時間の上限で、残りの %d リポジトリを見送った" % (len(repos) - k))
+            break
+        name = r["nameWithOwner"]
+        if name.split("/")[1] in exclude or not r.get("defaultBranchRef"):
+            continue
+        branch = urllib.parse.quote(r["defaultBranchRef"]["name"], safe="")  # API のパスに入れるので & # + % を逃がす
+        try:
+            prs = []
+            for p in recent_prs(name, branch, since_pr):
+                tick()
+                if p.get("merged_at") and _ts(p["merged_at"]) >= since_pr:
+                    files = file_names(_paged("repos/%s/pulls/%d/files?per_page=100" % (name, p["number"])))
+                    prs.append({"number": p["number"], "merged_at": p["merged_at"], "title": p["title"], "files": files,
+                                "merge_commit_sha": p.get("merge_commit_sha"), "body": p.get("body") or ""})
+            nowz = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+            commits = []
+            # 修正の PR: 窓の中でマージされ、題名が fix・revert の PR を 1 つの候補にする（squash・マージコミット・リベースの
+            # どれで入っても同じ。中のコミットのメッセージには頼らない）。差分は PR 全体、キーはマージのコミット
+            for p in prs:
+                tick()
+                if not (p.get("merge_commit_sha") and is_fix_message(p["title"]) and _ts(p["merged_at"]) >= now - dt.timedelta(days=WINDOW_DAYS)):
+                    continue
+                pdiff, why = (("", "") if "%s@%s" % (name, p["merge_commit_sha"]) in skip
+                              else suspect_diff(name, {"number": p["number"], "files": p["files"]}))
+                commits.append({"sha": p["merge_commit_sha"], "date": min(p["merged_at"], nowz),
+                                "message": p["title"] + "\n\n" + p["body"], "files": p["files"], "prs": [p["number"]],
+                                "diff": pdiff, "pr": p["number"], **({"incomplete": why} if why else {})})
+            pr_shas = {c["sha"] for c in commits}
+            # 直接 push された fix・revert のコミット（PR に属するコミットは、上の修正の PR の候補が受け持つ。
+            # 題名が fix でない PR の途中の直しは、候補にしない）
+            for c in _paged("repos/%s/commits?sha=%s&since=%s&per_page=100" % (name, branch, since_fix)):
+                msg = c["commit"]["message"]
+                if c["sha"] in pr_shas or not is_fix_message(msg):
+                    continue
+                tick()
+                try:  # 1 件の取得の失敗で、リポジトリの残りの候補を落とさない
+                    own_prs = json.loads(gh("api", "repos/%s/commits/%s/pulls" % (name, c["sha"])))
+                    if own_prs:
+                        continue
+                    # 変更ファイルは 300 件ごとにページが分かれるので、全ページを読む
+                    files_all = [f for page in _paged("repos/%s/commits/%s?per_page=100" % (name, c["sha"]))
+                                 for f in (page.get("files") or [] if isinstance(page, dict) else [])]
+                except TimeBudget:
+                    raise
+                except Exception as e:
+                    # 取れなくても台帳に未判定で残す（窓を出たあとも取り直せるように。材料が欠けているので判定はしない）
+                    errors.append("%s@%s: %s" % (name, c["sha"][:7], str(e)[:200]))
+                    commits.append({"sha": c["sha"], "date": min(c["commit"]["committer"]["date"], nowz), "message": msg,
+                                    "files": [], "prs": [], "diff": "", "incomplete": "コミットの詳細を取得できない",
+                                    "rebuild_suspects": True})
+                    continue
+                date = min(c["commit"]["committer"]["date"], nowz)  # 未来の日時は今に丸める
+                commits.append({"sha": c["sha"], "date": date, "message": msg,
+                                "files": file_names(files_all), "prs": [],
+                                "diff": commit_diff(files_all)})
+
+            def revert_pr(sha, name=name):
+                ps = json.loads(gh("api", "repos/%s/commits/%s/pulls" % (name, sha)))
+                return ps[0]["number"] if ps else None
+            fc = fix_candidates(name, commits, prs, revert_pr=revert_pr, same_repo=lambda ref, name=name: same_repo(ref, name))
+            seen_why = set()
+            for c in fc:  # revert 元の PR を取れなかった候補も、取得の失敗に数える
+                if c.get("incomplete") and c["key"] not in skip and c["incomplete"] not in seen_why:
+                    seen_why.add(c["incomplete"])
+                    errors.append("%s: %s" % (name, c["incomplete"]))
+            diffs = {}  # 同じ PR の差分は 1 回だけ取る（失敗も同じ結果を、その PR を候補に持つ全員に返す）
+            for c in fc:  # 原因の候補の差分は、判定に使うものだけ取る
+                if c["key"] in skip:
+                    continue  # 判定済み（pending で外れる）
+                for s in c["suspects"]:
+                    if s["number"] not in diffs:
+                        tick()
+                        diffs[s["number"]] = suspect_diff(name, s)
+                    s["diff"], why = diffs[s["number"]]
+                    if why:
+                        c["incomplete"] = why
+                        if why not in seen_why:  # 取得の失敗にも数える（終了コードで気づけるように。同じ失敗は 1 回だけ）
+                            seen_why.add(why)
+                            errors.append("%s: %s" % (name, why))
+            try:  # Issue を無効にしたリポジトリ（HTTP 410）などで失敗しても、修正コミットの候補は残す
+                issues = [i for i in _paged("repos/%s/issues?state=all&labels=type:fix&since=%s&per_page=100" % (name, since_fix))
+                          if "pull_request" not in i and _ts(i["created_at"]) >= now - dt.timedelta(days=WINDOW_DAYS)]
+            except Exception as e:
+                if "HTTP 410" not in str(e):
+                    errors.append("%s: Issue を取得できない: %s" % (name, str(e)[:200]))
+                issues = []
+            cands += fc + issue_candidates(name, issues, prs)
+        except TimeBudget:  # リポジトリの途中で上限に達した。このリポジトリの候補は捨て、残りも見送る
+            errors.append("時間の上限で、%s の途中から残りの %d リポジトリを見送った" % (name, len(repos) - k))
+            break
+        except Exception as e:  # 1 リポジトリの失敗で全体を止めない。失敗は記録に出す
+            if "HTTP 409" in str(e):  # 空のリポジトリ（コミットが無い）は対象外
+                continue
+            errors.append("%s: %s" % (name, str(e)[:200]))
+    return cands, errors
+
+
+def valid_record(r, owner, exclude):
+    """台帳の記録を、取り直しの前に確かめる（台帳は人が編集できるので、取得先を記録の値に任せない）"""
+    repo = r.get("repo")
+    if not isinstance(repo, str) or not re.fullmatch(r"%s/[A-Za-z0-9._-]+" % re.escape(owner), repo, re.I) \
+            or repo.split("/")[1] in (".", ".."):
+        return False
+    if repo.split("/")[1] in exclude:
+        return False
+    sus = r.get("suspects")
+    if not isinstance(sus, list) or len(sus) > MAX_SUSPECTS or not all(type(n) is int and n > 0 for n in sus):
+        return False
+    if r.get("kind") in ("fix", "revert"):
+        sha = r.get("sha")
+        return isinstance(sha, str) and bool(re.fullmatch(r"[0-9a-f]{7,40}", sha)) and r.get("key") == "%s@%s" % (repo, sha)
+    if r.get("kind") == "issue":
+        return isinstance(r.get("key"), str) and bool(re.fullmatch(r"%s#\d+" % re.escape(repo), r["key"]))
+    return False
+
+
+_REPO_INFO = {}
+
+
+def repo_info(repo):
+    """リポジトリの持ち主・アーカイブ・既定ブランチ（1 回の実行で 1 度だけ問い合わせる）"""
+    if repo not in _REPO_INFO:
+        _REPO_INFO[repo] = json.loads(gh("api", "repos/%s" % repo))
+    return _REPO_INFO[repo]
+
+
+def rebuild_suspects(repo, r, files, msg):
+    """記録の日付の直前 14 日にマージされ、同じファイルを触った PR を、原因の候補として作り直す（PR の番号の配列）"""
+    when = _ts(r["date"])
+    prs = []
+    # 通常の集め方と同じく、既定ブランチにマージされた PR だけを見る
+    base = urllib.parse.quote(repo_info(repo).get("default_branch") or "", safe="")
+    for p in recent_prs(repo, base, when - dt.timedelta(days=WINDOW_DAYS)):
+        tick()
+        m = p.get("merged_at")
+        if m and dt.timedelta(0) < when - _ts(m) <= dt.timedelta(days=WINDOW_DAYS):
+            pf = file_names(_paged("repos/%s/pulls/%d/files?per_page=100" % (repo, p["number"])))
+            prs.append({"number": p["number"], "merged_at": m, "title": p.get("title", ""), "files": pf})
+    c = {"sha": r["sha"], "date": r["date"], "message": msg or r.get("message") or "", "files": files, "prs": []}
+    cands = fix_candidates(repo, [c], prs)
+    return [s["number"] for s in cands[0]["suspects"]] if cands else []
+
+
+def refetch(stale, owner, exclude, errors):
+    """窓から外れた未判定の記録を、判定できる形に取り直す（試した回数の少ない順に、1 回の上限まで）。
+    戻り値: (取り直せた候補, 取り直せなかった記録の key)。取り直せなかったものも「試した」に数える"""
+    out, failed = [], []
+    _REPO_INFO.clear()
+    # 後から除外したリポジトリの記録は、上限を当てる前に除く（取り直さず、取得失敗にも数えない。記録はそのまま残す）
+    live = [r for r in stale if not (isinstance(r.get("repo"), str) and r["repo"].split("/")[-1] in exclude)]
+    if not live:
+        return out, failed
+    with time_budget(MAX_REFETCH_SECONDS) as started:
+        _refetch(live, owner, exclude, errors, out, failed, started)
+    return out, failed
+
+
+def _refetch(live, owner, exclude, errors, out, failed, started):
+    for r in sorted(live, key=lambda r: (int(r.get("attempts") or 0), r.get("date") or ""))[:MAX_PER_RUN]:
+        if monotonic() - started > MAX_REFETCH_SECONDS:
+            break  # 残りは台帳に未判定のまま残す（試した回数にも、取り直しの失敗にも数えない）
+        # 取り直しの失敗を取得失敗に数えるのは、取り直しの失敗の最初の MAX_REFETCH_ERRORS 回だけ
+        # （attempts は判定の失敗でも増えるので、取り直しの失敗は refetch_failures で別に数える）
+        counts = int(r.get("refetch_failures") or 0) < MAX_REFETCH_ERRORS
+        if not valid_record(r, owner, exclude):
+            if counts:
+                errors.append("台帳の記録が不正なので取り直さない: %s" % str(r.get("key"))[:100])
+            failed.append(r["key"])
+            continue
+        repo = r["repo"]
+        kind = r.get("kind")  # Issue はそのまま。修正は取り直した材料で決め直す（下の fix_kind）
+        rec_files = []
+        try:
+            tick()
+            info = repo_info(repo)  # 台帳の値だけで取り直す先を決めない: 今の持ち主のもので、アーカイブされていないこと
+            if ((info.get("owner") or {}).get("login") or "").lower() != owner.lower() or info.get("archived"):
+                if counts:
+                    errors.append("台帳の記録のリポジトリが対象外なので取り直さない: %s" % str(r.get("key"))[:100])
+                failed.append(r["key"])
+                continue
+            if r["kind"] == "issue":
+                i = json.loads(gh("api", "repos/%s/issues/%s" % (repo, r["key"].rsplit("#", 1)[1])))
+                # 台帳の値を信じない: collect と同じく、PR ではない type:fix の Issue だけを取り直す
+                if "pull_request" in i or "type:fix" not in [l.get("name") for l in i.get("labels") or [] if isinstance(l, dict)]:
+                    raise RuntimeError("台帳の記録が type:fix の Issue ではない")
+                diff = i.get("body") or ""  # 切らずに持つ（秘密情報は全文で確かめる）
+                fetched_msg = i.get("title") or ""
+                sus = []
+                for n in r["suspects"]:  # 原因の候補は、既定ブランチに、Issue の作成の直前 14 日にマージされた PR だけ
+                    p = json.loads(gh("api", "repos/%s/pulls/%d" % (repo, n)))
+                    m = p.get("merged_at")
+                    if (m and dt.timedelta(0) < _ts(r["date"]) - _ts(m) <= dt.timedelta(days=WINDOW_DAYS)
+                            and (p.get("base") or {}).get("ref") == info.get("default_branch")):
+                        sus.append({"number": n, "title": p.get("title", ""), "diff": ""})
+            else:
+                # 通常の集め方（collect・fix_candidates）とそろえる: 修正の PR は PR 全体の差分、コミットは変更ファイルの全ページ、
+                # revert は元の PR だけを窓の中で
+                nums = list(r["suspects"])
+                pr_no = r.get("pr")
+                own_prs = None
+                if not pr_no:  # PR の番号を持たない記録でも、そのコミットが PR のマージのコミットなら PR の候補として扱う
+                    own_prs = json.loads(gh("api", "repos/%s/commits/%s/pulls" % (repo, r["sha"])))
+                    hit = [p for p in own_prs if p.get("merge_commit_sha") == r["sha"] and type(p.get("number")) is int]
+                    if hit:
+                        pr_no = hit[0]["number"]
+                if pr_no:
+                    tick()
+                    pp = json.loads(gh("api", "repos/%s/pulls/%d" % (repo, pr_no)))
+                    if (not pp.get("merged_at") or pp.get("merge_commit_sha") != r["sha"]
+                            or (pp.get("base") or {}).get("ref") != info.get("default_branch")):  # base が無い PR も通さない
+                        # 台帳の pr を信じない: マージされていて、マージのコミットが記録の SHA と同じ PR だけを取り直す
+                        raise RuntimeError("台帳の pr（#%s）が記録のコミットと合わない" % pr_no)
+                    if not is_fix_message(pp.get("title")):  # collect と同じく、題名が fix・revert の PR だけ
+                        raise RuntimeError("台帳の pr（#%s）の題名が fix・revert ではない" % pr_no)
+                    pf = file_names(_paged("repos/%s/pulls/%d/files?per_page=100" % (repo, pr_no)))
+                    rec_files = pf
+                    diff, why = suspect_diff(repo, {"number": pr_no, "files": pf})
+                    if why:
+                        raise RuntimeError(why)
+                    msg = (pp.get("title") or "") + "\n\n" + (pp.get("body") or "")
+                    if r.get("rebuild_suspects"):  # PR のマージコミットだった記録も、原因の候補を作り直す
+                        nums = rebuild_suspects(repo, r, pf, msg)
+                else:
+                    if own_prs and r["sha"] not in {p.get("merge_commit_sha") for p in own_prs}:
+                        # PR の中のコミット（collect と同じく候補にしない）。台帳では判定済み扱いにして取り直しを止める
+                        out.append({k: r.get(k) for k in ("key", "repo", "kind", "sha", "date", "message")} | {"diff": "", "suspects": []})
+                        continue
+                    pages = [x for x in _paged("repos/%s/commits/%s?per_page=100" % (repo, r["sha"])) if isinstance(x, dict)]
+                    diff = commit_diff([f for x in pages for f in x.get("files") or []])
+                    rec_files = file_names([f for x in pages for f in x.get("files") or []])
+                    msg = ((pages[0] if pages else {}).get("commit") or {}).get("message", "")
+                    # 台帳の値を信じない: collect と同じく、既定ブランチに入った fix・revert のコミットだけを取り直す
+                    if not is_fix_message(msg):
+                        raise RuntimeError("台帳の記録のコミットが fix・revert ではない")
+                    cmp = json.loads(gh("api", "repos/%s/compare/%s...%s" % (
+                        repo, r["sha"], urllib.parse.quote(info.get("default_branch") or "", safe=""))))
+                    if cmp.get("status") not in ("ahead", "identical"):
+                        raise RuntimeError("台帳の記録のコミットが既定ブランチに入っていない")
+                    if r.get("rebuild_suspects"):
+                        # 前回はコミットの詳細を取れず、原因の候補を作れなかった。通常の集め方（fix_candidates）で作り直す
+                        nums = rebuild_suspects(repo, r, file_names([f for x in pages for f in x.get("files") or []]), msg)
+                fetched_msg = msg
+                target, target_pr = revert_target(msg), revert_pr_number(msg, repo)
+                ref = REVERT_PR_RE.search(msg or "")
+                if ref and not target_pr and same_repo(ref.group(1), repo):  # 名前を変える前のこのリポジトリの PR
+                    target_pr = int(ref.group(2))
+                kind = fix_kind(msg, target, target_pr)  # 台帳の kind を使わず、取り直した材料で決め直す
+                if target_pr:
+                    nums = [target_pr]
+                elif target:  # revert は元の PR を探し直す（前回は取得に失敗して、ファイルの重なりで代えていたかもしれない）
+                    ps = json.loads(gh("api", "repos/%s/commits/%s/pulls" % (repo, target)))
+                    nums = [ps[0]["number"]] if ps and type(ps[0].get("number")) is int else []
+                elif REVERT_PR_RE.search(msg or ""):  # 別のリポジトリの PR の revert: 台帳の候補（ファイルの重なり）を使わない
+                    nums = []
+                sus = []
+                for n in nums:
+                    tick()
+                    p = json.loads(gh("api", "repos/%s/pulls/%d" % (repo, n)))
+                    # 台帳の suspects を信じない: collect と同じく、既定ブランチに、記録の日付の直前 14 日にマージされた PR だけ
+                    # （任意の未マージの PR の差分を AI に渡させない）
+                    m = p.get("merged_at")
+                    if not (m and dt.timedelta(0) < _ts(r["date"]) - _ts(m) <= dt.timedelta(days=WINDOW_DAYS)):
+                        continue
+                    if (p.get("base") or {}).get("ref") != info.get("default_branch"):
+                        continue
+                    s_ = {"number": n, "title": p.get("title", ""),
+                          "files": file_names(_paged("repos/%s/pulls/%d/files?per_page=100" % (repo, n)))}
+                    s_["diff"], why = suspect_diff(repo, s_)
+                    if why:
+                        raise RuntimeError(why)
+                    sus.append(s_)
+        except TimeBudget:
+            break  # 残りは台帳に未判定のまま残す（試した回数にも、取り直しの失敗にも数えない）
+        except Exception as e:  # 取り直せなければ未判定のまま残す
+            if counts:
+                errors.append("%s: 取り直しに失敗: %s" % (r["key"], str(e)[:200]))
+            failed.append(r["key"])
+            continue
+        # プロンプトに入る message は、台帳の値ではなく取り直したコミット・PR・Issue のもの（台帳を書き換えて判定を誘導させない）
+        out.append({k: r.get(k) for k in ("key", "repo", "kind", "sha", "date", "pr") if r.get(k) is not None}
+                   | {"kind": kind, "message": first_line(fetched_msg)[:200], "message_full": first_line(fetched_msg), "diff": diff, "suspects": sus,
+                      "files": rec_files})
+
+
+def list_issues(ledger, label=None):
+    """台帳リポジトリの Issue の全件（検索 API は索引が遅れるので使わない。件数で打ち切らない）"""
+    path = "repos/%s/issues?state=all&per_page=100" % ledger + ("&labels=%s" % label if label else "")
+    return [{"number": i["number"], "title": i.get("title") or "", "body": i.get("body") or ""}
+            for i in _paged(path) if "pull_request" not in i]
+
+
+def save_months(ledger, records, slots, months, now):
+    """変わった月の台帳を書き直す。記録は入っている本から動かさず、新しい記録は最後の本（あふれたら次の本）に入れる"""
+    for month in sorted(months):
+        recs = [r for r in records.values() if month_of(r, now) == month]
+        parts = place(recs, month)
+        n = max(parts)
+        for part in sorted(parts, reverse=True):  # 移す先（番の大きい本）を先に書く（place の説明）
+            text = render_month(parts[part], month, part, n, summary_of=recs)
+            num = slots.get(month, {}).get(part)
+            if num:
+                gh("issue", "edit", str(num), "-R", ledger, "--body-file", "-", input_text=text)
+            else:
+                url = gh("issue", "create", "-R", ledger, "--title", ledger_title(month, part), "--body-file", "-",
+                         input_text=text).strip()
+                slots.setdefault(month, {})[part] = int(url.rsplit("/", 1)[-1])
+
+
+def notify(ledger, records, errors):
+    """重大で、まだ [漏れ] Issue を立てていない記録について起票する。立て終えたものだけ notified にする。
+    失敗したものは notified にしないので、次回に起票し直す（目印で二重の起票を防ぐ）。変わった月を返す"""
+    pending_r = [r for r in records.values() if r.get("serious") and not r.get("notified")]
+    if not pending_r:
+        return []
+    try:  # ラベルは無いときだけ作る（--force は毎回、色を乱数で塗り替える）
+        gh("label", "create", "type:fix", "-R", ledger, "--color", "d73a4a", "--description", "漏れの記録")
+    except Exception:
+        pass  # すでにある（あるいは作れない。そのときは起票の失敗として次回に回る）
+    try:
+        done = marked_keys(list_issues(ledger))  # ラベルを外された [漏れ] Issue も見る
+    except Exception as e:  # 一覧が取れないと二重に起票しうるので、今回は起票しない
+        errors.append("[漏れ] Issue の確認に失敗: %s" % str(e)[:200])
+        return []
+    changed = []
+    for r in pending_r:
+        try:
+            if r["key"] not in done:
+                title, body = serious_issue(r)
+                gh("issue", "create", "-R", ledger, "--title", title, "--label", "type:fix", "--body-file", "-",
+                   input_text=body)
+            r["notified"] = True
+            changed.append(r)
+        except Exception as e:  # 1 件の失敗で残りを止めない
+            errors.append("[漏れ] Issue の起票に失敗（次回に再試行）: %s: %s" % (r["key"], str(e)[:200]))
+    return changed
+
+
+def report_errors(errors):
+    """取得失敗をログに出す。既定は種類（HTTP の番号）ごとの件数だけ（公開のログに private のリポジトリ名を出さない）。
+    手元で詳しく見るときは LEAK_METRICS_LOG_DETAILS=1"""
+    if not errors:
+        return
+    if os.environ.get("LEAK_METRICS_LOG_DETAILS") == "1":
+        for e in errors:
+            print("取得失敗: " + e, file=sys.stderr)
+        return
+    kinds = {}
+    for e in errors:
+        m = re.search(r"\bHTTP (\d{3})\b", e)
+        k = "HTTP %s" % m.group(1) if m else "そのほか"
+        kinds[k] = kinds.get(k, 0) + 1
+    print("取得失敗 %d 件（%s）。詳しくは手元で LEAK_METRICS_LOG_DETAILS=1 を付けて動かす"
+          % (len(errors), "、".join("%s: %d 件" % kv for kv in sorted(kinds.items()))), file=sys.stderr)
+
+
+def run(a):
+    started = monotonic()
+    now = utcnow()
+    # 台帳には private リポジトリの情報（判定の理由・候補）を書くので、Private でなければ何もせずに止める
+    try:
+        vis = json.loads(gh("repo", "view", a.ledger, "--json", "visibility")).get("visibility")
+    except Exception as e:
+        print("台帳（%s）の公開設定を確かめられません: %s" % (a.ledger, str(e)[:200]), file=sys.stderr)
+        return 1
+    if vis != "PRIVATE":
+        print("台帳（%s）が Private ではありません（%s）。private の情報を書かないよう、何もせずに止めます" % (a.ledger, vis),
+              file=sys.stderr)
+        return 1
+    exclude = set(a.exclude.split(",")) | {a.ledger.split("/")[1]}
+    known, slots = load_ledger(list_issues(a.ledger))  # 読めない台帳があれば止める（上書きで消さない）
+    normalized = set()  # 古い基準（unclear も重大）で書いた記録を今の基準に合わせ、その月を保存し直す
+    for k, r in list(known.items()):
+        if r.get("serious") and r.get("is_leak") == "unclear":
+            known[k] = dict(r, serious=False)
+            normalized.add(month_of(known[k], now))
+    done = {k for k, r in known.items() if r.get("verdict") in ("judged", "no-suspect", "secret")}
+    cands, errors = collect(a.owner, exclude, done)
+    stale = [r for r in known.values() if r.get("verdict") == "unjudged" and r["key"] not in {c["key"] for c in cands}]
+    again, failed = refetch(stale, a.owner, exclude, errors)  # 窓から外れた未判定も判定し直す
+    cands += again
+    for k in failed:  # 取り直せなかったものも試した回数に数え、次回は他の記録に順番を回す
+        known[k] = dict(known[k], attempts=int(known[k].get("attempts") or 0) + 1,
+                        refetch_failures=int(known[k].get("refetch_failures") or 0) + 1)
+    todo = prioritize(pending(cands, list(known.values())), list(known.values()))
+    has_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    new, skipped = [], set()
+    for c in todo[:MAX_PER_RUN]:
+        if monotonic() - started > MAX_JUDGE_SECONDS:
+            # 時間の上限: 残りは判定せずに未判定として残す（job の時間切れで、判定と料金がまるごと失われないように）
+            if c["key"] not in known:
+                new.append(base_record(c, "時間の上限で見送り"))
+            skipped.add(c["key"])
+            continue
+        new.append(judge(c, anthropic_api, has_key))
+    for c in todo[MAX_PER_RUN:]:  # 上限で見送った分も未判定として残す（次回以降、試した回数の少ない順に選ぶ）
+        if c["key"] not in known:
+            new.append(base_record(c, "1 回の上限で見送り"))
+        skipped.add(c["key"])
+    for r in new:
+        old = known.get(r["key"]) or {}
+        # 見送った分（判定していない）は「試した回数」に数えない
+        tried = r["verdict"] == "unjudged" and r["key"] not in skipped
+        r["attempts"] = int(old.get("attempts") or 0) + (1 if tried else 0)
+        if r.get("serious"):
+            r["notified"] = bool(old.get("notified"))
+        for k in ("month", "part"):  # 判定し直しても、入っている本から動かさない
+            if old.get(k):
+                r[k] = old[k]
+        if r["verdict"] == "unjudged" and old.get("refetch_failures"):  # まだ未判定なら、取り直しの失敗の回数も引き継ぐ
+            r["refetch_failures"] = old["refetch_failures"]
+        known[r["key"]] = r
+    # このログは公開リポジトリの Actions に出るので、件数の合計だけを出す（重大の件数・リポジトリ名は台帳にだけ残す）
+    print("候補 %d / 今回判定 %d / 未判定 %d / 取得失敗 %d" % (
+        len(cands), sum(1 for r in new if r["verdict"] != "unjudged"), sum(1 for r in new if r["verdict"] == "unjudged"), len(errors)))
+    if a.dry_run:
+        report_errors(errors)
+        return 0
+    changed = {month_of(r, now) for r in new} | {month_of(known[k], now) for k in failed} | normalized
+    save_months(a.ledger, known, slots, changed, now)  # 起票の前に判定を保存する
+    notified = notify(a.ledger, known, errors)
+    if notified:  # 起票できたものだけ notified を保存する（失敗したものは次回に起票し直す）
+        save_months(a.ledger, known, slots, {month_of(r, now) for r in notified}, now)
+    report_errors(errors)
+    # 取得に失敗したリポジトリ・記録があれば、保存と起票を済ませてから 0 以外で終える（ワークフローを赤くして気づけるように）
+    return 1 if errors else 0
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = p.add_subparsers(dest="cmd", required=True)
+    r = sp.add_parser("run")
+    r.add_argument("--owner", required=True)
+    r.add_argument("--ledger", required=True)
+    r.add_argument("--exclude", default="")
+    r.add_argument("--dry-run", action="store_true")
+    a = p.parse_args()
+    sys.exit(run(a))
+
+
+if __name__ == "__main__":
+    main()

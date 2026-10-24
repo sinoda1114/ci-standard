@@ -1,0 +1,59 @@
+# マージ後の「漏れ」の記録（/ai-review の効果を結果で測る）
+#
+# 毎日、全リポジトリの既定ブランチに入った fix・revert（直近 14 日）と type:fix の Issue を集め、
+# 直前にマージされた PR が入れた不具合かを AI で 2 段に判定し、台帳リポジトリ（Private）の Issue に残す。
+#   1 段目 claude-haiku-5-5（全件）→ 重大・セキュリティ・不明だけ 2 段目 claude-opus-5-5
+#   重大・セキュリティの漏れは、台帳に [漏れ] の Issue（type:fix）を別に立てる。
+# 本体: scripts/leak-metrics/leak_metrics.py（テスト: test_leak_metrics.py）
+#
+# 必要な secret:
+#   ADMIN_TOKEN               sweeper と共用の fine-grained PAT（全リポジトリの読み取りと、台帳への Issue の起票）
+#   LEAK_JUDGE_ANTHROPIC_KEY  判定に使う Anthropic API キー。無ければ全件を「未判定」として記録し、次回に再判定する
+# 料金の上限: 1 回の判定は最大 60 件（leak_metrics.py の MAX_PER_RUN）。このリポジトリは Public なので Actions の分数は消費しない。
+# ログ: このリポジトリは Public なので、ログと要約には件数の合計と、取得失敗の種類（HTTP の番号ごとの件数）だけを出す。
+#   private のリポジトリ名・重大の件数・エラーの文は台帳（Private）にだけ残す。手元で詳しく見るときは LEAK_METRICS_LOG_DETAILS=1
+# 外部への送信: 判定のため、private リポジトリの差分を Anthropic の API に送る（この仕組みの前提）。
+#   秘密情報のファイル（.env・鍵など）や秘密情報の形（鍵・トークン・"api_key": "値" など）を差分に見つけた候補は、AI に送らずに
+#   判定しない（verdict=secret）。決まった形を持たない秘密情報（短いパスワードなど）は見分けられない
+name: leak-metrics
+
+on:
+  schedule:
+    - cron: "30 22 * * *" # 毎日 07:30 JST（sweeper の後）
+  workflow_dispatch: {}
+
+concurrency:
+  group: leak-metrics
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: ADMIN_TOKEN の存在確認
+        env:
+          GH_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.LEAK_JUDGE_ANTHROPIC_KEY }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Actions secret ADMIN_TOKEN が未設定です"
+            exit 1
+          fi
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::warning::LEAK_JUDGE_ANTHROPIC_KEY が未設定のため、判定せずに候補だけ記録します（次回に再判定）"
+          fi
+
+      - name: 漏れを集めて判定し、台帳に残す
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.LEAK_JUDGE_ANTHROPIC_KEY }}
+        run: python3 -I scripts/leak-metrics/leak_metrics.py run --owner sinoda1114 --ledger sinoda1114/ai-review-ledger --exclude ci-standard | tee -a "$GITHUB_STEP_SUMMARY"
