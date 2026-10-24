@@ -97,8 +97,9 @@ def _ts(s):
     return dt.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
 
 
-def fix_candidates(repo, commits, prs, revert_pr=None):
-    """fix・revert のコミットを候補にし、原因の候補（suspects）を付ける"""
+def fix_candidates(repo, commits, prs, revert_pr=None, same_repo=None):
+    """fix・revert のコミットを候補にし、原因の候補（suspects）を付ける。
+    same_repo: 「Reverts owner/repo#N」の参照先が、名前を変える前のこのリポジトリかを確かめる関数（無ければ別のリポジトリと見なす）"""
     out = []
     for c in commits:
         if not is_fix_message(c["message"]):
@@ -106,9 +107,16 @@ def fix_candidates(repo, commits, prs, revert_pr=None):
         when = _ts(c["date"])
         target = revert_target(c["message"])
         target_pr = revert_pr_number(c["message"], repo)
-        foreign = bool(REVERT_PR_RE.search(c["message"])) and not target_pr  # 別のリポジトリの PR の revert
+        ref = REVERT_PR_RE.search(c["message"])
+        foreign = bool(ref) and not target_pr  # 別のリポジトリの PR の revert
         kind = "revert" if target or target_pr or c["message"].lower().startswith("revert") else "fix"
         suspects, incomplete, known = [], c.get("incomplete", ""), foreign  # 別のリポジトリの revert は、ファイルの重なりで付け替えない
+        if foreign and same_repo:  # 名前を変える前のこのリポジトリなら、その PR が元の PR
+            try:
+                if same_repo(ref.group(1)):
+                    target_pr = int(ref.group(2))
+            except Exception as e:  # 確かめられなければ確定させない（次回に取り直す）
+                incomplete = "revert 元のリポジトリを確かめられない: %s" % str(e)[:150]
         if target_pr:  # 本文が「Reverts owner/repo#12」なら、元の PR の番号がそのまま分かる
             known = True
             suspects = [p for p in prs if p["number"] == target_pr and p.get("merged_at")
@@ -512,6 +520,8 @@ def load_ledger(issues):
         slots.setdefault(month, {}).setdefault(part, i["number"])
         for r in parse_month(i.get("body") or ""):
             r = dict(r, month=month, part=part)  # 入っている本を覚え、書き直しでも動かさない
+            if r.get("serious") and r.get("is_leak") == "unclear":  # 古い基準（unclear も重大）で書いた記録を、今の基準に合わせる
+                r["serious"] = False
             old = recs.get(r["key"])
             if old is None or rank.get(r.get("verdict"), 2) < rank.get(old.get("verdict"), 2):
                 recs[r["key"]] = r
@@ -721,7 +731,11 @@ def _collect(owner, exclude, skip, started):
             def revert_pr(sha, name=name):
                 ps = json.loads(gh("api", "repos/%s/commits/%s/pulls" % (name, sha)))
                 return ps[0]["number"] if ps else None
-            fc = fix_candidates(name, commits, prs, revert_pr=revert_pr)
+            def same_repo(ref, name=name):
+                if any(x in (".", "..") for x in ref.split("/")):
+                    return False
+                return str(json.loads(gh("api", "repos/%s" % ref)).get("full_name") or "").lower() == name.lower()
+            fc = fix_candidates(name, commits, prs, revert_pr=revert_pr, same_repo=same_repo)
             seen_why = set()
             for c in fc:  # revert 元の PR を取れなかった候補も、取得の失敗に数える
                 if c.get("incomplete") and c["key"] not in skip and c["incomplete"] not in seen_why:

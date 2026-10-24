@@ -1569,5 +1569,35 @@ class PrBots(Run):
         self.assertIn("今回判定 0", out.getvalue())
 
 
+class PrBotsGate(Run):
+    """PR #26 の直しの、push 前のゲートの指摘"""
+    def test_old_unclear_serious_record_is_not_notified(self):  # Codex P2
+        old = {"key": "o/r@abcde26", "repo": "o/r", "kind": "fix", "sha": "abcde26", "date": "2026-09-30T00:00:00Z",
+               "message": "fix: x", "verdict": "judged", "serious": True, "is_leak": "unclear", "severity": "high",
+               "security": False, "suspects": [10], "caused_by_pr": 10, "rationale": "r", "models": []}
+        recs, _ = lm.load_ledger([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month([old], "2026-09")}])
+        self.assertFalse(recs["o/r@abcde26"]["serious"])
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month([old], "2026-09")}])
+        self.go(fake, [])
+        self.assertEqual(fake.leak_issues(), [])
+
+    def test_revert_of_renamed_repo_uses_the_pr(self):  # own-review（名前を変えたリポジトリ）
+        msg = "Revert \"feat: y\"\n\nReverts o/old-name#12"
+        same = lambda ref: ref.lower() == "o/old-name"
+        c = lm.fix_candidates("o/r", [commit("abcdef3", "2026-10-10T00:00:00Z", msg, ["a"])],
+                              [pr(12, "2026-10-05T00:00:00Z", ["a"]), pr(13, "2026-10-06T00:00:00Z", ["a"])], same_repo=same)[0]
+        self.assertEqual([p["number"] for p in c["suspects"]], [12])
+
+    def test_revert_ref_lookup_failure_is_incomplete(self):
+        msg = "Revert \"feat: y\"\n\nReverts o/old-name#12"
+
+        def boom(ref):
+            raise RuntimeError("HTTP 502")
+        c = lm.fix_candidates("o/r", [commit("abcdef4", "2026-10-10T00:00:00Z", msg, ["a"])],
+                              [pr(12, "2026-10-05T00:00:00Z", ["a"])], same_repo=boom)[0]
+        self.assertTrue(c.get("incomplete"))
+        self.assertEqual(c["suspects"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
