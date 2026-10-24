@@ -448,7 +448,9 @@ MIGRATE_MAX_ATTEMPTS = 3  # 古い secret の移し替えを試す回数（一�
 def restore_migrated(orig, tried=True):
     """移し替えた記録を、判定まで進めなかったので secret に戻す。実際に試したとき（取り直し・判定）だけ、試した回数
     （attempts）を 1 増やし、MIGRATE_MAX_ATTEMPTS に達したら理由の文を変えて、それ以降は移し替えない。
-    件数・時間の上限で見送っただけなら、そのまま戻す（試していない分で打ち切らない）"""
+    件数・時間の上限で見送っただけなら、そのまま戻す（試していない分で打ち切らない）。
+    既知の限界（ユーザーの判断 2026-10-24）: 回数は、もとからある attempts で数える（台帳の欄を増やさないため）。
+    そのため、前に未判定だったことのある記録は、3 回より早く打ち切られ、元の secret のまま残る"""
     if not tried:
         return orig
     att = int(orig.get("attempts") or 0) + 1
