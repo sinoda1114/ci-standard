@@ -445,9 +445,12 @@ def secret_file_header(diff):
 MIGRATE_MAX_ATTEMPTS = 3  # 古い secret の移し替えを試す回数（一時的な失敗で打ち切らない。毎回いちばん先に試し続けもしない）
 
 
-def restore_migrated(orig):
-    """移し替えた記録を、判定まで進めなかったので secret に戻す。試した回数（attempts）を 1 増やし、
-    MIGRATE_MAX_ATTEMPTS に達したら理由の文を変えて、それ以降は移し替えない"""
+def restore_migrated(orig, tried=True):
+    """移し替えた記録を、判定まで進めなかったので secret に戻す。実際に試したとき（取り直し・判定）だけ、試した回数
+    （attempts）を 1 増やし、MIGRATE_MAX_ATTEMPTS に達したら理由の文を変えて、それ以降は移し替えない。
+    件数・時間の上限で見送っただけなら、そのまま戻す（試していない分で打ち切らない）"""
+    if not tried:
+        return orig
     att = int(orig.get("attempts") or 0) + 1
     return dict(orig, attempts=att, **({"rationale": RESTORED_SECRET_RATIONALE} if att >= MIGRATE_MAX_ATTEMPTS else {}))
 
@@ -1278,7 +1281,7 @@ def run(a):
         # 移し替えた記録が、今回の方式でも判定まで進めなかったら（材料が欠けた・上限で見送った・取り直せないなど、
         # どの経路でも）、元の secret に戻す
         if known[k].get("verdict") == "unjudged":
-            known[k] = restore_migrated(orig)
+            known[k] = restore_migrated(orig, tried=k in {r["key"] for r in new} and k not in skipped)
             normalized.add(month_of(known[k], now))
     # このログは公開リポジトリの Actions に出るので、件数の合計だけを出す（重大の件数・リポジトリ名は台帳にだけ残す）
     print("候補 %d / 今回判定 %d / 未判定 %d / 取得失敗 %d" % (

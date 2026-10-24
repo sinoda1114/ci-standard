@@ -1818,6 +1818,22 @@ class SecretsPerFileMigrate(Run):
         recs = {r["key"]: r for rs in fake.ledgers().values() for r in rs}
         self.assertIn(recs["o/r@abcde35"]["verdict"], ("secret", "judged"))
 
+    def test_untried_migration_does_not_use_up_attempts(self):  # 確認役の却下（上限で見送った分）
+        old = dict(self.OLD, key="o/r@abcde38", sha="abcde38", date="2026-09-30T00:00:00Z")
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month([old], "2026-09")}])
+        cands = [cand("o/r@abcde38", "2026-09-30T00:00:00Z")] + [cand("o/r@%07x" % i, "2026-09-29T00:00:00Z") for i in range(3)]
+        saved = lm.MAX_PER_RUN
+        lm.MAX_PER_RUN = 0
+        try:
+            for _ in range(lm.MIGRATE_MAX_ATTEMPTS + 1):
+                self.go(fake, cands)
+        finally:
+            lm.MAX_PER_RUN = saved
+        rec = [r for rs in fake.ledgers().values() for r in rs if r["key"] == "o/r@abcde38"][0]
+        self.assertEqual(rec["verdict"], "secret")
+        self.assertEqual(rec["rationale"], lm.OLD_SECRET_RATIONALE)  # 試していないので、打ち切らない
+        self.assertFalse(rec.get("attempts"))
+
     def test_migration_is_retried_up_to_three_times(self):  # Devin（一時的な失敗で打ち切らない）
         gone = dict(self.OLD, key="o/r@abcde37", sha="abcde37")
         fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([gone], "2026-08")}])
