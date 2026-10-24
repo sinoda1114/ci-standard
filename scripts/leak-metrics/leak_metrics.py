@@ -814,19 +814,50 @@ def anthropic_api(model, prompt):
     return "".join(b.get("text", "") for b in d.get("content", []) if b.get("type") == "text")
 
 
+_BRANCH_NAMES = {}
+
+
+def default_base(repo, ref, default):
+    """PR の base（ref）が既定ブランチ（default）か。名前を変える前の既定ブランチも含める: GitHub は名前を変えた
+    ブランチを古い名前で問い合わせると新しい名前のブランチを返すので、返ってきた名前で比べる（Issue #28）。
+    消したブランチ（404）は既定ブランチではない。それ以外の失敗は例外のまま返す。
+    既知の限界: 古い名前のブランチを作り直した、または名前を変えずに既定ブランチの設定だけを切り替えた場合は、
+    古い名前が転送されないので拾えない（変更前と同じ）"""
+    if not ref or not default:
+        return False
+    if ref == default:
+        return True
+    key = (repo, ref)
+    if key not in _BRANCH_NAMES:
+        try:
+            _BRANCH_NAMES[key] = json.loads(gh("api", "repos/%s/branches/%s" % (repo, urllib.parse.quote(ref, safe="")))).get("name")
+        except Exception as e:
+            if "HTTP 404" not in str(e):
+                raise
+            _BRANCH_NAMES[key] = None
+    return _BRANCH_NAMES[key] == default
+
+
 def recent_prs(repo, base, since):
-    """閉じた PR を、更新日の新しい順にページごとに読み、ページの最後が since より古くなったら打ち切る
-    （_paged は全履歴を読むので、履歴の多いリポジトリで毎日全部を取ってしまう）"""
+    """既定ブランチ（base）に since 以降にマージされた PR を、更新日の新しい順にページごとに読み、ページの最後が since より古くなったら
+    打ち切る（_paged は全履歴を読むので、履歴の多いリポジトリで毎日全部を取ってしまう）。
+    一覧は base で絞らずに取り、default_base で絞る（名前を変える前の既定ブランチへの PR も拾うため）"""
     page = 1
     while True:
         tick()
         if page > 200:  # 黙って打ち切らない（候補を欠いたまま進めない）
             raise RuntimeError("閉じた PR が 200 ページを超えた（%s）" % repo)
-        items = json.loads(gh("api", "repos/%s/pulls?state=closed&base=%s&sort=updated&direction=desc&per_page=50&page=%d"
-                              % (repo, base, page)))
+        items = json.loads(gh("api", "repos/%s/pulls?state=closed&sort=updated&direction=desc&per_page=50&page=%d"
+                              % (repo, page)))
         items = [x for x in (items if isinstance(items, list) else []) if isinstance(x, dict)]
         for p in items:
-            yield p
+            # マージされていない PR と、since より前にマージされた PR は、どの呼び出し元も使わないので、問い合わせずに飛ばす
+            # （結果に使わない PR のブランチの問い合わせの失敗で、収集全体を落とさない）
+            m = p.get("merged_at")
+            if not m or _ts(m) < since:
+                continue
+            if default_base(repo, (p.get("base") or {}).get("ref"), base):
+                yield p
         last = items[-1].get("updated_at") if items else None
         if len(items) < 50 or (last and _ts(last) < since):
             return
@@ -891,7 +922,7 @@ def _collect(owner, exclude, skip, started):
         branch = urllib.parse.quote(r["defaultBranchRef"]["name"], safe="")  # API のパスに入れるので & # + % を逃がす
         try:
             prs = []
-            for p in recent_prs(name, branch, since_pr):
+            for p in recent_prs(name, r["defaultBranchRef"]["name"], since_pr):
                 tick()
                 if p.get("merged_at") and _ts(p["merged_at"]) >= since_pr:
                     files = file_names(_paged("repos/%s/pulls/%d/files?per_page=100" % (name, p["number"])))
@@ -1014,8 +1045,7 @@ def rebuild_suspects(repo, r, files, msg):
     when = _ts(r["date"])
     prs = []
     # 通常の集め方と同じく、既定ブランチにマージされた PR だけを見る
-    base = urllib.parse.quote(repo_info(repo).get("default_branch") or "", safe="")
-    for p in recent_prs(repo, base, when - dt.timedelta(days=WINDOW_DAYS)):
+    for p in recent_prs(repo, repo_info(repo).get("default_branch") or "", when - dt.timedelta(days=WINDOW_DAYS)):
         tick()
         m = p.get("merged_at")
         if m and dt.timedelta(0) < when - _ts(m) <= dt.timedelta(days=WINDOW_DAYS):
@@ -1075,7 +1105,7 @@ def _refetch(live, owner, exclude, errors, out, failed, started):
                     p = json.loads(gh("api", "repos/%s/pulls/%d" % (repo, n)))
                     m = p.get("merged_at")
                     if (m and dt.timedelta(0) < _ts(r["date"]) - _ts(m) <= dt.timedelta(days=WINDOW_DAYS)
-                            and (p.get("base") or {}).get("ref") == info.get("default_branch")):
+                            and default_base(repo, (p.get("base") or {}).get("ref"), info.get("default_branch"))):
                         sus.append({"number": n, "title": p.get("title", ""), "diff": ""})
             else:
                 # 通常の集め方（collect・fix_candidates）とそろえる: 修正の PR は PR 全体の差分、コミットは変更ファイルの全ページ、
@@ -1092,7 +1122,7 @@ def _refetch(live, owner, exclude, errors, out, failed, started):
                     tick()
                     pp = json.loads(gh("api", "repos/%s/pulls/%d" % (repo, pr_no)))
                     if (not pp.get("merged_at") or pp.get("merge_commit_sha") != r["sha"]
-                            or (pp.get("base") or {}).get("ref") != info.get("default_branch")):  # base が無い PR も通さない
+                            or not default_base(repo, (pp.get("base") or {}).get("ref"), info.get("default_branch"))):  # base が無い PR も通さない
                         # 台帳の pr を信じない: マージされていて、マージのコミットが記録の SHA と同じ PR だけを取り直す
                         raise RuntimeError("台帳の pr（#%s）が記録のコミットと合わない" % pr_no)
                     if not is_fix_message(pp.get("title")):  # collect と同じく、題名が fix・revert の PR だけ
@@ -1146,7 +1176,7 @@ def _refetch(live, owner, exclude, errors, out, failed, started):
                     m = p.get("merged_at")
                     if not (m and dt.timedelta(0) < _ts(r["date"]) - _ts(m) <= dt.timedelta(days=WINDOW_DAYS)):
                         continue
-                    if (p.get("base") or {}).get("ref") != info.get("default_branch"):
+                    if not default_base(repo, (p.get("base") or {}).get("ref"), info.get("default_branch")):
                         continue
                     s_ = {"number": n, "title": p.get("title", ""),
                           "files": file_names(_paged("repos/%s/pulls/%d/files?per_page=100" % (repo, n)))}
