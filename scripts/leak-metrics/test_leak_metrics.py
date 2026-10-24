@@ -1772,6 +1772,13 @@ class SecretsPerFileMigrate(Run):
     OLD = {"repo": "o/r", "kind": "fix", "date": "2026-08-01T00:00:00Z", "message": "fix: x", "verdict": "secret",
            "serious": False, "suspects": [10], "rationale": "差分に秘密情報（のファイル・形）を含むので、AI に送らずに判定しない"}
 
+    def test_incomplete_migrated_candidate_returns_to_secret(self):  # 確認役の却下（集める処理の経路）
+        old = dict(self.OLD, key="o/r@abcde34", sha="abcde34", date="2026-09-30T00:00:00Z")
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month([old], "2026-09")}])
+        c = dict(cand("o/r@abcde34", "2026-09-30T00:00:00Z"), incomplete="PR #10 の差分を取得できない")
+        self.go(fake, [c])
+        self.assertEqual(fake.ledgers()["[漏れの記録] 2026-09"][0]["verdict"], "secret")
+
     def test_unrefetchable_old_secret_stays_secret(self):  # ゲートの指摘 2
         gone = dict(self.OLD, key="o/r@abcde32", sha="abcde32")
         excl = dict(self.OLD, key="o/skip@abcde33", repo="o/skip", sha="abcde33")

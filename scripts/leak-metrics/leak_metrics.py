@@ -339,7 +339,9 @@ SECRET_VALUE_TOKEN_RE = re.compile(r"""['"]([^'"\n]{6,})['"]|([^\s'"`,;()\[\]{}<
 
 
 def withheld_values(text, split=True):
-    """外した部分の、キーワードへの代入の値と決まった形の鍵（ほかの場所に書かれていないかを確かめるため）"""
+    """外した部分の、キーワードへの代入の値と決まった形の鍵（ほかの場所に書かれていないかを確かめるため）。
+    既知の限界: 5 文字以下の値と、次の行以降に書いた値（YAML の複数行など）は拾わない（ユーザーの判断 2026-10-24。
+    当たった行の近くの語を全部照合すると、普通のコードの語が当たって、ほぼ判定できなくなるため）"""
     vals = set()
     for part in (re.split(r"(?m)^(?=diff --git )", str(text or "")) if split else [str(text or "")]):
         if not part or not has_secret(part):
@@ -1218,6 +1220,10 @@ def run(a):
         if c["key"] not in known:
             new.append(base_record(c, "1 回の上限で見送り"))
         skipped.add(c["key"])
+    # 移し替えた記録が、今回の方式でも判定まで進めなかったら（材料が欠けた・見送ったなど）、元の secret に戻す
+    new = [migrated[r["key"]] if r["key"] in migrated and r["verdict"] == "unjudged" else r for r in new]
+    for k in set(migrated) - {r["key"] for r in new} - {c["key"] for c in cands}:
+        known[k] = migrated[k]  # 集め直されず取り直しにも出なかった記録も戻す
     for r in new:
         old = known.get(r["key"]) or {}
         # 見送った分（判定していない）は「試した回数」に数えない
