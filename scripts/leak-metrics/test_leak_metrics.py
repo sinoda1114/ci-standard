@@ -316,6 +316,7 @@ class Run(unittest.TestCase):
     def setUp(self):
         lm._BRANCH_NAMES.clear()
         lm._REPO_INFO.clear()
+        lm._RENAMED.clear()
         self.saved = (lm.gh, lm.collect, lm.anthropic_api, lm.utcnow, os.environ.get("ANTHROPIC_API_KEY"))
         os.environ["ANTHROPIC_API_KEY"] = "k"
         self.now = lm.dt.datetime(2026, 10, 1, 3, 0, tzinfo=lm.dt.timezone.utc)
@@ -2213,6 +2214,27 @@ class RepoRename(Run):
         self.assertEqual(list(got), ["o/new@abcdefb"])
         self.assertEqual(got["o/new@abcdefb"]["verdict"], "judged")
         self.assertTrue(got["o/new@abcdefb"]["notified"])
+
+    def test_merge_prefers_a_real_judgement_over_secret(self):  # Codex（secret より実際の判定を優先する）
+        old = self.rec("o/old@abcdefc", verdict="secret")
+        new = self.rec("o/new@abcdefc", verdict="judged", is_leak="no")
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month([old, new], "2026-09")}])
+        fake.api = {"api repos/o/old": json.dumps({"full_name": "o/new", "owner": {"login": "o"}})}
+        self.go(fake, [cand("o/new@abcdefc", "2026-09-30T00:00:00Z")])
+        self.assertEqual([r["verdict"] for rs in fake.ledgers().values() for r in rs], ["judged"])
+
+    def test_name_lookup_result_is_cached_even_on_failure(self):  # Codex（同じ問い合わせを繰り返さない）
+        calls = []
+
+        def gh(*args, input_text=None):
+            calls.append(args)
+            raise RuntimeError("gh api: HTTP 502")
+        lm.gh = gh
+        lm._REPO_INFO.clear()
+        lm._RENAMED.clear()
+        for _ in range(3):
+            self.assertFalse(lm.renamed_to("o/old", "o/new"))
+        self.assertEqual(len(calls), 1)
 
     def test_issue_mark_of_renamed_repo_is_matched(self):  # own-review（Issue の候補の目印も照合する）
         rec = {"key": "o/new#5", "repo": "o/new", "kind": "issue", "sha": "", "date": "2026-09-30T00:00:00Z", "message": "bug",
