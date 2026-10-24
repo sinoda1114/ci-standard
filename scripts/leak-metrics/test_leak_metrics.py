@@ -1528,6 +1528,22 @@ class PrBots(Run):
                               [pr(12, "2026-10-05T00:00:00Z", ["a"])])[0]
         self.assertEqual(c["suspects"], [])
 
+    def test_refetched_revert_of_another_repos_pr_drops_old_suspects(self):  # Devin の直し直し（取り直しの経路）
+        old = {"key": "o/r@abcde23", "repo": "o/r", "kind": "revert", "sha": "abcde23", "date": "2026-08-01T00:00:00Z",
+               "message": "Revert", "verdict": "unjudged", "serious": False, "suspects": [12], "pr": 23}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
+        fake.api = {"api repos/o/r/pulls/23": json.dumps({"title": "Revert \"feat: y\"", "body": "Reverts other/project#10",
+                                                          "merged_at": "2026-08-01T00:00:00Z", "merge_commit_sha": "abcde23",
+                                                          "base": {"ref": "main"}}),
+                    "api --paginate --slurp repos/o/r/pulls/23/files?per_page=100": json.dumps([[{"filename": "a.js"}]]),
+                    "pr diff 23 -R o/r": "-y",
+                    "api repos/o/r/pulls/12": json.dumps({"title": "feat: unrelated", "merged_at": "2026-07-25T00:00:00Z", "base": {"ref": "main"}}),
+                    "api --paginate --slurp repos/o/r/pulls/12/files?per_page=100": json.dumps([[{"filename": "a.js"}]]),
+                    "pr diff 12 -R o/r": "+unrelated"}
+        self.go(fake, [])
+        self.assertEqual(self.judged, [])
+        self.assertFalse([c for c in fake.calls if c[:3] == ("pr", "diff", "12")])
+
     def test_secret_file_names_ignore_case(self):  # Codex P1
         self.assertTrue(lm.secret_files(["config/.ENV", "PROD.KEY"]))
         self.assertTrue(lm.secret_files(["ID_RSA"]))

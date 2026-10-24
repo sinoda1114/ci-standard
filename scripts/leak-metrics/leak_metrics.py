@@ -908,6 +908,8 @@ def _refetch(live, owner, exclude, errors, out, failed, started):
                 elif target:  # revert は元の PR を探し直す（前回は取得に失敗して、ファイルの重なりで代えていたかもしれない）
                     ps = json.loads(gh("api", "repos/%s/commits/%s/pulls" % (repo, target)))
                     nums = [ps[0]["number"]] if ps and type(ps[0].get("number")) is int else []
+                elif REVERT_PR_RE.search(msg or ""):  # 別のリポジトリの PR の revert: 台帳の候補（ファイルの重なり）を使わない
+                    nums = []
                 sus = []
                 for n in nums:
                     tick()
