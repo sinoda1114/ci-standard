@@ -1713,6 +1713,13 @@ class SecretsPerFile(unittest.TestCase):
         self.assertEqual(withheld, ["（見出しの無い部分）"])
         self.assertFalse(lm.has_secret(clean))
 
+    def test_issue_body_is_not_split_by_fake_headers(self):  # 確認役の却下
+        body = 'password = """\ndiff --git a/x b/x\nREALSECRETVALUE\n"""'
+        c = lm.issue_candidates("o/r", [{"number": 5, "created_at": "2026-10-10T00:00:00Z", "title": "bug", "body": body}],
+                                [pr(10, "2026-10-05T00:00:00Z", ["a"])])[0]
+        out = lm.judge(c, api=lambda m, p: self.fail("送った"), has_key=True)
+        self.assertEqual(out["verdict"], "secret")
+
     def test_final_guard_blocks_a_prompt_that_still_looks_secret(self):
         saved = lm.build_prompt
         lm.build_prompt = lambda c: saved(c) + '\npassword = "leftover"'

@@ -300,15 +300,17 @@ OLD_SECRET_RATIONALE = "差分に秘密情報（のファイル・形）を含�
 WITHHELD_MARK = "（秘密情報の疑いがあるので、中身は送らない"
 
 
-def withhold_secret_files(text):
+def withhold_secret_files(text, split=True):
     """差分をファイルごと（diff --git の区切り）に分け、秘密情報の疑いがあるファイルは中身を外してパスだけ残す。
-    見出しの無い部分（Issue の本文など）に疑いがあれば、その部分を丸ごと外す。戻り値: (送ってよい文, 外したパスの一覧)"""
+    見出しの無い部分に疑いがあれば、その部分を丸ごと外す。戻り値: (送ってよい文, 外したパスの一覧)。
+    split=False は差分でない文（Issue の本文）用で、区切らずに丸ごと調べる（本文に書いた diff --git の行で、
+    区切りに見せかけさせない。本物の差分では、中身の行は + - 空白で始まるので、diff --git で始まる行は見出しだけ）"""
     out, withheld = [], []
-    for part in re.split(r"(?m)^(?=diff --git )", str(text or "")):
+    for part in (re.split(r"(?m)^(?=diff --git )", str(text or "")) if split else [str(text or "")]):
         if not part or not has_secret(part):
             out.append(part)
             continue
-        if part.startswith("diff --git "):
+        if split and part.startswith("diff --git "):
             head = part.split("\n", 1)[0]
             path = head.rsplit(" b/", 1)[-1] if " b/" in head else head[len("diff --git "):]
             out.append("%s: %s）\n" % (WITHHELD_MARK, path))
@@ -390,7 +392,7 @@ def judge(c, api, has_key):
     if (secret_files(c.get("files")) or has_secret(c.get("message_full", c.get("message")))
             or any(secret_files(s.get("files")) or has_secret(s.get("title")) for s in c["suspects"])):
         return secret_record(rec, "題名か変更ファイルに秘密情報（のファイル・形）を含むので、AI に送らずに判定しない")
-    fix_diff, withheld = withhold_secret_files(c.get("diff"))
+    fix_diff, withheld = withhold_secret_files(c.get("diff"), split=c.get("kind") != "issue")
     if withheld and only_withheld(fix_diff):
         return secret_record(rec, "修正の差分がすべて秘密情報の疑いのあるファイルなので、AI に送らずに判定しない")
     c = dict(c, diff=fix_diff, suspects=[dict(s, diff=withhold_secret_files(s.get("diff"))[0]) for s in c["suspects"]])
