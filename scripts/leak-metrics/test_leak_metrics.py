@@ -1758,6 +1758,20 @@ class SecretsPerFile(unittest.TestCase):
         self.assertNotIn("string", lm.cross_check_values(lm.withheld_values(sus)))
         self.assertIn("hunter2", lm.cross_check_values({"hunter2", "abcdefghijklmnopq"}))  # 数字あり・16 文字以上は照合する
 
+    def test_value_with_spaces_is_cross_checked_whole(self):  # ゲートの P1
+        sus = ("diff --git a/config/app.yml b/config/app.yml\n+  password: correct horse battery staple1\n"
+               "diff --git a/src/a.js b/src/a.js\n+  login(\"correct horse battery staple1\")\n")
+        out = lm.judge(self.cand(sus=sus), api=lambda m, p: self.fail("送った"), has_key=True)
+        self.assertEqual(out["verdict"], "secret")
+
+    def test_value_extraction_is_bounded(self):  # ゲートの P2（二乗のメモリ）
+        import time
+        line = "+ " + "token=abcdefgh1 " * 8000
+        t0 = time.monotonic()
+        vals = lm.withheld_values("diff --git a/x b/x\n" + line)
+        self.assertLess(time.monotonic() - t0, 1.0)
+        self.assertLess(sum(len(v) for v in vals), 100000)
+
     def test_final_guard_blocks_a_prompt_that_still_looks_secret(self):
         saved = lm.build_prompt
         lm.build_prompt = lambda c: saved(c) + '\npassword = "leftover"'
@@ -1791,6 +1805,23 @@ class SecretsPerFileMigrate(Run):
             lm.MAX_PER_RUN = saved
         recs = {r["key"]: r for rs in fake.ledgers().values() for r in rs}
         self.assertIn(recs["o/r@abcde35"]["verdict"], ("secret", "judged"))
+
+    def test_restored_secret_is_not_migrated_again(self):  # ゲートの指摘（試した回数が増えず、毎回取り直す）
+        gone = dict(self.OLD, key="o/r@abcde36", sha="abcde36")
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([gone], "2026-08")}])
+        lm.gh = fake
+        lm.collect = lambda owner, exclude, skip=frozenset(): ([], [])
+        args = lm.argparse.Namespace(owner="o", ledger="o/ledger", exclude="", dry_run=False)
+        lm.run(args)
+        n = len([c for c in fake.calls if c[:2] == ("api", "repos/o/r")])
+        rec = [r for rs in fake.ledgers().values() for r in rs if r["key"] == "o/r@abcde36"]
+        lm.run(args)
+        self.assertEqual(len([c for c in fake.calls if c[:2] == ("api", "repos/o/r")]), n)  # 2 回目は取り直さない
+        self.assertTrue(rec and rec[0]["verdict"] == "secret")
+
+    def test_error_cleanup_matches_whole_key(self):  # ゲートの Low
+        errs = ["o/r@abc: 取り直しに失敗: x", "o/r@abcdef: 取り直しに失敗: y"]
+        self.assertEqual(lm.drop_errors_of(errs, ["o/r@abc"]), ["o/r@abcdef: 取り直しに失敗: y"])
 
     def test_unrefetchable_old_secret_stays_secret(self):  # ゲートの指摘 2
         gone = dict(self.OLD, key="o/r@abcde32", sha="abcde32")

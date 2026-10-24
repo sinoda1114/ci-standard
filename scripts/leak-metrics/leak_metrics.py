@@ -307,6 +307,7 @@ def first_line(text):
     return lines[0] if lines else ""
 
 
+RESTORED_SECRET_RATIONALE = "古い方式で秘密情報の疑いとして送らなかった（今の方式でも判定まで進めなかった）"
 OLD_SECRET_RATIONALE = "差分に秘密情報（のファイル・形）を含むので、AI に送らずに判定しない"  # 2026-10-24 より前の方式の理由
 WITHHELD_MARK = "（秘密情報の疑いがあるので、中身は送らない"
 
@@ -338,6 +339,9 @@ def withhold_secret_files(text, split=True):
 SECRET_VALUE_TOKEN_RE = re.compile(r"""['"]([^'"\n]{6,})['"]|([^\s'"`,;()\[\]{}<>]{6,})""")
 
 
+SECRET_VALUE_MAX = 200  # 照合に使う値の長さの上限
+
+
 def withheld_values(text, split=True):
     """外した部分の、キーワードへの代入の値と決まった形の鍵（ほかの場所に書かれていないかを確かめるため）。
     既知の限界: 5 文字以下の値と、次の行以降に書いた値（YAML の複数行など）は拾わない（ユーザーの判断 2026-10-24。
@@ -347,17 +351,23 @@ def withheld_values(text, split=True):
         if not part or not has_secret(part):
             continue
         vals.update(m.group(0) for m in SECRET_RE.finditer(part))
-        line_end = -1
+        line_end, seen = -1, 0
         for m in SECRET_KEY_RE.finditer(part):
             if m.start() > line_end:
                 line_end = part.find("\n", m.start())
                 line_end = len(part) if line_end < 0 else line_end
+                seen = 0
             a = SECRET_ASSIGN_RE.match(part, m.end())
-            if not a:
+            if not a or seen >= SECRET_KEYS_PER_LINE:  # 1 行で見る代入の数に上限（同じ行の長い残りを何度も取らない）
                 continue
+            seen += 1
             v = SECRET_VALUE_TOKEN_RE.search(part, a.end(), max(line_end, a.end()))
             if v:
                 vals.add(v.group(1) or v.group(2))
+            # 空白を含む値も丸ごと照合する: 代入の後ろから行の終わりまで（長さに上限）を、引用符と区切りを外して使う
+            rhs = part[a.end():min(line_end, a.end() + SECRET_VALUE_MAX)].strip().strip("'\"`,;)").strip()
+            if len(rhs) >= 6:
+                vals.add(rhs)
     return vals
 
 
@@ -418,6 +428,11 @@ def base_record(c, why=""):
     rec.update({"verdict": "unjudged", "serious": False, "severity": None, "security": None,
                 "caused_by_pr": None, "rationale": why, "models": []})
     return rec
+
+
+def drop_errors_of(errors, keys):
+    """記録の key に結び付いた取得の失敗だけを消す（部分一致で、名前の似た別の記録の失敗を消さない）"""
+    return [e for e in errors if not any(e.startswith(k + ":") or e.endswith(": " + k) for k in keys)]
 
 
 def secret_record(rec, why):
@@ -1199,8 +1214,9 @@ def run(a):
     cands += again
     back = [k for k in failed if k in migrated]  # 移し替えの記録を取り直せなかった: 元の secret に戻し、失敗に数えない
     for k in back:
-        known[k] = migrated[k]
-    errors[:] = [e for e in errors if not any(k in e for k in back)]
+        known[k] = dict(migrated[k], rationale=RESTORED_SECRET_RATIONALE)
+        normalized.add(month_of(known[k], now))
+    errors[:] = drop_errors_of(errors, back)
     failed = [k for k in failed if k not in migrated]
     for k in failed:  # 取り直せなかったものも試した回数に数え、次回は他の記録に順番を回す
         known[k] = dict(known[k], attempts=int(known[k].get("attempts") or 0) + 1,
@@ -1237,7 +1253,8 @@ def run(a):
         # 移し替えた記録が、今回の方式でも判定まで進めなかったら（材料が欠けた・上限で見送った・取り直せないなど、
         # どの経路でも）、元の secret に戻す
         if known[k].get("verdict") == "unjudged":
-            known[k] = orig
+            known[k] = dict(orig, rationale=RESTORED_SECRET_RATIONALE)  # 理由を変えて、次の実行で移し替え直さない
+            normalized.add(month_of(known[k], now))
     # このログは公開リポジトリの Actions に出るので、件数の合計だけを出す（重大の件数・リポジトリ名は台帳にだけ残す）
     print("候補 %d / 今回判定 %d / 未判定 %d / 取得失敗 %d" % (
         len(cands), sum(1 for r in new if r["verdict"] != "unjudged"), sum(1 for r in new if r["verdict"] == "unjudged"), len(errors)))
