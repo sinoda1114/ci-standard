@@ -1946,5 +1946,18 @@ class UnjudgedReasons(Run):
         self.assertNotIn("#12", text)
 
 
+    def test_refetch_failures_are_in_the_breakdown(self):  # Devin
+        import io, contextlib
+        old = {"key": "o/r@abcde43", "repo": "o/r", "kind": "fix", "sha": "abcde43", "date": "2026-08-01T00:00:00Z",
+               "message": "fix: x", "verdict": "secret", "serious": False, "suspects": [10], "pr": 43,
+               "rationale": lm.OLD_SECRET_RATIONALE}
+        gone = dict(old, key="o/r@abcde44", sha="abcde44", verdict="unjudged", rationale="")
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old, gone], "2026-08")}])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.go(fake, [])
+        self.assertIn("取り直しの失敗 2", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
