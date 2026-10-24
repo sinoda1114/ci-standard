@@ -1834,6 +1834,27 @@ class SecretsPerFileMigrate(Run):
         self.assertEqual(rec["rationale"], lm.OLD_SECRET_RATIONALE)  # 試していないので、打ち切らない
         self.assertFalse(rec.get("attempts"))
 
+    def test_refetched_but_unjudged_migration_counts_as_tried(self):  # 確認役の却下（取り直しは成功、判定は見送り）
+        old = dict(self.OLD, key="o/r@abcde39", sha="abcde39", pr=39, attempts=1)  # 新しい候補（0 回）が先に選ばれる
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
+        fake.api = {"api repos/o/r/pulls/39": json.dumps({"title": "fix: x", "body": "", "merged_at": "2026-08-01T00:00:00Z",
+                                                          "merge_commit_sha": "abcde39", "base": {"ref": "main"}}),
+                    "api --paginate --slurp repos/o/r/pulls/39/files?per_page=100": json.dumps([[{"filename": "a.js"}]]),
+                    "pr diff 39 -R o/r": "+x",
+                    "api repos/o/r/pulls/10": json.dumps({"title": "feat", "merged_at": "2026-07-25T00:00:00Z", "base": {"ref": "main"}}),
+                    "api --paginate --slurp repos/o/r/pulls/10/files?per_page=100": json.dumps([[{"filename": "a.js"}]]),
+                    "pr diff 10 -R o/r": "+y"}
+        new = [cand("o/r@%07x" % i, "2026-09-29T00:00:00Z") for i in range(3)]
+        saved = lm.MAX_PER_RUN
+        lm.MAX_PER_RUN = 1
+        try:
+            self.go(fake, new)
+        finally:
+            lm.MAX_PER_RUN = saved
+        rec = [r for rs in fake.ledgers().values() for r in rs if r["key"] == "o/r@abcde39"][0]
+        self.assertEqual(rec["verdict"], "secret")
+        self.assertEqual(rec.get("attempts"), 2)
+
     def test_migration_is_retried_up_to_three_times(self):  # Devin（一時的な失敗で打ち切らない）
         gone = dict(self.OLD, key="o/r@abcde37", sha="abcde37")
         fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([gone], "2026-08")}])

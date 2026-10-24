@@ -1240,6 +1240,7 @@ def run(a):
     stale = [r for r in known.values() if r.get("verdict") == "unjudged" and r["key"] not in {c["key"] for c in cands}]
     again, failed = refetch(stale, a.owner, exclude, errors)  # 窓から外れた未判定も判定し直す
     cands += again
+    refetched = {c["key"] for c in again}
     back = [k for k in failed if k in migrated]  # 移し替えの記録を取り直せなかった: 元の secret に戻し、失敗に数えない
     for k in back:
         known[k] = restore_migrated(migrated[k])
@@ -1281,7 +1282,9 @@ def run(a):
         # 移し替えた記録が、今回の方式でも判定まで進めなかったら（材料が欠けた・上限で見送った・取り直せないなど、
         # どの経路でも）、元の secret に戻す
         if known[k].get("verdict") == "unjudged":
-            known[k] = restore_migrated(orig, tried=k in {r["key"] for r in new} and k not in skipped)
+            # 取り直しに成功した（判定は見送った）ときも、試したと数える（同じ記録が取り直しの枠を占め続けないように）
+            tried = k in refetched or (k in {r["key"] for r in new} and k not in skipped)
+            known[k] = restore_migrated(orig, tried=tried)
             normalized.add(month_of(known[k], now))
     # このログは公開リポジトリの Actions に出るので、件数の合計だけを出す（重大の件数・リポジトリ名は台帳にだけ残す）
     print("候補 %d / 今回判定 %d / 未判定 %d / 取得失敗 %d" % (
