@@ -1260,7 +1260,8 @@ def run(a):
         if r.get("serious") and r.get("is_leak") == "unclear":
             known[k] = dict(r, serious=False)
             normalized.add(month_of(known[k], now))
-        if r.get("verdict") == "secret" and r.get("rationale") == RESTORED_SECRET_RATIONALE_V1 and has_key:
+        if (r.get("verdict") == "secret" and r.get("rationale") == RESTORED_SECRET_RATIONALE_V1 and has_key
+                and valid_record(r, a.owner, exclude)):  # 実際に移し替える記録だけ、数え直す
             r = dict(r, rationale=OLD_SECRET_RATIONALE, attempts=0)  # 試した回数を 0 から数え直す
             known[k] = r
             normalized.add(month_of(r, now))

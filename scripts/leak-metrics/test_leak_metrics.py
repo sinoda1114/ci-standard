@@ -2049,5 +2049,16 @@ class ReopenRestored(Run):
         self.assertNotEqual(lm.RESTORED_SECRET_RATIONALE, lm.RESTORED_SECRET_RATIONALE_V1)
 
 
+    def test_unrefetchable_restored_v1_is_left_as_is(self):  # ゲートの指摘（取り直せない記録は書き換えない）
+        old = {"key": "o/skip@abcde46", "repo": "o/skip", "kind": "fix", "sha": "abcde46", "date": "2026-08-01T00:00:00Z",
+               "message": "fix: x", "verdict": "secret", "serious": False, "suspects": [10], "attempts": 3,
+               "rationale": lm.RESTORED_SECRET_RATIONALE_V1}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
+        lm.gh = fake
+        lm.collect = lambda owner, exclude, skip=frozenset(): ([], [])
+        lm.run(lm.argparse.Namespace(owner="o", ledger="o/ledger", exclude="skip", dry_run=False))
+        self.assertFalse([c for c in fake.calls if c[:2] == ("issue", "edit")])  # 書き換えも保存もしない
+
+
 if __name__ == "__main__":
     unittest.main()
