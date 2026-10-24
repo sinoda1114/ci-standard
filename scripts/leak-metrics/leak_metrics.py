@@ -463,24 +463,30 @@ def rekey_renamed(known, owner, exclude, now):
     """名前を変えたリポジトリの記録を、今の名前（repo と key）に付け替える（Issue #28 の 1）。GitHub は古い名前で
     問い合わせると今のリポジトリを返すので、その full_name を使う。持ち主が変わったもの・引き直せないものはそのまま。
     同じ修正の記録が新旧の名前で 2 つあれば、判定の進んだほうを残し、通知済みの印はどちらかにあれば立てる
-    （[漏れ] Issue を立て直さない）。戻り値: (付け替えた後の記録, 保存し直す月)"""
+    （[漏れ] Issue を立て直さない）。消したリポジトリ（404）は付け替えない。それ以外の失敗は例外のまま返す
+    （黙って飛ばすと、新しい名前で集めた候補と二重に判定・起票するので、その回は止める）。
+    戻り値: (付け替えた後の記録, 保存し直す月, 新しいキー → 古いキーの集合)"""
     current = {}
     for repo in sorted({r.get("repo") for r in known.values() if valid_record(r, owner, exclude)}):
+        tick()
         try:
             full = str(repo_info(repo).get("full_name") or "")
-        except Exception:
-            continue  # 引き直せなければ付け替えない（消したリポジトリなど）
+        except Exception as e:
+            if "HTTP 404" in str(e):
+                continue
+            raise
         if full and full.lower() != repo.lower() and full.split("/")[0].lower() == owner.lower():
             current[repo] = full
     if not current:
-        return known, set()
+        return known, set(), {}
     rank = {"judged": 0, "no-suspect": 0, "secret": 0, "unjudged": 1}
-    out, months = {}, set()
+    out, months, aliases = {}, set(), {}
     for k, r in known.items():
         new = current.get(r.get("repo"))
         if new:
             months.add(month_of(r, now))
             r = dict(r, repo=new, key=new + k[len(r["repo"]):])
+            aliases.setdefault(r["key"], set()).add(k)
         key = r["key"] if new else k
         if key in out:  # 新旧の名前の記録が重なった
             a, b = out[key], r
@@ -488,7 +494,7 @@ def rekey_renamed(known, owner, exclude, now):
             months.update({month_of(a, now), month_of(b, now)})
             r = dict(keep, notified=bool(a.get("notified") or b.get("notified")))
         out[key] = r
-    return out, months
+    return out, months, aliases
 
 
 def drop_errors_of(errors, keys):
@@ -1241,6 +1247,8 @@ def save_months(ledger, records, slots, months, now):
     for month in sorted(months):
         recs = [r for r in records.values() if month_of(r, now) == month]
         parts = place(recs, month)
+        for part in slots.get(month, {}):  # 記録が無くなった本（名前の付け替えで統合した、など）も、空の本として書き直す
+            parts.setdefault(part, [])
         n = max(parts)
         for part in sorted(parts, reverse=True):  # 移す先（番の大きい本）を先に書く（place の説明）
             text = render_month(parts[part], month, part, n, summary_of=recs)
@@ -1253,7 +1261,7 @@ def save_months(ledger, records, slots, months, now):
                 slots.setdefault(month, {})[part] = int(url.rsplit("/", 1)[-1])
 
 
-def notify(ledger, records, errors):
+def notify(ledger, records, errors, aliases=None):
     """重大で、まだ [漏れ] Issue を立てていない記録について起票する。立て終えたものだけ notified にする。
     失敗したものは notified にしないので、次回に起票し直す（目印で二重の起票を防ぐ）。変わった月を返す"""
     pending_r = [r for r in records.values() if r.get("serious") and not r.get("notified")]
@@ -1271,7 +1279,7 @@ def notify(ledger, records, errors):
     changed = []
     for r in pending_r:
         try:
-            if r["key"] not in done:
+            if r["key"] not in done and not ((aliases or {}).get(r["key"], set()) & done):  # 名前を変える前のキーの目印とも照合
                 title, body = serious_issue(r)
                 gh("issue", "create", "-R", ledger, "--title", title, "--label", "type:fix", "--body-file", "-",
                    input_text=body)
@@ -1316,7 +1324,12 @@ def run(a):
     exclude = set(a.exclude.split(",")) | {a.ledger.split("/")[1]}
     known, slots = load_ledger(list_issues(a.ledger))  # 読めない台帳があれば止める（上書きで消さない）
     normalized = set()  # 古い基準（unclear も重大）で書いた記録を今の基準に合わせ、その月を保存し直す
-    known, renamed_months = rekey_renamed(known, a.owner, exclude, now)  # 名前を変えたリポジトリの記録を付け替える
+    try:  # 名前を変えたリポジトリの記録を付け替える。確かめられなければ、二重の判定・起票を避けて、その回は止める
+        with time_budget(MAX_REFETCH_SECONDS):
+            known, renamed_months, aliases = rekey_renamed(known, a.owner, exclude, now)
+    except (Exception, TimeBudget) as e:
+        print("リポジトリの名前を確かめられないので、今回は止めます（次回に再試行）: %s" % str(e)[:200], file=sys.stderr)
+        return 1
     normalized |= renamed_months
     migrated = {}       # 古い方式の secret から未判定に戻した記録（元の記録）
     has_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
@@ -1399,7 +1412,7 @@ def run(a):
         return 0
     changed = {month_of(r, now) for r in new} | {month_of(known[k], now) for k in failed} | normalized
     save_months(a.ledger, known, slots, changed, now)  # 起票の前に判定を保存する
-    notified = notify(a.ledger, known, errors)
+    notified = notify(a.ledger, known, errors, aliases)
     if notified:  # 起票できたものだけ notified を保存する（失敗したものは次回に起票し直す）
         save_months(a.ledger, known, slots, {month_of(r, now) for r in notified}, now)
     report_errors(errors)
