@@ -314,6 +314,7 @@ def cand(key, date, suspects=(10,)):
 
 class Run(unittest.TestCase):
     def setUp(self):
+        lm._BRANCH_NAMES.clear()
         self.saved = (lm.gh, lm.collect, lm.anthropic_api, lm.utcnow, os.environ.get("ANTHROPIC_API_KEY"))
         os.environ["ANTHROPIC_API_KEY"] = "k"
         self.now = lm.dt.datetime(2026, 10, 1, 3, 0, tzinfo=lm.dt.timezone.utc)
@@ -763,6 +764,7 @@ class Collect(unittest.TestCase):
     NOW = lm.dt.datetime(2026, 10, 20, tzinfo=lm.dt.timezone.utc)
 
     def setUp(self):
+        lm._BRANCH_NAMES.clear()
         self.saved = (lm.gh, lm.utcnow)
         lm.utcnow = lambda: self.NOW
         self.calls = []
@@ -1133,7 +1135,7 @@ class FinalP(Run):
         lm.gh = gh
         got = list(lm.recent_prs("o/r", "main", self.now - lm.dt.timedelta(days=28)))
         self.assertEqual(len(calls), 1)  # 古いページに来たら打ち切る
-        self.assertEqual(len(got), 50)
+        self.assertEqual(len(got), 0)  # since より前にマージされた PR は返さない（どの呼び出し元も使わない）
 
     def test_refetch_failures_survive_a_failed_judgement(self):  # P2
         old = {"key": "o/r@abcde30", "repo": "o/r", "kind": "fix", "sha": "abcde30", "date": "2026-08-01T00:00:00Z",
@@ -2092,9 +2094,9 @@ class DefaultBranchRename(Run):
 
     def test_recent_prs_lists_without_base_filter_and_keeps_renamed(self):
         fake = FakeGitHub()
-        items = [{"number": 1, "base": {"ref": "main"}, "updated_at": "2026-10-20T00:00:00Z"},
-                 {"number": 2, "base": {"ref": "master"}, "updated_at": "2026-10-19T00:00:00Z"},
-                 {"number": 3, "base": {"ref": "release"}, "updated_at": "2026-10-18T00:00:00Z"}]
+        items = [{"number": 1, "base": {"ref": "main"}, "updated_at": "2026-10-20T00:00:00Z", "merged_at": "2026-10-20T00:00:00Z"},
+                 {"number": 2, "base": {"ref": "master"}, "updated_at": "2026-10-19T00:00:00Z", "merged_at": "2026-10-19T00:00:00Z"},
+                 {"number": 3, "base": {"ref": "release"}, "updated_at": "2026-10-18T00:00:00Z", "merged_at": "2026-10-18T00:00:00Z"}]
         fake.api = {"api repos/o/r/pulls?state=closed&sort=updated&direction=desc&per_page=50&page=1": json.dumps(items),
                     "api repos/o/r/branches/master": json.dumps({"name": "main"}),
                     "api repos/o/r/branches/release": json.dumps({"name": "release"})}
@@ -2102,6 +2104,19 @@ class DefaultBranchRename(Run):
         lm._BRANCH_NAMES.clear()
         since = lm.dt.datetime(2026, 10, 1, tzinfo=lm.dt.timezone.utc)
         self.assertEqual([p["number"] for p in lm.recent_prs("o/r", "main", since)], [1, 2])
+
+    def test_unused_prs_are_not_looked_up(self):  # ゲートの指摘（結果に使わない PR の問い合わせで、収集全体が落ちる）
+        items = [{"number": 1, "base": {"ref": "feature-x"}, "updated_at": "2026-10-20T00:00:00Z", "merged_at": None},
+                 {"number": 2, "base": {"ref": "feature-y"}, "updated_at": "2026-10-19T00:00:00Z", "merged_at": "2026-09-01T00:00:00Z"},
+                 {"number": 3, "base": {"ref": "main"}, "updated_at": "2026-10-18T00:00:00Z", "merged_at": "2026-10-10T00:00:00Z"}]
+
+        def gh(*args, input_text=None):
+            if "branches/" in " ".join(args):
+                raise RuntimeError("gh api: HTTP 502")
+            return json.dumps(items)
+        lm.gh = gh
+        since = lm.dt.datetime(2026, 10, 1, tzinfo=lm.dt.timezone.utc)
+        self.assertEqual([p["number"] for p in lm.recent_prs("o/r", "main", since)], [3])
 
     def test_refetched_pr_on_renamed_default_branch_is_judged(self):
         old = {"key": "o/r@abcde47", "repo": "o/r", "kind": "fix", "sha": "abcde47", "date": "2026-08-01T00:00:00Z",

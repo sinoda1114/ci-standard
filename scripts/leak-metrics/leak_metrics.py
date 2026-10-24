@@ -820,7 +820,9 @@ _BRANCH_NAMES = {}
 def default_base(repo, ref, default):
     """PR の base（ref）が既定ブランチ（default）か。名前を変える前の既定ブランチも含める: GitHub は名前を変えた
     ブランチを古い名前で問い合わせると新しい名前のブランチを返すので、返ってきた名前で比べる（Issue #28）。
-    消したブランチ（404）は既定ブランチではない。それ以外の失敗は例外のまま返す"""
+    消したブランチ（404）は既定ブランチではない。それ以外の失敗は例外のまま返す。
+    既知の限界: 古い名前のブランチを作り直した、または名前を変えずに既定ブランチの設定だけを切り替えた場合は、
+    古い名前が転送されないので拾えない（変更前と同じ）"""
     if not ref or not default:
         return False
     if ref == default:
@@ -837,7 +839,7 @@ def default_base(repo, ref, default):
 
 
 def recent_prs(repo, base, since):
-    """既定ブランチ（base）への閉じた PR を、更新日の新しい順にページごとに読み、ページの最後が since より古くなったら
+    """既定ブランチ（base）に since 以降にマージされた PR を、更新日の新しい順にページごとに読み、ページの最後が since より古くなったら
     打ち切る（_paged は全履歴を読むので、履歴の多いリポジトリで毎日全部を取ってしまう）。
     一覧は base で絞らずに取り、default_base で絞る（名前を変える前の既定ブランチへの PR も拾うため）"""
     page = 1
@@ -849,6 +851,11 @@ def recent_prs(repo, base, since):
                               % (repo, page)))
         items = [x for x in (items if isinstance(items, list) else []) if isinstance(x, dict)]
         for p in items:
+            # マージされていない PR と、since より前にマージされた PR は、どの呼び出し元も使わないので、問い合わせずに飛ばす
+            # （結果に使わない PR のブランチの問い合わせの失敗で、収集全体を落とさない）
+            m = p.get("merged_at")
+            if not m or _ts(m) < since:
+                continue
             if default_base(repo, (p.get("base") or {}).get("ref"), base):
                 yield p
         last = items[-1].get("updated_at") if items else None
