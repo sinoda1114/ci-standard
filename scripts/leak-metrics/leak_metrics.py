@@ -527,8 +527,10 @@ def judge(c, api, has_key):
         if j is None:
             # 止まった理由と長さは理由の種類に入れる（公開ログの内訳に出る）。返事の先頭は、非公開の台帳にだけ残る
             head = re.sub(r"\s+", " ", str(text or "")).strip()
-            rec["rationale"] = ("%s の出力を読めない（stop_reason=%s、%d 文字）: %s"
-                                % (model, LAST_RESPONSE.get("stop_reason") or "不明", len(str(text or "")), head))[:MAX_RATIONALE_CHARS]
+            stop = str(LAST_RESPONSE.get("stop_reason") or "")
+            stop = stop if re.fullmatch(r"[a-z_]{1,30}", stop) else "不明"  # 公開ログに出るので、決まった形だけ
+            rec["rationale"] = ("%s の出力を読めない（stop_reason=%s）: %d 文字: %s"
+                                % (model, stop, len(str(text or "")), head))[:MAX_RATIONALE_CHARS]
             return rec
         final = j
         if model == STAGE1_MODEL and not needs_stage2(j):

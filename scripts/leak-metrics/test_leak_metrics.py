@@ -1940,7 +1940,7 @@ class UnjudgedReasons(Run):
             self.go(FakeGitHub(), [cand("o/r@abcde41", "2026-09-30T00:00:00Z"), c2])
         text = out.getvalue()
         self.assertIn("未判定の理由:", text)
-        self.assertIn("claude-haiku-5-5 の出力を読めない（stop_reason=不明、6 文字） 1", text)
+        self.assertIn("claude-haiku-5-5 の出力を読めない（stop_reason=不明） 1", text)
         self.assertIn("材料が欠けている 1", text)
         self.assertNotIn("private-repo", text)
         self.assertNotIn("#12", text)
@@ -1971,10 +1971,17 @@ class UnreadableDetail(unittest.TestCase):
             return "分析すると、この修正は\n" + "あ" * 300
         out = lm.judge(dict(self.CAND), api=api, has_key=True)
         self.assertEqual(out["verdict"], "unjudged")
-        self.assertTrue(out["rationale"].startswith("claude-haiku-5-5 の出力を読めない（stop_reason=max_tokens、312 文字）: 分析すると、この修正は"))
+        self.assertTrue(out["rationale"].startswith("claude-haiku-5-5 の出力を読めない（stop_reason=max_tokens）: 312 文字: 分析すると、この修正は"))
         self.assertNotIn("\n", out["rationale"])
         self.assertLessEqual(len(out["rationale"]), lm.MAX_RATIONALE_CHARS)
-        self.assertEqual(list(lm.unjudged_reasons([out])), ["claude-haiku-5-5 の出力を読めない（stop_reason=max_tokens、312 文字）"])
+        self.assertEqual(list(lm.unjudged_reasons([out])), ["claude-haiku-5-5 の出力を読めない（stop_reason=max_tokens）"])
+
+    def test_odd_stop_reason_is_not_logged(self):
+        def api(model, prompt):
+            lm.LAST_RESPONSE["stop_reason"] = "o/private-repo"
+            return "x"
+        out = lm.judge(dict(self.CAND), api=api, has_key=True)
+        self.assertIn("stop_reason=不明", out["rationale"])
 
     def test_api_records_stop_reason(self):
         import io
