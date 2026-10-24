@@ -57,6 +57,10 @@ SECRET_RE = re.compile(
 # （値の書き方の抜け道をふさぎきれないため。ユーザーの判断 2026-10-17）
 # config["password"] = … の ] も、キーと : の間の改行（差分の行頭の + - も）も許す
 SECRET_ASSIGN_RE = re.compile(r"""[\w.-]{0,100}['"]?\]?(?:\s|(?<=\n)[+-])*[:=]""")
+# SECRET_ASSIGN_RE と同じ判定を、英数字の並び（[\w.-]*）の終わりを使い回して線形の時間で行うための部品
+SECRET_WORD_RUN_RE = re.compile(r"[\w.-]*")
+SECRET_ASSIGN_TAIL_RE = re.compile(r"""['"]?\]?(?:\s|(?<=\n)[+-])*[:=]""")
+SECRET_ASSIGN_MAX_WORD = 100
 MAX_SECRET_SCAN_CHARS = 2000000  # これより長い文字列は調べきらずに、秘密情報を含むものとして扱う
 # 伏せる（redact）ときは、値の形まで見て範囲を決める
 SECRET_KEY_RE = re.compile(r"(?i)(password|passwd|secret|api[_-]?key|token|credential)")
@@ -97,6 +101,11 @@ def _ts(s):
     return dt.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
 
 
+def fix_kind(msg, target, target_pr):
+    """修正の種類。revert 元（コミット・PR）が分かったものと、題名が Revert のものは revert"""
+    return "revert" if target or target_pr or str(msg or "").lower().startswith("revert") else "fix"
+
+
 def fix_candidates(repo, commits, prs, revert_pr=None, same_repo=None):
     """fix・revert のコミットを候補にし、原因の候補（suspects）を付ける。
     same_repo: 「Reverts owner/repo#N」の参照先が、名前を変える前のこのリポジトリかを確かめる関数（無ければ別のリポジトリと見なす）"""
@@ -116,7 +125,7 @@ def fix_candidates(repo, commits, prs, revert_pr=None, same_repo=None):
                     target_pr = int(ref.group(2))
             except Exception as e:  # 確かめられなければ確定させない（次回に取り直す）
                 incomplete = "revert 元のリポジトリを確かめられない: %s" % str(e)[:150]
-        kind = "revert" if target or target_pr or c["message"].lower().startswith("revert") else "fix"  # 元の PR が決まってから
+        kind = fix_kind(c["message"], target, target_pr)  # 元の PR が決まってから
         if target_pr:  # 本文が「Reverts owner/repo#12」なら、元の PR の番号がそのまま分かる
             known = True
             suspects = [p for p in prs if p["number"] == target_pr and p.get("merged_at")
@@ -268,7 +277,18 @@ def has_secret(text):
             return True
     if SECRET_RE.search(t):
         return True
-    return any(SECRET_ASSIGN_RE.match(t, m.end()) for m in SECRET_KEY_RE.finditer(t))
+    run_start, run_end, tails = -1, -1, {}
+    for m in SECRET_KEY_RE.finditer(t):
+        i = m.end()
+        if not run_start <= i <= run_end:  # 同じ並びの中のキーワードは、並びの終わりが同じ
+            run_start, run_end = i, SECRET_WORD_RUN_RE.match(t, i).end()
+        if run_end - i > SECRET_ASSIGN_MAX_WORD:  # 並びが長すぎると、SECRET_ASSIGN_RE の {0,100} では届かない
+            continue
+        if run_end not in tails:
+            tails[run_end] = bool(SECRET_ASSIGN_TAIL_RE.match(t, run_end))
+        if tails[run_end]:
+            return True
+    return False
 
 
 def first_line(text):
@@ -859,6 +879,7 @@ def _refetch(live, owner, exclude, errors, out, failed, started):
             failed.append(r["key"])
             continue
         repo = r["repo"]
+        kind = r.get("kind")  # Issue はそのまま。修正は取り直した材料で決め直す（下の fix_kind）
         rec_files = []
         try:
             tick()
@@ -934,6 +955,7 @@ def _refetch(live, owner, exclude, errors, out, failed, started):
                 ref = REVERT_PR_RE.search(msg or "")
                 if ref and not target_pr and same_repo(ref.group(1), repo):  # 名前を変える前のこのリポジトリの PR
                     target_pr = int(ref.group(2))
+                kind = fix_kind(msg, target, target_pr)  # 台帳の kind を使わず、取り直した材料で決め直す
                 if target_pr:
                     nums = [target_pr]
                 elif target:  # revert は元の PR を探し直す（前回は取得に失敗して、ファイルの重なりで代えていたかもしれない）
@@ -967,7 +989,7 @@ def _refetch(live, owner, exclude, errors, out, failed, started):
             continue
         # プロンプトに入る message は、台帳の値ではなく取り直したコミット・PR・Issue のもの（台帳を書き換えて判定を誘導させない）
         out.append({k: r.get(k) for k in ("key", "repo", "kind", "sha", "date", "pr") if r.get(k) is not None}
-                   | {"message": first_line(fetched_msg)[:200], "message_full": first_line(fetched_msg), "diff": diff, "suspects": sus,
+                   | {"kind": kind, "message": first_line(fetched_msg)[:200], "message_full": first_line(fetched_msg), "diff": diff, "suspects": sus,
                       "files": rec_files})
 
 

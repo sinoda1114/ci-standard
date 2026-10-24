@@ -1635,6 +1635,24 @@ class PrBotsGate(Run):
                               [pr(12, "2026-10-05T00:00:00Z", ["a"])], same_repo=same)[0]
         self.assertTrue(c.get("incomplete"))
 
+    def test_refetched_kind_is_decided_again(self):  # 確認役の却下（取り直しでも kind を決め直す）
+        old = {"key": "o/r@abcde29", "repo": "o/r", "kind": "fix", "sha": "abcde29", "date": "2026-08-01T00:00:00Z",
+               "message": "fix: y を戻す", "verdict": "unjudged", "serious": False, "suspects": [], "pr": 29}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
+        fake.api = {"api repos/o/r/pulls/29": json.dumps({"title": "fix: y を戻す", "body": "Reverts o/old-name#12",
+                                                          "merged_at": "2026-08-01T00:00:00Z", "merge_commit_sha": "abcde29",
+                                                          "base": {"ref": "main"}}),
+                    "api --paginate --slurp repos/o/r/pulls/29/files?per_page=100": json.dumps([[{"filename": "a.js"}]]),
+                    "pr diff 29 -R o/r": "-y",
+                    "api repos/o/old-name": json.dumps({"full_name": "o/r", "owner": {"login": "o"}}),
+                    "api repos/o/r/pulls/12": json.dumps({"title": "feat: y", "merged_at": "2026-07-25T00:00:00Z", "base": {"ref": "main"}}),
+                    "api --paginate --slurp repos/o/r/pulls/12/files?per_page=100": json.dumps([[{"filename": "a.js"}]]),
+                    "pr diff 12 -R o/r": "+y"}
+        self.go(fake, [])
+        self.assertTrue(self.judged)
+        self.assertEqual(fake.ledgers()["[漏れの記録] 2026-08"][0]["kind"], "revert")
+        self.assertTrue(any("次の修正（revert）" in p for p in self.prompts))
+
     def test_kind_of_renamed_repo_revert_is_revert(self):  # ゲートの指摘
         msg = "fix: y を戻す\n\nReverts o/old-name#12"
         c = lm.fix_candidates("o/r", [commit("abcdef7", "2026-10-10T00:00:00Z", msg, ["a"])],
