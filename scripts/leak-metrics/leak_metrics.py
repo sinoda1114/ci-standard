@@ -296,6 +296,34 @@ def first_line(text):
     return lines[0] if lines else ""
 
 
+OLD_SECRET_RATIONALE = "差分に秘密情報（のファイル・形）を含むので、AI に送らずに判定しない"  # 2026-10-24 より前の方式の理由
+WITHHELD_MARK = "（秘密情報の疑いがあるので、中身は送らない"
+
+
+def withhold_secret_files(text):
+    """差分をファイルごと（diff --git の区切り）に分け、秘密情報の疑いがあるファイルは中身を外してパスだけ残す。
+    見出しの無い部分（Issue の本文など）に疑いがあれば、その部分を丸ごと外す。戻り値: (送ってよい文, 外したパスの一覧)"""
+    out, withheld = [], []
+    for part in re.split(r"(?m)^(?=diff --git )", str(text or "")):
+        if not part or not has_secret(part):
+            out.append(part)
+            continue
+        if part.startswith("diff --git "):
+            head = part.split("\n", 1)[0]
+            path = head.rsplit(" b/", 1)[-1] if " b/" in head else head[len("diff --git "):]
+            out.append("%s: %s）\n" % (WITHHELD_MARK, path))
+            withheld.append(path)
+        else:
+            out.append("%s: この部分）\n" % WITHHELD_MARK)
+            withheld.append("（見出しの無い部分）")
+    return "".join(out), withheld
+
+
+def only_withheld(text):
+    """外したあとの文に、外した印のほかに何も残っていないか"""
+    return not [l for l in str(text or "").splitlines() if l.strip() and not l.startswith(WITHHELD_MARK)]
+
+
 def secret_files(files):
     """API から取った生のパスの一覧に、秘密情報のファイルがあるか（差分の見出しの書き方に左右されない）"""
     return any(isinstance(f, str) and SECRET_PATH_RE.search(f) for f in files or [])
@@ -342,6 +370,12 @@ def base_record(c, why=""):
     return rec
 
 
+def secret_record(rec, why):
+    rec["verdict"] = "secret"
+    rec["rationale"] = why
+    return rec
+
+
 def judge(c, api, has_key):
     rec = base_record(c)
     if c.get("incomplete"):  # 材料が欠けたまま判定しない。候補が無くても確定させない（次回に取り直す）
@@ -350,16 +384,22 @@ def judge(c, api, has_key):
     if not c["suspects"]:
         rec["verdict"] = "no-suspect"
         return rec
-    # 秘密情報を見つけたら、伏せて送るのではなく、送らない（正規表現で伏せきることはできないため。判定はしないで確定する）
-    if (secret_files(c.get("files")) or has_secret(c.get("diff")) or has_secret(c.get("message_full", c.get("message")))
-            or any(secret_files(s.get("files")) or has_secret(s.get("diff")) or has_secret(s.get("title")) for s in c["suspects"])):
-        rec["verdict"] = "secret"
-        rec["rationale"] = "差分に秘密情報（のファイル・形）を含むので、AI に送らずに判定しない"
-        return rec
+    # 秘密情報の疑いがあるものは、伏せて送るのではなく、送らない（正規表現で伏せきることはできないため）。
+    # 題名と、秘密情報のファイル（.env・鍵など）を含む候補は丸ごと送らない。差分は、疑いのあるファイルだけ中身を外し、
+    # 残りで判定する（ユーザーの判断 2026-10-24）。修正の差分が全部外れたら、材料が無いので判定せずに確定する
+    if (secret_files(c.get("files")) or has_secret(c.get("message_full", c.get("message")))
+            or any(secret_files(s.get("files")) or has_secret(s.get("title")) for s in c["suspects"])):
+        return secret_record(rec, "題名か変更ファイルに秘密情報（のファイル・形）を含むので、AI に送らずに判定しない")
+    fix_diff, withheld = withhold_secret_files(c.get("diff"))
+    if withheld and only_withheld(fix_diff):
+        return secret_record(rec, "修正の差分がすべて秘密情報の疑いのあるファイルなので、AI に送らずに判定しない")
+    c = dict(c, diff=fix_diff, suspects=[dict(s, diff=withhold_secret_files(s.get("diff"))[0]) for s in c["suspects"]])
+    prompt = build_prompt(c)
+    if has_secret(prompt):  # 最後の守り: 組み立てたプロンプトに疑いが残っていれば送らない
+        return secret_record(rec, "送る文に秘密情報の疑いが残ったので、AI に送らずに判定しない")
     if not has_key:
         rec["rationale"] = "API キーが無い"
         return rec
-    prompt = build_prompt(c)
     final = None
     for model in (STAGE1_MODEL, STAGE2_MODEL):
         try:
@@ -1083,6 +1123,10 @@ def run(a):
     for k, r in list(known.items()):
         if r.get("serious") and r.get("is_leak") == "unclear":
             known[k] = dict(r, serious=False)
+            normalized.add(month_of(known[k], now))
+        if r.get("verdict") == "secret" and r.get("rationale") == OLD_SECRET_RATIONALE:
+            # 古い方式（疑いが 1 か所でもあれば候補を丸ごと送らない）で確定した記録は、ファイルごとに外す今の方式で判定し直す
+            known[k] = dict(r, verdict="unjudged")
             normalized.add(month_of(known[k], now))
     done = {k for k, r in known.items() if r.get("verdict") in ("judged", "no-suspect", "secret")}
     cands, errors = collect(a.owner, exclude, done)

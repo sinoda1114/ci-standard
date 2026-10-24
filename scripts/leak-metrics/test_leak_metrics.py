@@ -1252,9 +1252,11 @@ class SecretsNotSent(unittest.TestCase):
         out, sent = self.judge(diff=d)
         self.assertEqual((out["verdict"], sent), ("secret", []))
 
-    def test_secret_shape_in_suspect_diff_is_not_sent(self):
+    def test_secret_shape_in_suspect_diff_is_not_sent(self):  # ファイルごとに外す（ユーザーの判断 2026-10-24）
         out, sent = self.judge(suspects=[{"number": 10, "title": "feat", "diff": '+  "api_key": "s3cr3t-value-123"'}])
-        self.assertEqual((out["verdict"], sent), ("secret", []))
+        self.assertEqual(out["verdict"], "unjudged")  # 返事 "x" は読めないので未判定。送ったことだけを見る
+        self.assertTrue(sent)
+        self.assertTrue(all("s3cr3t-value-123" not in p for p in sent))
 
     def test_quoted_or_tab_paths_and_file_lists_are_checked(self):
         d = 'diff --git "a/dir\\tx/.env.production" "b/dir\\tx/.env.production"\n-DB_PASS=abcdefgh\n'
@@ -1675,6 +1677,63 @@ class PrBotsGate(Run):
                               [pr(12, "2026-10-05T00:00:00Z", ["a"])], same_repo=boom)[0]
         self.assertTrue(c.get("incomplete"))
         self.assertEqual(c["suspects"], [])
+
+
+class SecretsPerFile(unittest.TestCase):
+    """秘密情報の疑いのあるファイルだけ中身を送らず、残りで判定する（ユーザーの判断 2026-10-24）"""
+    FIX = ("diff --git a/src/a.js b/src/a.js\n-  bug()\n+  ok()\n")
+    SUS = ("diff --git a/src/a.js b/src/a.js\n+  bug()\n"
+           "diff --git a/test/judge.bats b/test/judge.bats\n+  token=\"abcdefgh12345678\"\n")
+
+    def cand(self, diff=None, sus=None):
+        return {"key": "o/r@s2", "repo": "o/r", "kind": "fix", "sha": "s2", "message": "fix: x", "diff": diff or self.FIX,
+                "suspects": [{"number": 10, "title": "feat: y", "diff": sus or self.SUS}]}
+
+    def test_only_the_suspicious_file_is_withheld(self):
+        sent = []
+        out = lm.judge(self.cand(), api=lambda m, p: sent.append(p) or MINOR, has_key=True)
+        self.assertEqual(out["verdict"], "judged")
+        self.assertTrue(sent)
+        self.assertTrue(all("abcdefgh12345678" not in p for p in sent))
+        self.assertTrue(all("test/judge.bats" in p and "bug()" in p for p in sent))  # パスと残りのファイルは送る
+
+    def test_fix_diff_wholly_withheld_is_secret(self):
+        sent = []
+        d = "diff --git a/src/auth.ts b/src/auth.ts\n+  const token = getToken()\n"
+        out = lm.judge(self.cand(diff=d), api=lambda m, p: sent.append(p) or MINOR, has_key=True)
+        self.assertEqual((out["verdict"], sent), ("secret", []))
+
+    def test_withhold_keeps_clean_sections_and_lists_paths(self):
+        clean, withheld = lm.withhold_secret_files(self.SUS)
+        self.assertEqual(withheld, ["test/judge.bats"])
+        self.assertIn("bug()", clean)
+        self.assertNotIn("abcdefgh", clean)
+        self.assertFalse(lm.has_secret(clean))
+        clean, withheld = lm.withhold_secret_files('+  password = "abcdefgh"')  # 見出しの無い文は全体を外す
+        self.assertEqual(withheld, ["（見出しの無い部分）"])
+        self.assertFalse(lm.has_secret(clean))
+
+    def test_final_guard_blocks_a_prompt_that_still_looks_secret(self):
+        saved = lm.build_prompt
+        lm.build_prompt = lambda c: saved(c) + '\npassword = "leftover"'
+        try:
+            out = lm.judge(self.cand(), api=lambda m, p: self.fail("送った"), has_key=True)
+        finally:
+            lm.build_prompt = saved
+        self.assertEqual(out["verdict"], "secret")
+
+
+class SecretsPerFileMigrate(Run):
+    def test_old_whole_candidate_secret_is_judged_again(self):  # 古い方式で secret にした記録は、判定し直す
+        old = {"key": "o/r@abcde30", "repo": "o/r", "kind": "fix", "sha": "abcde30", "date": "2026-09-30T00:00:00Z",
+               "message": "fix: x", "verdict": "secret", "serious": False, "suspects": [10],
+               "rationale": "差分に秘密情報（のファイル・形）を含むので、AI に送らずに判定しない"}
+        keep = dict(old, key="o/r@abcde31", sha="abcde31", rationale="題名か変更ファイルに秘密情報（のファイル・形）を含むので、AI に送らずに判定しない")
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month([old, keep], "2026-09")}])
+        self.go(fake, [cand("o/r@abcde30", "2026-09-30T00:00:00Z"), cand("o/r@abcde31", "2026-09-30T00:00:00Z")])
+        recs = {r["key"]: r for r in fake.ledgers()["[漏れの記録] 2026-09"]}
+        self.assertEqual(recs["o/r@abcde30"]["verdict"], "judged")
+        self.assertEqual(recs["o/r@abcde31"]["verdict"], "secret")
 
 
 if __name__ == "__main__":
