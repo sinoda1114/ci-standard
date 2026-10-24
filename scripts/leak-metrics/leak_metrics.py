@@ -350,7 +350,8 @@ def judge(c, api, has_key):
     rec.update({"verdict": "judged", "severity": final["severity"], "security": final["security"],
                 "caused_by_pr": pr, "rationale": final["rationale"],
                 "is_leak": final["is_leak"]})
-    rec["serious"] = final["is_leak"] != "no" and (final["severity"] in ("critical", "high") or final["security"])
+    # 重大は、漏れと判定したもの（yes）だけ。unclear は台帳に残すが、集計の重大にも [漏れ] Issue にもしない（ユーザーの判断 2026-10-24）
+    rec["serious"] = final["is_leak"] == "yes" and (final["severity"] in ("critical", "high") or final["security"])
     return rec
 
 

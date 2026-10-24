@@ -1544,6 +1544,17 @@ class PrBots(Run):
         self.assertEqual(self.judged, [])
         self.assertFalse([c for c in fake.calls if c[:3] == ("pr", "diff", "12")])
 
+    def test_unclear_high_is_not_serious(self):  # Devin（ユーザーの判断 2026-10-24: yes だけ重大）
+        unclear = '{"is_leak":"unclear","caused_by_pr":10,"severity":"high","security":true,"rationale":"r"}'
+        out = lm.judge(cand("o/r@abcde24", "2026-09-30T00:00:00Z"), api=lambda m, p: unclear, has_key=True)
+        self.assertEqual(out["verdict"], "judged")
+        self.assertEqual(out["is_leak"], "unclear")
+        self.assertFalse(out["serious"])
+        fake = FakeGitHub()
+        self.replies = [unclear, unclear]
+        self.go(fake, [cand("o/r@abcde25", "2026-09-30T00:00:00Z")])
+        self.assertEqual(fake.leak_issues(), [])
+
     def test_secret_file_names_ignore_case(self):  # Codex P1
         self.assertTrue(lm.secret_files(["config/.ENV", "PROD.KEY"]))
         self.assertTrue(lm.secret_files(["ID_RSA"]))
