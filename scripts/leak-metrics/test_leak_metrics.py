@@ -1252,9 +1252,11 @@ class SecretsNotSent(unittest.TestCase):
         out, sent = self.judge(diff=d)
         self.assertEqual((out["verdict"], sent), ("secret", []))
 
-    def test_secret_shape_in_suspect_diff_is_not_sent(self):
+    def test_secret_shape_in_suspect_diff_is_not_sent(self):  # ファイルごとに外す（ユーザーの判断 2026-10-24）
         out, sent = self.judge(suspects=[{"number": 10, "title": "feat", "diff": '+  "api_key": "s3cr3t-value-123"'}])
-        self.assertEqual((out["verdict"], sent), ("secret", []))
+        self.assertEqual(out["verdict"], "unjudged")  # 返事 "x" は読めないので未判定。送ったことだけを見る
+        self.assertTrue(sent)
+        self.assertTrue(all("s3cr3t-value-123" not in p for p in sent))
 
     def test_quoted_or_tab_paths_and_file_lists_are_checked(self):
         d = 'diff --git "a/dir\\tx/.env.production" "b/dir\\tx/.env.production"\n-DB_PASS=abcdefgh\n'
@@ -1675,6 +1677,256 @@ class PrBotsGate(Run):
                               [pr(12, "2026-10-05T00:00:00Z", ["a"])], same_repo=boom)[0]
         self.assertTrue(c.get("incomplete"))
         self.assertEqual(c["suspects"], [])
+
+
+class SecretsPerFile(unittest.TestCase):
+    """秘密情報の疑いのあるファイルだけ中身を送らず、残りで判定する（ユーザーの判断 2026-10-24）"""
+    FIX = ("diff --git a/src/a.js b/src/a.js\n-  bug()\n+  ok()\n")
+    SUS = ("diff --git a/src/a.js b/src/a.js\n+  bug()\n"
+           "diff --git a/test/judge.bats b/test/judge.bats\n+  token=\"abcdefgh12345678\"\n")
+
+    def cand(self, diff=None, sus=None):
+        return {"key": "o/r@s2", "repo": "o/r", "kind": "fix", "sha": "s2", "message": "fix: x", "diff": diff or self.FIX,
+                "suspects": [{"number": 10, "title": "feat: y", "diff": sus or self.SUS}]}
+
+    def test_only_the_suspicious_file_is_withheld(self):
+        sent = []
+        out = lm.judge(self.cand(), api=lambda m, p: sent.append(p) or MINOR, has_key=True)
+        self.assertEqual(out["verdict"], "judged")
+        self.assertTrue(sent)
+        self.assertTrue(all("abcdefgh12345678" not in p for p in sent))
+        self.assertTrue(all("test/judge.bats" in p and "bug()" in p for p in sent))  # パスと残りのファイルは送る
+
+    def test_fix_diff_wholly_withheld_is_secret(self):
+        sent = []
+        d = "diff --git a/src/auth.ts b/src/auth.ts\n+  const token = getToken()\n"
+        out = lm.judge(self.cand(diff=d), api=lambda m, p: sent.append(p) or MINOR, has_key=True)
+        self.assertEqual((out["verdict"], sent), ("secret", []))
+
+    def test_withhold_keeps_clean_sections_and_lists_paths(self):
+        clean, withheld = lm.withhold_secret_files(self.SUS)
+        self.assertEqual(withheld, ["test/judge.bats"])
+        self.assertIn("bug()", clean)
+        self.assertNotIn("abcdefgh", clean)
+        self.assertFalse(lm.has_secret(clean))
+        clean, withheld = lm.withhold_secret_files('+  password = "abcdefgh"')  # 見出しの無い文は全体を外す
+        self.assertEqual(withheld, ["（見出しの無い部分）"])
+        self.assertFalse(lm.has_secret(clean))
+
+    def test_issue_body_is_not_split_by_fake_headers(self):  # 確認役の却下
+        body = 'password = """\ndiff --git a/x b/x\nREALSECRETVALUE\n"""'
+        c = lm.issue_candidates("o/r", [{"number": 5, "created_at": "2026-10-10T00:00:00Z", "title": "bug", "body": body}],
+                                [pr(10, "2026-10-05T00:00:00Z", ["a"])])[0]
+        out = lm.judge(c, api=lambda m, p: self.fail("送った"), has_key=True)
+        self.assertEqual(out["verdict"], "secret")
+
+    def test_newline_in_file_name_cannot_fake_a_header(self):  # 確認役の却下（ファイル名の改行）
+        name = 'x\npassword = """\ndiff --git a/x b/x\nREALSECRETVALUE\n"""'
+        d = lm.commit_diff([{"filename": "src/a.js", "patch": "-  bug()\n+  ok()"}, {"filename": name, "patch": "+y"}])
+        self.assertEqual(len(re.findall(r"(?m)^diff --git ", d)), 2)  # 見出しは本物の 2 つだけ
+        sent = []
+        out = lm.judge(self.cand(diff=d), api=lambda m, p: sent.append(p) or MINOR, has_key=True)
+        self.assertTrue(all("REALSECRETVALUE" not in p for p in sent))
+        self.assertIn('diff --git "a/x\\npassword', lm.commit_diff([{"filename": name, "patch": ""}]))
+
+    def test_secret_in_raw_file_name_is_not_sent(self):  # 確認役の却下（エスケープで代入の形が隠れる）
+        name = "password\n=REALSECRETVALUE"
+        ents = [{"filename": "src/a.js", "patch": "-  bug()\n+  ok()"}, {"filename": name, "patch": "+y"}]
+        c = dict(self.cand(diff=lm.commit_diff(ents)), files=lm.file_names(ents))
+        out = lm.judge(c, api=lambda m, p: self.fail("送った"), has_key=True)
+        self.assertEqual(out["verdict"], "secret")
+        sus = [dict(self.cand()["suspects"][0], files=[name])]
+        out = lm.judge(dict(self.cand(), suspects=sus), api=lambda m, p: self.fail("送った"), has_key=True)
+        self.assertEqual(out["verdict"], "secret")
+
+    def test_withheld_value_reused_elsewhere_blocks_the_candidate(self):  # ゲートの指摘 1
+        sus = ("diff --git a/config/app.yml b/config/app.yml\n+  password: hunter2-prod-pass\n"
+               "diff --git a/src/a.js b/src/a.js\n+  client.login(\"hunter2-prod-pass\")\n")
+        out = lm.judge(self.cand(sus=sus), api=lambda m, p: self.fail("送った"), has_key=True)
+        self.assertEqual(out["verdict"], "secret")
+        fix = "diff --git a/src/b.js b/src/b.js\n+  use('hunter2-prod-pass')\n"
+        sus2 = "diff --git a/config/app.yml b/config/app.yml\n+  password: hunter2-prod-pass\n"
+        out = lm.judge(self.cand(diff=fix, sus=sus2), api=lambda m, p: self.fail("送った"), has_key=True)
+        self.assertEqual(out["verdict"], "secret")
+
+    def test_short_letters_only_value_is_not_cross_checked(self):  # ユーザーの判断 2026-10-24
+        sus = ("diff --git a/src/types.ts b/src/types.ts\n+  token: string\n"
+               "diff --git a/src/a.ts b/src/a.ts\n+  const name: string = \"x\"\n")
+        sent = []
+        out = lm.judge(self.cand(sus=sus), api=lambda m, p: sent.append(p) or MINOR, has_key=True)
+        self.assertEqual(out["verdict"], "judged")
+        self.assertNotIn("string", lm.cross_check_values(lm.withheld_values(sus)))
+        self.assertIn("hunter2", lm.cross_check_values({"hunter2", "abcdefghijklmnopq"}))  # 数字あり・16 文字以上は照合する
+
+    def test_value_with_spaces_is_cross_checked_whole(self):  # ゲートの P1
+        sus = ("diff --git a/config/app.yml b/config/app.yml\n+  password: correct horse battery staple1\n"
+               "diff --git a/src/a.js b/src/a.js\n+  login(\"correct horse battery staple1\")\n")
+        out = lm.judge(self.cand(sus=sus), api=lambda m, p: self.fail("送った"), has_key=True)
+        self.assertEqual(out["verdict"], "secret")
+
+    def test_value_extraction_is_bounded(self):  # ゲートの P2（二乗のメモリ）
+        import time
+        line = "+ " + "token=abcdefgh1 " * 8000
+        t0 = time.monotonic()
+        vals = lm.withheld_values("diff --git a/x b/x\n" + line)
+        self.assertLess(time.monotonic() - t0, 1.0)
+        self.assertLess(sum(len(v) for v in vals), 100000)
+
+    def test_typed_or_fallback_value_is_cross_checked(self):  # own-security の V1
+        for decl, use in (('+  private apiKey: string = "Zq81xPw0Lm33"', '+  fetch(url, {headers: {"x-k": "Zq81xPw0Lm33"}})'),
+                          ('+  token = process.env.T || "fallbackS3cret99"', '+  use("fallbackS3cret99")')):
+            sus = "diff --git a/src/config.ts b/src/config.ts\n%s\ndiff --git a/src/client.ts b/src/client.ts\n%s\n" % (decl, use)
+            out = lm.judge(self.cand(sus=sus), api=lambda m, p: self.fail("送った"), has_key=True)
+            self.assertEqual(out["verdict"], "secret", decl)
+
+    def test_secret_file_header_in_diff_blocks_the_candidate(self):  # own-review #1
+        d = self.FIX + "diff --git a/.env.production b/.env.production\n-X=1\n"
+        out = lm.judge(self.cand(diff=d), api=lambda m, p: self.fail("送った"), has_key=True)
+        self.assertEqual(out["verdict"], "secret")
+
+    def test_final_guard_blocks_a_prompt_that_still_looks_secret(self):
+        saved = lm.build_prompt
+        lm.build_prompt = lambda c: saved(c) + '\npassword = "leftover"'
+        try:
+            out = lm.judge(self.cand(), api=lambda m, p: self.fail("送った"), has_key=True)
+        finally:
+            lm.build_prompt = saved
+        self.assertEqual(out["verdict"], "secret")
+
+
+class SecretsPerFileMigrate(Run):
+    OLD = {"repo": "o/r", "kind": "fix", "date": "2026-08-01T00:00:00Z", "message": "fix: x", "verdict": "secret",
+           "serious": False, "suspects": [10], "rationale": "差分に秘密情報（のファイル・形）を含むので、AI に送らずに判定しない"}
+
+    def test_incomplete_migrated_candidate_returns_to_secret(self):  # 確認役の却下（集める処理の経路）
+        old = dict(self.OLD, key="o/r@abcde34", sha="abcde34", date="2026-09-30T00:00:00Z")
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month([old], "2026-09")}])
+        c = dict(cand("o/r@abcde34", "2026-09-30T00:00:00Z"), incomplete="PR #10 の差分を取得できない")
+        self.go(fake, [c])
+        self.assertEqual(fake.ledgers()["[漏れの記録] 2026-09"][0]["verdict"], "secret")
+
+    def test_migrated_record_skipped_by_caps_returns_to_secret(self):  # 確認役の却下（件数・時間の上限で見送り）
+        old = dict(self.OLD, key="o/r@abcde35", sha="abcde35", date="2026-09-30T00:00:00Z")
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month([old], "2026-09")}])
+        cands = [cand("o/r@abcde35", "2026-09-30T00:00:00Z")] + [cand("o/r@%07x" % i, "2026-09-29T00:00:00Z") for i in range(lm.MAX_PER_RUN + 2)]
+        saved = lm.MAX_PER_RUN
+        lm.MAX_PER_RUN = 1
+        try:
+            self.go(fake, cands)
+        finally:
+            lm.MAX_PER_RUN = saved
+        recs = {r["key"]: r for rs in fake.ledgers().values() for r in rs}
+        self.assertIn(recs["o/r@abcde35"]["verdict"], ("secret", "judged"))
+
+    def test_untried_migration_does_not_use_up_attempts(self):  # 確認役の却下（上限で見送った分）
+        old = dict(self.OLD, key="o/r@abcde38", sha="abcde38", date="2026-09-30T00:00:00Z")
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month([old], "2026-09")}])
+        cands = [cand("o/r@abcde38", "2026-09-30T00:00:00Z")] + [cand("o/r@%07x" % i, "2026-09-29T00:00:00Z") for i in range(3)]
+        saved = lm.MAX_PER_RUN
+        lm.MAX_PER_RUN = 0
+        try:
+            for _ in range(lm.MIGRATE_MAX_ATTEMPTS + 1):
+                self.go(fake, cands)
+        finally:
+            lm.MAX_PER_RUN = saved
+        rec = [r for rs in fake.ledgers().values() for r in rs if r["key"] == "o/r@abcde38"][0]
+        self.assertEqual(rec["verdict"], "secret")
+        self.assertEqual(rec["rationale"], lm.OLD_SECRET_RATIONALE)  # 試していないので、打ち切らない
+        self.assertFalse(rec.get("attempts"))
+
+    def test_refetched_but_unjudged_migration_counts_as_tried(self):  # 確認役の却下（取り直しは成功、判定は見送り）
+        old = dict(self.OLD, key="o/r@abcde39", sha="abcde39", pr=39, attempts=1)  # 新しい候補（0 回）が先に選ばれる
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
+        fake.api = {"api repos/o/r/pulls/39": json.dumps({"title": "fix: x", "body": "", "merged_at": "2026-08-01T00:00:00Z",
+                                                          "merge_commit_sha": "abcde39", "base": {"ref": "main"}}),
+                    "api --paginate --slurp repos/o/r/pulls/39/files?per_page=100": json.dumps([[{"filename": "a.js"}]]),
+                    "pr diff 39 -R o/r": "+x",
+                    "api repos/o/r/pulls/10": json.dumps({"title": "feat", "merged_at": "2026-07-25T00:00:00Z", "base": {"ref": "main"}}),
+                    "api --paginate --slurp repos/o/r/pulls/10/files?per_page=100": json.dumps([[{"filename": "a.js"}]]),
+                    "pr diff 10 -R o/r": "+y"}
+        new = [cand("o/r@%07x" % i, "2026-09-29T00:00:00Z") for i in range(3)]
+        saved = lm.MAX_PER_RUN
+        lm.MAX_PER_RUN = 1
+        try:
+            self.go(fake, new)
+        finally:
+            lm.MAX_PER_RUN = saved
+        rec = [r for rs in fake.ledgers().values() for r in rs if r["key"] == "o/r@abcde39"][0]
+        self.assertEqual(rec["verdict"], "secret")
+        self.assertEqual(rec.get("attempts"), 2)
+
+    def test_no_api_key_does_not_migrate(self):  # ゲートの指摘（キーが無いと試したことに数える）
+        old = dict(self.OLD, key="o/r@abcde40", sha="abcde40", date="2026-09-30T00:00:00Z")
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month([old], "2026-09")}])
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+        for _ in range(lm.MIGRATE_MAX_ATTEMPTS + 1):
+            self.go(fake, [cand("o/r@abcde40", "2026-09-30T00:00:00Z")])
+        rec = fake.ledgers()["[漏れの記録] 2026-09"][0]
+        self.assertEqual((rec["verdict"], rec["rationale"]), ("secret", lm.OLD_SECRET_RATIONALE))
+        self.assertFalse(rec.get("attempts"))
+
+    def test_migration_is_retried_up_to_three_times(self):  # Devin（一時的な失敗で打ち切らない）
+        gone = dict(self.OLD, key="o/r@abcde37", sha="abcde37")
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([gone], "2026-08")}])
+        lm.gh = fake
+        lm.collect = lambda owner, exclude, skip=frozenset(): ([], [])
+        args = lm.argparse.Namespace(owner="o", ledger="o/ledger", exclude="", dry_run=False)
+        seen = []
+        for _ in range(4):
+            lm.run(args)
+            rec = [r for rs in fake.ledgers().values() for r in rs if r["key"] == "o/r@abcde37"][0]
+            seen.append((rec["verdict"], rec["rationale"] == lm.OLD_SECRET_RATIONALE, rec.get("attempts")))
+        self.assertEqual([v for v, _, _ in seen], ["secret"] * 4)
+        self.assertEqual([o for _, o, _ in seen], [True, True, False, False])  # 3 回目で打ち切る
+        self.assertEqual(seen[0][2], 1)
+
+    def test_restored_secret_is_not_migrated_again(self):  # ゲートの指摘（試した回数が増えず、毎回取り直す）
+        gone = dict(self.OLD, key="o/r@abcde36", sha="abcde36")
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([gone], "2026-08")}])
+        lm.gh = fake
+        lm.collect = lambda owner, exclude, skip=frozenset(): ([], [])
+        args = lm.argparse.Namespace(owner="o", ledger="o/ledger", exclude="", dry_run=False)
+        for _ in range(lm.MIGRATE_MAX_ATTEMPTS):
+            lm.run(args)
+        n = len([c for c in fake.calls if c[:2] == ("api", "repos/o/r")])
+        rec = [r for rs in fake.ledgers().values() for r in rs if r["key"] == "o/r@abcde36"]
+        lm.run(args)
+        self.assertEqual(len([c for c in fake.calls if c[:2] == ("api", "repos/o/r")]), n)  # 上限の後は取り直さない
+        self.assertTrue(rec and rec[0]["verdict"] == "secret")
+
+    def test_error_cleanup_matches_whole_long_key_only(self):  # ゲートの指摘（切ったキーで別の記録まで消す）
+        k1 = "o/" + "r" * 97 + "@" + "a" * 40
+        k2 = "o/" + "r" * 97 + "@" + "b" * 40
+        errs = ["台帳の記録のリポジトリが対象外なので取り直さない: %s" % k1, "台帳の記録のリポジトリが対象外なので取り直さない: %s" % k2]
+        self.assertEqual(lm.drop_errors_of(errs, [k1]), [errs[1]])
+
+    def test_error_cleanup_matches_whole_key(self):  # ゲートの Low
+        errs = ["o/r@abc: 取り直しに失敗: x", "o/r@abcdef: 取り直しに失敗: y"]
+        self.assertEqual(lm.drop_errors_of(errs, ["o/r@abc"]), ["o/r@abcdef: 取り直しに失敗: y"])
+
+    def test_unrefetchable_old_secret_stays_secret(self):  # ゲートの指摘 2
+        gone = dict(self.OLD, key="o/r@abcde32", sha="abcde32")
+        excl = dict(self.OLD, key="o/skip@abcde33", repo="o/skip", sha="abcde33")
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([gone, excl], "2026-08")}])
+        lm.gh = fake
+        lm.collect = lambda owner, exclude, skip=frozenset(): ([], [])
+        rc = lm.run(lm.argparse.Namespace(owner="o", ledger="o/ledger", exclude="skip", dry_run=False))
+        recs = {r["key"]: r for r in fake.ledgers()["[漏れの記録] 2026-08"]}
+        self.assertEqual(recs["o/r@abcde32"]["verdict"], "secret")   # 取り直しに失敗したら secret に戻す
+        self.assertEqual(recs["o/skip@abcde33"]["verdict"], "secret")  # 除外したリポジトリは戻さない
+        self.assertFalse(recs["o/r@abcde32"].get("refetch_failures"))
+        self.assertEqual(rc, 0)  # 移し替えの失敗で赤くしない
+
+    def test_old_whole_candidate_secret_is_judged_again(self):  # 古い方式で secret にした記録は、判定し直す
+        old = {"key": "o/r@abcde30", "repo": "o/r", "kind": "fix", "sha": "abcde30", "date": "2026-09-30T00:00:00Z",
+               "message": "fix: x", "verdict": "secret", "serious": False, "suspects": [10],
+               "rationale": "差分に秘密情報（のファイル・形）を含むので、AI に送らずに判定しない"}
+        keep = dict(old, key="o/r@abcde31", sha="abcde31", rationale="題名か変更ファイルに秘密情報（のファイル・形）を含むので、AI に送らずに判定しない")
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month([old, keep], "2026-09")}])
+        self.go(fake, [cand("o/r@abcde30", "2026-09-30T00:00:00Z"), cand("o/r@abcde31", "2026-09-30T00:00:00Z")])
+        recs = {r["key"]: r for r in fake.ledgers()["[漏れの記録] 2026-09"]}
+        self.assertEqual(recs["o/r@abcde30"]["verdict"], "judged")
+        self.assertEqual(recs["o/r@abcde31"]["verdict"], "secret")
 
 
 if __name__ == "__main__":

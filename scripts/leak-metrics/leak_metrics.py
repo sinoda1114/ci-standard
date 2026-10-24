@@ -253,6 +253,16 @@ def redact(text):
     return t
 
 
+def git_path(prefix, name):
+    """git と同じく、制御文字（改行など）・引用符・バックスラッシュを含むパスは引用符で囲んでエスケープする
+    （ファイル名の改行で、偽の diff --git の見出しを作らせない）"""
+    if not re.search(r'[\x00-\x1f\x7f"\\]', name):
+        return prefix + name
+    esc = "".join({"\\": "\\\\", '"': '\\"', "\n": "\\n", "\t": "\\t", "\r": "\\r"}.get(ch)
+                  or ("\\%03o" % ord(ch) if ord(ch) < 0x20 or ord(ch) == 0x7f else ch) for ch in name)
+    return '"%s%s"' % (prefix, esc)
+
+
 def commit_diff(entries):
     """コミットの変更ファイルの patch を、ファイルごとに diff --git の見出しを付けて連結する。名前を変えたファイルは
     変更前のパスも見出しに入れる（秘密情報のファイルを見分けられるように）"""
@@ -261,7 +271,8 @@ def commit_diff(entries):
         if isinstance(f, dict):
             name = f.get("filename") or ""
             old = f.get("previous_filename") or name
-            head = "diff --git a/%s b/%s\n" % (old, name) + ("rename from %s\nrename to %s\n" % (old, name) if old != name else "")
+            head = ("diff --git %s %s\n" % (git_path("a/", old), git_path("b/", name))
+                    + ("rename from %s\nrename to %s\n" % (git_path("", old), git_path("", name)) if old != name else ""))
             parts.append(head + f.get("patch", ""))
     return "\n".join(parts)
 
@@ -296,9 +307,93 @@ def first_line(text):
     return lines[0] if lines else ""
 
 
+RESTORED_SECRET_RATIONALE = "古い方式で秘密情報の疑いとして送らなかった（今の方式でも判定まで進めなかった）"
+OLD_SECRET_RATIONALE = "差分に秘密情報（のファイル・形）を含むので、AI に送らずに判定しない"  # 2026-10-24 より前の方式の理由
+WITHHELD_MARK = "（秘密情報の疑いがあるので、中身は送らない"
+
+
+def withhold_secret_files(text, split=True):
+    """差分をファイルごと（diff --git の区切り）に分け、秘密情報の疑いがあるファイルは中身を外してパスだけ残す。
+    見出しの無い部分に疑いがあれば、その部分を丸ごと外す。戻り値: (送ってよい文, 外したパスの一覧)。
+    split=False は差分でない文（Issue の本文）用で、区切らずに丸ごと調べる（本文に書いた diff --git の行で、
+    区切りに見せかけさせない。本物の差分では、中身の行は + - 空白で始まるので、diff --git で始まる行は見出しだけ）"""
+    out, withheld = [], []
+    for part in (re.split(r"(?m)^(?=diff --git )", str(text or "")) if split else [str(text or "")]):
+        if not part or not has_secret(part):
+            out.append(part)
+            continue
+        if split and part.startswith("diff --git "):
+            head = part.split("\n", 1)[0]
+            m = re.fullmatch(r"diff --git a/([\w./ -]+) b/([\w./ -]+)", head)
+            # パスは、見出しが単純な形（引用符やエスケープの無いパス）で、疑いも無いときだけ書く
+            # （見出しの中に書かれた偽の「 b/」で切り出させない）
+            path = m.group(2) if m and m.group(1) == m.group(2) and not has_secret(m.group(2)) else "（パスは省く）"
+            out.append("%s: %s）\n" % (WITHHELD_MARK, path))
+            withheld.append(path)
+        else:
+            out.append("%s: この部分）\n" % WITHHELD_MARK)
+            withheld.append("（見出しの無い部分）")
+    return "".join(out), withheld
+
+
+SECRET_VALUE_TOKEN_RE = re.compile(r"""['"]([^'"\n]{6,})['"]|([^\s'"`,;()\[\]{}<>]{6,})""")
+
+
+SECRET_VALUE_MAX = 200  # 照合に使う値の長さの上限
+
+
+def withheld_values(text, split=True):
+    """外した部分の、キーワードへの代入の値と決まった形の鍵（ほかの場所に書かれていないかを確かめるため）。
+    この照合はベストエフォート（ユーザーの判断 2026-10-24）。当たった行そのものは送らないが、同じ値を別のファイルに
+    キーワード無しで書いた場合、次の形は拾えないことがある:
+    - 5 文字以下の値、次の行以降に書いた値（YAML の複数行など）
+    - 値の後ろにコメントなどが続く行（行の終わりまでを値として照合するため、値だけの再掲と一致しない）
+    - 1 行に SECRET_KEYS_PER_LINE を超えて並ぶ代入の値
+    当たった行の近くの語を全部照合すると、普通のコードの語が当たって、ほぼ判定できなくなるため、ここで止めている"""
+    vals = set()
+    for part in (re.split(r"(?m)^(?=diff --git )", str(text or "")) if split else [str(text or "")]):
+        if not part or not has_secret(part):
+            continue
+        vals.update(m.group(0) for m in SECRET_RE.finditer(part))
+        line_end, seen = -1, 0
+        for m in SECRET_KEY_RE.finditer(part):
+            if m.start() > line_end:
+                line_end = part.find("\n", m.start())
+                line_end = len(part) if line_end < 0 else line_end
+                seen = 0
+            a = SECRET_ASSIGN_RE.match(part, m.end())
+            if not a or seen >= SECRET_KEYS_PER_LINE:  # 1 行で見る代入の数に上限（同じ行の長い残りを何度も取らない）
+                continue
+            seen += 1
+            v = SECRET_VALUE_TOKEN_RE.search(part, a.end(), max(line_end, a.end()))
+            if v:
+                vals.add(v.group(1) or v.group(2))
+            # 空白を含む値も丸ごと照合する: 代入の後ろから行の終わりまで（長さに上限）を、引用符と区切りを外して使う
+            seg = part[a.end():min(line_end, a.end() + SECRET_VALUE_MAX)]
+            rhs = seg.strip().strip("'\"`,;)").strip()
+            if len(rhs) >= 6:
+                vals.add(rhs)
+            # 型や式の後ろの値も拾う（apiKey: string = "…"、process.env.T || "…"）: = || ?? or の直後の引用符の文字列
+            vals.update(q.group(1) for q in re.finditer(r"""(?:=|\|\||\?\?|\bor)\s*['"`]([^'"`\n]{6,})['"`]""", seg))
+    return vals
+
+
+def cross_check_values(vals):
+    """ほかの場所との照合に使う値。数字も記号も無い 16 文字未満の英字だけの値（型の名前 string など）は外す
+    （ユーザーの判断 2026-10-24。そういう値は秘密としても弱く、照合すると普通のコードのほとんどが当たる）"""
+    return {v for v in vals if not re.fullmatch(r"[A-Za-z]{1,15}", v)}
+
+
+def only_withheld(text):
+    """外したあとの文に、外した印のほかに何も残っていないか"""
+    return not [l for l in str(text or "").splitlines() if l.strip() and not l.startswith(WITHHELD_MARK)]
+
+
 def secret_files(files):
-    """API から取った生のパスの一覧に、秘密情報のファイルがあるか（差分の見出しの書き方に左右されない）"""
-    return any(isinstance(f, str) and SECRET_PATH_RE.search(f) for f in files or [])
+    """API から取った生のパスの一覧に、秘密情報のファイルがあるか、パスそのものが秘密情報の疑いの形か
+    （差分の見出しの書き方・エスケープに左右されない）"""
+    names = [f for f in files or [] if isinstance(f, str)]
+    return any(SECRET_PATH_RE.search(f) for f in names) or has_secret("\n".join(names))
 
 
 def file_names(entries):
@@ -342,6 +437,37 @@ def base_record(c, why=""):
     return rec
 
 
+def secret_file_header(diff):
+    """差分の見出しの行（diff --git・---・+++・rename）に、秘密情報のファイルの名前があるか（files の一覧が無い経路でも）"""
+    return any(SECRET_NAME_RE.search(m.group(0)) for m in DIFF_PATH_LINE_RE.finditer(str(diff or "")))
+
+
+MIGRATE_MAX_ATTEMPTS = 3  # 古い secret の移し替えを試す回数（一時的な失敗で打ち切らない。毎回いちばん先に試し続けもしない）
+
+
+def restore_migrated(orig, tried=True):
+    """移し替えた記録を、判定まで進めなかったので secret に戻す。実際に試したとき（取り直し・判定）だけ、試した回数
+    （attempts）を 1 増やし、MIGRATE_MAX_ATTEMPTS に達したら理由の文を変えて、それ以降は移し替えない。
+    件数・時間の上限で見送っただけなら、そのまま戻す（試していない分で打ち切らない）。
+    既知の限界（ユーザーの判断 2026-10-24）: 回数は、もとからある attempts で数える（台帳の欄を増やさないため）。
+    そのため、前に未判定だったことのある記録は、3 回より早く打ち切られ、元の secret のまま残る"""
+    if not tried:
+        return orig
+    att = int(orig.get("attempts") or 0) + 1
+    return dict(orig, attempts=att, **({"rationale": RESTORED_SECRET_RATIONALE} if att >= MIGRATE_MAX_ATTEMPTS else {}))
+
+
+def drop_errors_of(errors, keys):
+    """記録の key に結び付いた取得の失敗だけを消す（部分一致で、名前の似た別の記録の失敗を消さない）"""
+    return [e for e in errors if not any(e.startswith(k + ":") or e.endswith(": " + k) for k in keys)]
+
+
+def secret_record(rec, why):
+    rec["verdict"] = "secret"
+    rec["rationale"] = why
+    return rec
+
+
 def judge(c, api, has_key):
     rec = base_record(c)
     if c.get("incomplete"):  # 材料が欠けたまま判定しない。候補が無くても確定させない（次回に取り直す）
@@ -350,16 +476,34 @@ def judge(c, api, has_key):
     if not c["suspects"]:
         rec["verdict"] = "no-suspect"
         return rec
-    # 秘密情報を見つけたら、伏せて送るのではなく、送らない（正規表現で伏せきることはできないため。判定はしないで確定する）
-    if (secret_files(c.get("files")) or has_secret(c.get("diff")) or has_secret(c.get("message_full", c.get("message")))
-            or any(secret_files(s.get("files")) or has_secret(s.get("diff")) or has_secret(s.get("title")) for s in c["suspects"])):
-        rec["verdict"] = "secret"
-        rec["rationale"] = "差分に秘密情報（のファイル・形）を含むので、AI に送らずに判定しない"
-        return rec
+    # 秘密情報の疑いがあるものは、伏せて送るのではなく、送らない（正規表現で伏せきることはできないため）。
+    # 題名と、秘密情報のファイル（.env・鍵など）を含む候補は丸ごと送らない。差分は、疑いのあるファイルだけ中身を外し、
+    # 残りで判定する（ユーザーの判断 2026-10-24）。修正の差分が全部外れたら、材料が無いので判定せずに確定する
+    if (secret_files(c.get("files")) or has_secret(c.get("message_full", c.get("message")))
+            or secret_file_header(c.get("diff")) or any(secret_file_header(s.get("diff")) for s in c["suspects"])
+            or any(secret_files(s.get("files")) or has_secret(s.get("title")) for s in c["suspects"])):
+        return secret_record(rec, "題名か変更ファイルに秘密情報（のファイル・形）を含むので、AI に送らずに判定しない")
+    fix_diff, withheld = withhold_secret_files(c.get("diff"), split=c.get("kind") != "issue")
+    if withheld and only_withheld(fix_diff):
+        return secret_record(rec, "修正の差分がすべて秘密情報の疑いのあるファイルなので、AI に送らずに判定しない")
+    c2 = dict(c, diff=fix_diff, suspects=[dict(s, diff=withhold_secret_files(s.get("diff"))[0]) for s in c["suspects"]])
+    # 外した値が、残りの材料（別のファイル・題名）にキーワード無しで書かれていれば、候補ごと送らない
+    vals = withheld_values(c.get("diff"), split=c.get("kind") != "issue")
+    for s in c["suspects"]:
+        vals |= withheld_values(s.get("diff"))
+    rest = "\n".join([c2.get("diff") or "", str(c.get("message") or "")]
+                     + [(s.get("diff") or "") + "\n" + str(s.get("title") or "") for s in c2["suspects"]])
+    if any(v in rest for v in cross_check_values(vals)):
+        return secret_record(rec, "外した秘密情報の疑いの値が、ほかの場所にも書かれているので、AI に送らずに判定しない")
+    c = c2
+    prompt = build_prompt(c)
+    # 最後の守り: 外した後の材料（伏せ字をかける前）と、組み立てたプロンプトに疑いが残っていれば送らない
+    # （伏せ字で疑いが消えて見えても、伏せきれていない値が残ることがあるので、伏せ字の前で確かめる）
+    if any(has_secret(x) for x in [c.get("diff")] + [s.get("diff") for s in c["suspects"]]) or has_secret(prompt):
+        return secret_record(rec, "送る文に秘密情報の疑いが残ったので、AI に送らずに判定しない")
     if not has_key:
         rec["rationale"] = "API キーが無い"
         return rec
-    prompt = build_prompt(c)
     final = None
     for model in (STAGE1_MODEL, STAGE2_MODEL):
         try:
@@ -886,7 +1030,7 @@ def _refetch(live, owner, exclude, errors, out, failed, started):
             info = repo_info(repo)  # 台帳の値だけで取り直す先を決めない: 今の持ち主のもので、アーカイブされていないこと
             if ((info.get("owner") or {}).get("login") or "").lower() != owner.lower() or info.get("archived"):
                 if counts:
-                    errors.append("台帳の記録のリポジトリが対象外なので取り直さない: %s" % str(r.get("key"))[:100])
+                    errors.append("台帳の記録のリポジトリが対象外なので取り直さない: %s" % r["key"])  # valid_record を通ったキーなので切らない
                 failed.append(r["key"])
                 continue
             if r["kind"] == "issue":
@@ -1080,20 +1224,34 @@ def run(a):
     exclude = set(a.exclude.split(",")) | {a.ledger.split("/")[1]}
     known, slots = load_ledger(list_issues(a.ledger))  # 読めない台帳があれば止める（上書きで消さない）
     normalized = set()  # 古い基準（unclear も重大）で書いた記録を今の基準に合わせ、その月を保存し直す
+    migrated = {}       # 古い方式の secret から未判定に戻した記録（元の記録）
+    has_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
     for k, r in list(known.items()):
         if r.get("serious") and r.get("is_leak") == "unclear":
             known[k] = dict(r, serious=False)
             normalized.add(month_of(known[k], now))
+        if (r.get("verdict") == "secret" and r.get("rationale") == OLD_SECRET_RATIONALE and has_key
+                and valid_record(r, a.owner, exclude)):  # キーが無い実行では移し替えない（試せないので、回数も減らさない）
+            # 古い方式（疑いが 1 か所でもあれば候補を丸ごと送らない）で確定した記録は、ファイルごとに外す今の方式で判定し直す。
+            # 取り直せる記録だけ（除外したリポジトリなどは戻さない）。取り直しに失敗したら、元の secret に戻す
+            migrated[k] = known[k]  # 上の合わせ込み（unclear の重大）の後の記録を覚える
+            known[k] = dict(r, verdict="unjudged")
     done = {k for k, r in known.items() if r.get("verdict") in ("judged", "no-suspect", "secret")}
     cands, errors = collect(a.owner, exclude, done)
     stale = [r for r in known.values() if r.get("verdict") == "unjudged" and r["key"] not in {c["key"] for c in cands}]
     again, failed = refetch(stale, a.owner, exclude, errors)  # 窓から外れた未判定も判定し直す
     cands += again
+    refetched = {c["key"] for c in again}
+    back = [k for k in failed if k in migrated]  # 移し替えの記録を取り直せなかった: 元の secret に戻し、失敗に数えない
+    for k in back:
+        known[k] = restore_migrated(migrated[k])
+        normalized.add(month_of(known[k], now))
+    errors[:] = drop_errors_of(errors, back)
+    failed = [k for k in failed if k not in migrated]
     for k in failed:  # 取り直せなかったものも試した回数に数え、次回は他の記録に順番を回す
         known[k] = dict(known[k], attempts=int(known[k].get("attempts") or 0) + 1,
                         refetch_failures=int(known[k].get("refetch_failures") or 0) + 1)
     todo = prioritize(pending(cands, list(known.values())), list(known.values()))
-    has_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
     new, skipped = [], set()
     for c in todo[:MAX_PER_RUN]:
         if monotonic() - started > MAX_JUDGE_SECONDS:
@@ -1120,6 +1278,14 @@ def run(a):
         if r["verdict"] == "unjudged" and old.get("refetch_failures"):  # まだ未判定なら、取り直しの失敗の回数も引き継ぐ
             r["refetch_failures"] = old["refetch_failures"]
         known[r["key"]] = r
+    for k, orig in migrated.items():
+        # 移し替えた記録が、今回の方式でも判定まで進めなかったら（材料が欠けた・上限で見送った・取り直せないなど、
+        # どの経路でも）、元の secret に戻す
+        if known[k].get("verdict") == "unjudged":
+            # 取り直しに成功した（判定は見送った）ときも、試したと数える（同じ記録が取り直しの枠を占め続けないように）
+            tried = k in refetched or (k in {r["key"] for r in new} and k not in skipped)
+            known[k] = restore_migrated(orig, tried=tried)
+            normalized.add(month_of(known[k], now))
     # このログは公開リポジトリの Actions に出るので、件数の合計だけを出す（重大の件数・リポジトリ名は台帳にだけ残す）
     print("候補 %d / 今回判定 %d / 未判定 %d / 取得失敗 %d" % (
         len(cands), sum(1 for r in new if r["verdict"] != "unjudged"), sum(1 for r in new if r["verdict"] == "unjudged"), len(errors)))
