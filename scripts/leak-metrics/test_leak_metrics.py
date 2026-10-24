@@ -1739,6 +1739,25 @@ class SecretsPerFile(unittest.TestCase):
         out = lm.judge(dict(self.cand(), suspects=sus), api=lambda m, p: self.fail("送った"), has_key=True)
         self.assertEqual(out["verdict"], "secret")
 
+    def test_withheld_value_reused_elsewhere_blocks_the_candidate(self):  # ゲートの指摘 1
+        sus = ("diff --git a/config/app.yml b/config/app.yml\n+  password: hunter2-prod-pass\n"
+               "diff --git a/src/a.js b/src/a.js\n+  client.login(\"hunter2-prod-pass\")\n")
+        out = lm.judge(self.cand(sus=sus), api=lambda m, p: self.fail("送った"), has_key=True)
+        self.assertEqual(out["verdict"], "secret")
+        fix = "diff --git a/src/b.js b/src/b.js\n+  use('hunter2-prod-pass')\n"
+        sus2 = "diff --git a/config/app.yml b/config/app.yml\n+  password: hunter2-prod-pass\n"
+        out = lm.judge(self.cand(diff=fix, sus=sus2), api=lambda m, p: self.fail("送った"), has_key=True)
+        self.assertEqual(out["verdict"], "secret")
+
+    def test_short_letters_only_value_is_not_cross_checked(self):  # ユーザーの判断 2026-10-24
+        sus = ("diff --git a/src/types.ts b/src/types.ts\n+  token: string\n"
+               "diff --git a/src/a.ts b/src/a.ts\n+  const name: string = \"x\"\n")
+        sent = []
+        out = lm.judge(self.cand(sus=sus), api=lambda m, p: sent.append(p) or MINOR, has_key=True)
+        self.assertEqual(out["verdict"], "judged")
+        self.assertNotIn("string", lm.cross_check_values(lm.withheld_values(sus)))
+        self.assertIn("hunter2", lm.cross_check_values({"hunter2", "abcdefghijklmnopq"}))  # 数字あり・16 文字以上は照合する
+
     def test_final_guard_blocks_a_prompt_that_still_looks_secret(self):
         saved = lm.build_prompt
         lm.build_prompt = lambda c: saved(c) + '\npassword = "leftover"'
@@ -1750,6 +1769,22 @@ class SecretsPerFile(unittest.TestCase):
 
 
 class SecretsPerFileMigrate(Run):
+    OLD = {"repo": "o/r", "kind": "fix", "date": "2026-08-01T00:00:00Z", "message": "fix: x", "verdict": "secret",
+           "serious": False, "suspects": [10], "rationale": "差分に秘密情報（のファイル・形）を含むので、AI に送らずに判定しない"}
+
+    def test_unrefetchable_old_secret_stays_secret(self):  # ゲートの指摘 2
+        gone = dict(self.OLD, key="o/r@abcde32", sha="abcde32")
+        excl = dict(self.OLD, key="o/skip@abcde33", repo="o/skip", sha="abcde33")
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([gone, excl], "2026-08")}])
+        lm.gh = fake
+        lm.collect = lambda owner, exclude, skip=frozenset(): ([], [])
+        rc = lm.run(lm.argparse.Namespace(owner="o", ledger="o/ledger", exclude="skip", dry_run=False))
+        recs = {r["key"]: r for r in fake.ledgers()["[漏れの記録] 2026-08"]}
+        self.assertEqual(recs["o/r@abcde32"]["verdict"], "secret")   # 取り直しに失敗したら secret に戻す
+        self.assertEqual(recs["o/skip@abcde33"]["verdict"], "secret")  # 除外したリポジトリは戻さない
+        self.assertFalse(recs["o/r@abcde32"].get("refetch_failures"))
+        self.assertEqual(rc, 0)  # 移し替えの失敗で赤くしない
+
     def test_old_whole_candidate_secret_is_judged_again(self):  # 古い方式で secret にした記録は、判定し直す
         old = {"key": "o/r@abcde30", "repo": "o/r", "kind": "fix", "sha": "abcde30", "date": "2026-09-30T00:00:00Z",
                "message": "fix: x", "verdict": "secret", "serious": False, "suspects": [10],

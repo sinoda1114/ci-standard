@@ -335,6 +335,36 @@ def withhold_secret_files(text, split=True):
     return "".join(out), withheld
 
 
+SECRET_VALUE_TOKEN_RE = re.compile(r"""['"]([^'"\n]{6,})['"]|([^\s'"`,;()\[\]{}<>]{6,})""")
+
+
+def withheld_values(text, split=True):
+    """外した部分の、キーワードへの代入の値と決まった形の鍵（ほかの場所に書かれていないかを確かめるため）"""
+    vals = set()
+    for part in (re.split(r"(?m)^(?=diff --git )", str(text or "")) if split else [str(text or "")]):
+        if not part or not has_secret(part):
+            continue
+        vals.update(m.group(0) for m in SECRET_RE.finditer(part))
+        line_end = -1
+        for m in SECRET_KEY_RE.finditer(part):
+            if m.start() > line_end:
+                line_end = part.find("\n", m.start())
+                line_end = len(part) if line_end < 0 else line_end
+            a = SECRET_ASSIGN_RE.match(part, m.end())
+            if not a:
+                continue
+            v = SECRET_VALUE_TOKEN_RE.search(part, a.end(), max(line_end, a.end()))
+            if v:
+                vals.add(v.group(1) or v.group(2))
+    return vals
+
+
+def cross_check_values(vals):
+    """ほかの場所との照合に使う値。数字も記号も無い 16 文字未満の英字だけの値（型の名前 string など）は外す
+    （ユーザーの判断 2026-10-24。そういう値は秘密としても弱く、照合すると普通のコードのほとんどが当たる）"""
+    return {v for v in vals if not re.fullmatch(r"[A-Za-z]{1,15}", v)}
+
+
 def only_withheld(text):
     """外したあとの文に、外した印のほかに何も残っていないか"""
     return not [l for l in str(text or "").splitlines() if l.strip() and not l.startswith(WITHHELD_MARK)]
@@ -411,7 +441,16 @@ def judge(c, api, has_key):
     fix_diff, withheld = withhold_secret_files(c.get("diff"), split=c.get("kind") != "issue")
     if withheld and only_withheld(fix_diff):
         return secret_record(rec, "修正の差分がすべて秘密情報の疑いのあるファイルなので、AI に送らずに判定しない")
-    c = dict(c, diff=fix_diff, suspects=[dict(s, diff=withhold_secret_files(s.get("diff"))[0]) for s in c["suspects"]])
+    c2 = dict(c, diff=fix_diff, suspects=[dict(s, diff=withhold_secret_files(s.get("diff"))[0]) for s in c["suspects"]])
+    # 外した値が、残りの材料（別のファイル・題名）にキーワード無しで書かれていれば、候補ごと送らない
+    vals = withheld_values(c.get("diff"), split=c.get("kind") != "issue")
+    for s in c["suspects"]:
+        vals |= withheld_values(s.get("diff"))
+    rest = "\n".join([c2.get("diff") or "", str(c.get("message") or "")]
+                     + [(s.get("diff") or "") + "\n" + str(s.get("title") or "") for s in c2["suspects"]])
+    if any(v in rest for v in cross_check_values(vals)):
+        return secret_record(rec, "外した秘密情報の疑いの値が、ほかの場所にも書かれているので、AI に送らずに判定しない")
+    c = c2
     prompt = build_prompt(c)
     # 最後の守り: 外した後の材料（伏せ字をかける前）と、組み立てたプロンプトに疑いが残っていれば送らない
     # （伏せ字で疑いが消えて見えても、伏せきれていない値が残ることがあるので、伏せ字の前で確かめる）
@@ -1140,19 +1179,27 @@ def run(a):
     exclude = set(a.exclude.split(",")) | {a.ledger.split("/")[1]}
     known, slots = load_ledger(list_issues(a.ledger))  # 読めない台帳があれば止める（上書きで消さない）
     normalized = set()  # 古い基準（unclear も重大）で書いた記録を今の基準に合わせ、その月を保存し直す
+    migrated = {}       # 古い方式の secret から未判定に戻した記録（元の記録）
     for k, r in list(known.items()):
         if r.get("serious") and r.get("is_leak") == "unclear":
             known[k] = dict(r, serious=False)
             normalized.add(month_of(known[k], now))
-        if r.get("verdict") == "secret" and r.get("rationale") == OLD_SECRET_RATIONALE:
-            # 古い方式（疑いが 1 か所でもあれば候補を丸ごと送らない）で確定した記録は、ファイルごとに外す今の方式で判定し直す
+        if (r.get("verdict") == "secret" and r.get("rationale") == OLD_SECRET_RATIONALE
+                and valid_record(r, a.owner, exclude)):
+            # 古い方式（疑いが 1 か所でもあれば候補を丸ごと送らない）で確定した記録は、ファイルごとに外す今の方式で判定し直す。
+            # 取り直せる記録だけ（除外したリポジトリなどは戻さない）。取り直しに失敗したら、元の secret に戻す
+            migrated[k] = r
             known[k] = dict(r, verdict="unjudged")
-            normalized.add(month_of(known[k], now))
     done = {k for k, r in known.items() if r.get("verdict") in ("judged", "no-suspect", "secret")}
     cands, errors = collect(a.owner, exclude, done)
     stale = [r for r in known.values() if r.get("verdict") == "unjudged" and r["key"] not in {c["key"] for c in cands}]
     again, failed = refetch(stale, a.owner, exclude, errors)  # 窓から外れた未判定も判定し直す
     cands += again
+    back = [k for k in failed if k in migrated]  # 移し替えの記録を取り直せなかった: 元の secret に戻し、失敗に数えない
+    for k in back:
+        known[k] = migrated[k]
+    errors[:] = [e for e in errors if not any(k in e for k in back)]
+    failed = [k for k in failed if k not in migrated]
     for k in failed:  # 取り直せなかったものも試した回数に数え、次回は他の記録に順番を回す
         known[k] = dict(known[k], attempts=int(known[k].get("attempts") or 0) + 1,
                         refetch_failures=int(known[k].get("refetch_failures") or 0) + 1)
