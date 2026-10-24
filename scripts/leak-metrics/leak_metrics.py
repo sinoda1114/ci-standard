@@ -459,41 +459,29 @@ def restore_migrated(orig, tried=True):
     return dict(orig, attempts=att, **({"rationale": RESTORED_SECRET_RATIONALE} if att >= MIGRATE_MAX_ATTEMPTS else {}))
 
 
-def rekey_renamed(known, owner, exclude, now):
-    """名前を変えたリポジトリの記録を、今の名前（repo と key）に付け替える（Issue #28 の 1）。GitHub は古い名前で
-    問い合わせると今のリポジトリを返すので、その full_name を使う。持ち主が変わったもの・引き直せないものはそのまま。
-    同じ修正の記録が新旧の名前で 2 つあれば、判定の進んだほうを残し、通知済みの印はどちらかにあれば立てる
-    （[漏れ] Issue を立て直さない）。消したリポジトリ（404）は付け替えない。それ以外の失敗は例外のまま返す
-    （黙って飛ばすと、新しい名前で集めた候補と二重に判定・起票するので、その回は止める）。
-    戻り値: (付け替えた後の記録, 保存し直す月, 新しいキー → 古いキーの集合)"""
-    current = {}
-    for repo in sorted({r.get("repo") for r in known.values() if valid_record(r, owner, exclude)}):
-        tick()
-        try:
-            full = str(repo_info(repo).get("full_name") or "")
-        except Exception as e:
-            if "HTTP 404" in str(e):
-                continue
-            raise
-        if full and full.lower() != repo.lower() and full.split("/")[0].lower() == owner.lower():
-            current[repo] = full
-    if not current:
-        return known, set(), {}
-    rank = {"judged": 0, "no-suspect": 0, "secret": 0, "unjudged": 1}
-    out, months, aliases = {}, set(), {}
+def reconcile_renamed(known, cands, owner, now):
+    """名前を変えたリポジトリの記録を、集めた候補の名前（今の名前）に付け替える（Issue #28 の 1）。
+    集めた候補と同じ SHA の記録が、別の名前（同じ持ち主）で台帳にあれば、その記録の repo と key を候補のものに
+    付け替える（判定・通知済みの印などはそのまま）。新しい名前で二重に判定・起票しないため。API の問い合わせはしない。
+    既知の限界: 窓の外の記録は古い名前のまま残る（取り直しは GitHub の転送で通る）。Issue の候補（#番号）は SHA を
+    持たないので付け替えない。戻り値: (付け替えた後の記録, 保存し直す月, 新しいキー → 古いキーの集合)"""
+    by_sha = {}
     for k, r in known.items():
-        new = current.get(r.get("repo"))
-        if new:
-            months.add(month_of(r, now))
-            r = dict(r, repo=new, key=new + k[len(r["repo"]):])
-            aliases.setdefault(r["key"], set()).add(k)
-        key = r["key"] if new else k
-        if key in out:  # 新旧の名前の記録が重なった
-            a, b = out[key], r
-            keep = a if rank.get(a.get("verdict"), 2) <= rank.get(b.get("verdict"), 2) else b
-            months.update({month_of(a, now), month_of(b, now)})
-            r = dict(keep, notified=bool(a.get("notified") or b.get("notified")))
-        out[key] = r
+        if r.get("kind") in ("fix", "revert") and isinstance(r.get("sha"), str) and isinstance(r.get("repo"), str):
+            by_sha.setdefault(r["sha"], []).append(k)
+    out, months, aliases = dict(known), set(), {}
+    for c in cands:
+        k = c.get("key")
+        if c.get("kind") not in ("fix", "revert") or not k or k in out:
+            continue
+        olds = [o for o in by_sha.get(c.get("sha"), []) if o in out and o != k
+                and out[o]["repo"].split("/")[0].lower() == str(owner).lower()]
+        if not olds:
+            continue
+        r = out.pop(olds[0])
+        months.add(month_of(r, now))
+        out[k] = dict(r, repo=c["repo"], key=k)
+        aliases[k] = {olds[0]}
     return out, months, aliases
 
 
@@ -1261,6 +1249,17 @@ def save_months(ledger, records, slots, months, now):
                 slots.setdefault(month, {})[part] = int(url.rsplit("/", 1)[-1])
 
 
+def already_marked(r, done, aliases=None):
+    """[漏れ] Issue の目印がすでにあるか。名前を変える前のキーの目印とも照合する: この回に付け替えたもの（aliases）と、
+    修正のコミット（キーが @SHA で終わるもの）は SHA でも照合する（付け替えた回より後の再試行でも立て直さない）"""
+    if r["key"] in done or (aliases or {}).get(r["key"], set()) & done:
+        return True
+    if "@" in r["key"]:
+        sha = r["key"].rsplit("@", 1)[1]
+        return any(d.rsplit("@", 1)[-1] == sha for d in done if "@" in d)
+    return False
+
+
 def notify(ledger, records, errors, aliases=None):
     """重大で、まだ [漏れ] Issue を立てていない記録について起票する。立て終えたものだけ notified にする。
     失敗したものは notified にしないので、次回に起票し直す（目印で二重の起票を防ぐ）。変わった月を返す"""
@@ -1279,7 +1278,7 @@ def notify(ledger, records, errors, aliases=None):
     changed = []
     for r in pending_r:
         try:
-            if r["key"] not in done and not ((aliases or {}).get(r["key"], set()) & done):  # 名前を変える前のキーの目印とも照合
+            if not already_marked(r, done, aliases):
                 title, body = serious_issue(r)
                 gh("issue", "create", "-R", ledger, "--title", title, "--label", "type:fix", "--body-file", "-",
                    input_text=body)
@@ -1324,13 +1323,7 @@ def run(a):
     exclude = set(a.exclude.split(",")) | {a.ledger.split("/")[1]}
     known, slots = load_ledger(list_issues(a.ledger))  # 読めない台帳があれば止める（上書きで消さない）
     normalized = set()  # 古い基準（unclear も重大）で書いた記録を今の基準に合わせ、その月を保存し直す
-    try:  # 名前を変えたリポジトリの記録を付け替える。確かめられなければ、二重の判定・起票を避けて、その回は止める
-        with time_budget(MAX_REFETCH_SECONDS):
-            known, renamed_months, aliases = rekey_renamed(known, a.owner, exclude, now)
-    except (Exception, TimeBudget) as e:
-        print("リポジトリの名前を確かめられないので、今回は止めます（次回に再試行）: %s" % str(e)[:200], file=sys.stderr)
-        return 1
-    normalized |= renamed_months
+    aliases = {}  # 名前を付け替えた記録の、新しいキー → 古いキー（[漏れ] Issue の目印の照合に使う）
     migrated = {}       # 古い方式の secret から未判定に戻した記録（元の記録）
     has_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
     for k, r in list(known.items()):
@@ -1350,6 +1343,8 @@ def run(a):
             known[k] = dict(r, verdict="unjudged")
     done = {k for k, r in known.items() if r.get("verdict") in ("judged", "no-suspect", "secret")}
     cands, errors = collect(a.owner, exclude, done)
+    known, renamed_months, aliases = reconcile_renamed(known, cands, a.owner, now)  # 名前を変えたリポジトリの記録を付け替える
+    normalized |= renamed_months
     stale = [r for r in known.values() if r.get("verdict") == "unjudged" and r["key"] not in {c["key"] for c in cands}]
     again, failed = refetch(stale, a.owner, exclude, errors)  # 窓から外れた未判定も判定し直す
     refetch_failed = len(failed)  # 未判定の理由の内訳に出す（移し替えた記録の失敗も含める）
