@@ -459,6 +459,38 @@ def restore_migrated(orig, tried=True):
     return dict(orig, attempts=att, **({"rationale": RESTORED_SECRET_RATIONALE} if att >= MIGRATE_MAX_ATTEMPTS else {}))
 
 
+def rekey_renamed(known, owner, exclude, now):
+    """名前を変えたリポジトリの記録を、今の名前（repo と key）に付け替える（Issue #28 の 1）。GitHub は古い名前で
+    問い合わせると今のリポジトリを返すので、その full_name を使う。持ち主が変わったもの・引き直せないものはそのまま。
+    同じ修正の記録が新旧の名前で 2 つあれば、判定の進んだほうを残し、通知済みの印はどちらかにあれば立てる
+    （[漏れ] Issue を立て直さない）。戻り値: (付け替えた後の記録, 保存し直す月)"""
+    current = {}
+    for repo in sorted({r.get("repo") for r in known.values() if valid_record(r, owner, exclude)}):
+        try:
+            full = str(repo_info(repo).get("full_name") or "")
+        except Exception:
+            continue  # 引き直せなければ付け替えない（消したリポジトリなど）
+        if full and full.lower() != repo.lower() and full.split("/")[0].lower() == owner.lower():
+            current[repo] = full
+    if not current:
+        return known, set()
+    rank = {"judged": 0, "no-suspect": 0, "secret": 0, "unjudged": 1}
+    out, months = {}, set()
+    for k, r in known.items():
+        new = current.get(r.get("repo"))
+        if new:
+            months.add(month_of(r, now))
+            r = dict(r, repo=new, key=new + k[len(r["repo"]):])
+        key = r["key"] if new else k
+        if key in out:  # 新旧の名前の記録が重なった
+            a, b = out[key], r
+            keep = a if rank.get(a.get("verdict"), 2) <= rank.get(b.get("verdict"), 2) else b
+            months.update({month_of(a, now), month_of(b, now)})
+            r = dict(keep, notified=bool(a.get("notified") or b.get("notified")))
+        out[key] = r
+    return out, months
+
+
 def drop_errors_of(errors, keys):
     """記録の key に結び付いた取得の失敗だけを消す（部分一致で、名前の似た別の記録の失敗を消さない）"""
     return [e for e in errors if not any(e.startswith(k + ":") or e.endswith(": " + k) for k in keys)]
@@ -1284,6 +1316,8 @@ def run(a):
     exclude = set(a.exclude.split(",")) | {a.ledger.split("/")[1]}
     known, slots = load_ledger(list_issues(a.ledger))  # 読めない台帳があれば止める（上書きで消さない）
     normalized = set()  # 古い基準（unclear も重大）で書いた記録を今の基準に合わせ、その月を保存し直す
+    known, renamed_months = rekey_renamed(known, a.owner, exclude, now)  # 名前を変えたリポジトリの記録を付け替える
+    normalized |= renamed_months
     migrated = {}       # 古い方式の secret から未判定に戻した記録（元の記録）
     has_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
     for k, r in list(known.items()):

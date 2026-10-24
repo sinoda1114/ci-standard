@@ -315,6 +315,7 @@ def cand(key, date, suspects=(10,)):
 class Run(unittest.TestCase):
     def setUp(self):
         lm._BRANCH_NAMES.clear()
+        lm._REPO_INFO.clear()
         self.saved = (lm.gh, lm.collect, lm.anthropic_api, lm.utcnow, os.environ.get("ANTHROPIC_API_KEY"))
         os.environ["ANTHROPIC_API_KEY"] = "k"
         self.now = lm.dt.datetime(2026, 10, 1, 3, 0, tzinfo=lm.dt.timezone.utc)
@@ -765,6 +766,7 @@ class Collect(unittest.TestCase):
 
     def setUp(self):
         lm._BRANCH_NAMES.clear()
+        lm._REPO_INFO.clear()
         self.saved = (lm.gh, lm.utcnow)
         lm.utcnow = lambda: self.NOW
         self.calls = []
@@ -1621,17 +1623,19 @@ class PrBotsGate(Run):
                "message": "Revert", "verdict": "unjudged", "serious": False, "suspects": [], "pr": 28}
         fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month([old], "2026-08")}])
         fake.api = {"api repos/o/r": json.dumps({"full_name": "o/new-name", "owner": {"login": "o"}, "archived": False, "default_branch": "main"}),
-                    "api repos/o/r/pulls/28": json.dumps({"title": "Revert \"feat: y\"", "body": "Reverts o/old-name#12",
+                    "api repos/o/new-name/pulls/28": json.dumps({"title": "Revert \"feat: y\"", "body": "Reverts o/old-name#12",
                                                           "merged_at": "2026-08-01T00:00:00Z", "merge_commit_sha": "abcde28",
                                                           "base": {"ref": "main"}}),
-                    "api --paginate --slurp repos/o/r/pulls/28/files?per_page=100": json.dumps([[{"filename": "a.js"}]]),
-                    "pr diff 28 -R o/r": "-y",
+                    "api --paginate --slurp repos/o/new-name/pulls/28/files?per_page=100": json.dumps([[{"filename": "a.js"}]]),
+                    "pr diff 28 -R o/new-name": "-y",
                     "api repos/o/old-name": json.dumps({"full_name": "o/new-name", "owner": {"login": "o"}}),
-                    "api repos/o/r/pulls/12": json.dumps({"title": "feat: y", "merged_at": "2026-07-25T00:00:00Z", "base": {"ref": "main"}}),
-                    "api --paginate --slurp repos/o/r/pulls/12/files?per_page=100": json.dumps([[{"filename": "a.js"}]]),
-                    "pr diff 12 -R o/r": "+y"}
+                    "api repos/o/new-name/pulls/12": json.dumps({"title": "feat: y", "merged_at": "2026-07-25T00:00:00Z", "base": {"ref": "main"}}),
+                    "api --paginate --slurp repos/o/new-name/pulls/12/files?per_page=100": json.dumps([[{"filename": "a.js"}]]),
+                    "pr diff 12 -R o/new-name": "+y"}
+        fake.api["api repos/o/new-name"] = json.dumps({"full_name": "o/new-name", "owner": {"login": "o"}, "archived": False, "default_branch": "main"})
         self.go(fake, [])
         self.assertTrue([c for c in fake.calls if c[:3] == ("pr", "diff", "12")])
+        self.assertIn("o/new-name@abcde28", {r["key"] for rs in fake.ledgers().values() for r in rs})  # 記録も今の名前に付け替わる
 
     def test_missing_revert_ref_is_another_repo_but_5xx_is_not_decided(self):  # ゲートの指摘（404 は自分のリポジトリではない）
         msg = "Revert \"feat: y\"\n\nReverts x/gone#12"
@@ -2133,6 +2137,40 @@ class DefaultBranchRename(Run):
         lm._BRANCH_NAMES.clear()
         self.go(fake, [])
         self.assertTrue(self.judged)
+
+
+
+class RepoRename(Run):
+    """リポジトリの名前を変えたら、台帳の記録を今の名前に付け替える（Issue #28 の 1）"""
+    def rec(self, key, **kw):
+        repo, sha = key.split("@")
+        return dict({"key": key, "repo": repo, "kind": "fix", "sha": sha, "date": "2026-08-01T00:00:00Z", "message": "fix: x",
+                     "verdict": "judged", "serious": False, "suspects": [10]}, **kw)
+
+    def run_with(self, recs, api):
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-08", "body": lm.render_month(recs, "2026-08")}])
+        fake.api = api
+        self.go(fake, [])
+        return {r["key"]: r for rs in fake.ledgers().values() for r in rs}
+
+    def test_record_is_rekeyed_to_the_current_name(self):
+        got = self.run_with([self.rec("o/old@abcdef1")], {"api repos/o/old": json.dumps({"full_name": "o/new", "owner": {"login": "o"}})})
+        self.assertEqual(list(got), ["o/new@abcdef1"])
+        self.assertEqual(got["o/new@abcdef1"]["repo"], "o/new")
+
+    def test_duplicate_under_both_names_is_merged(self):
+        old = self.rec("o/old@abcdef2", serious=True, notified=True)
+        new = self.rec("o/new@abcdef2", verdict="unjudged")
+        got = self.run_with([old, new], {"api repos/o/old": json.dumps({"full_name": "o/new", "owner": {"login": "o"}}),
+                                         "api repos/o/new": json.dumps({"full_name": "o/new", "owner": {"login": "o"}})})
+        self.assertEqual(list(got), ["o/new@abcdef2"])
+        self.assertEqual(got["o/new@abcdef2"]["verdict"], "judged")
+        self.assertTrue(got["o/new@abcdef2"]["notified"])  # 通知済みを引き継ぐ（[漏れ] Issue を立て直さない）
+
+    def test_lookup_failure_or_other_owner_leaves_records(self):
+        got = self.run_with([self.rec("o/gone@abcdef3"), self.rec("o/moved@abcdef4")],
+                            {"api repos/o/moved": json.dumps({"full_name": "other/moved", "owner": {"login": "other"}})})
+        self.assertEqual(sorted(got), ["o/gone@abcdef3", "o/moved@abcdef4"])
 
 
 if __name__ == "__main__":
