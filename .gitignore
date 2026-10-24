@@ -3,3 +3,6 @@
 work-summary/
 __pycache__/
 *.pyc
+
+# ai-review skill output (local-only, not pushed)
+.review-reports/
