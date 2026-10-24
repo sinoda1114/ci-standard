@@ -479,15 +479,16 @@ def reconcile_renamed(known, cands, owner, now):
     新しい名前で二重に判定・起票しないため。SHA が同じというだけでは付け替えない（同じ履歴を持つ別のリポジトリが
     ありうる）。問い合わせは SHA がぶつかったときだけで、確かめられなければ付け替えない。
     既知の限界: 窓の外の記録は古い名前のまま残る（取り直しは GitHub の転送で通る）。Issue の候補（#番号）は SHA を
-    持たないので付け替えない。戻り値: (付け替えた後の記録, 保存し直す月, 新しいキー → 古いキーの集合)"""
+    持たないので付け替えない（[漏れ] Issue の目印の照合はする）。新旧のキーの記録がすでに両方あれば、まとめる。戻り値: (付け替えた後の記録, 保存し直す月, 新しいキー → 古いキーの集合)"""
     by_sha = {}
     for k, r in known.items():
         if r.get("kind") in ("fix", "revert") and isinstance(r.get("sha"), str) and isinstance(r.get("repo"), str):
             by_sha.setdefault(r["sha"], []).append(k)
     out, months, aliases = dict(known), set(), {}
+    rank = {"judged": 0, "no-suspect": 0, "secret": 0, "unjudged": 1}
     for c in cands:
         k = c.get("key")
-        if c.get("kind") not in ("fix", "revert") or not k or k in out:
+        if c.get("kind") not in ("fix", "revert") or not k:
             continue
         olds = [o for o in by_sha.get(c.get("sha"), []) if o in out and o != k
                 and out[o]["repo"].split("/")[0].lower() == str(owner).lower()]
@@ -496,7 +497,13 @@ def reconcile_renamed(known, cands, owner, now):
             continue
         r = out.pop(olds[0])
         months.add(month_of(r, now))
-        out[k] = dict(r, repo=c["repo"], key=k)
+        moved = dict(r, repo=c["repo"], key=k)
+        if k in out:  # 新しいキーの記録もすでにある（途中で二重になった）: 判定の進んだほうを残し、通知済みの印を引き継ぐ
+            cur = out[k]
+            months.add(month_of(cur, now))
+            keep = moved if rank.get(moved.get("verdict"), 2) <= rank.get(cur.get("verdict"), 2) else cur
+            moved = dict(keep, repo=c["repo"], key=k, notified=bool(r.get("notified") or cur.get("notified")))
+        out[k] = moved
         aliases[k] = {olds[0]}
     return out, months, aliases
 
@@ -1271,10 +1278,12 @@ def already_marked(r, done, aliases=None):
     確かめられたもの（付け替えた回より後の再試行でも立て直さない）"""
     if r["key"] in done or (aliases or {}).get(r["key"], set()) & done:
         return True
-    if "@" in r["key"]:
-        sha = r["key"].rsplit("@", 1)[1]
-        # 確かめられなければ例外のまま返す（notify はその記録の起票を次回に回す。二重に立てない）
-        return any(renamed_to(d.rsplit("@", 1)[0], r["repo"], strict=True) for d in done if "@" in d and d.rsplit("@", 1)[1] == sha)
+    # 確かめられなければ例外のまま返す（notify はその記録の起票を次回に回す。二重に立てない）
+    for sep in ("@", "#"):  # 修正のコミット（@SHA）と Issue（#番号）
+        if sep in r["key"]:
+            tail = r["key"].rsplit(sep, 1)[1]
+            return any(renamed_to(d.rsplit(sep, 1)[0], r["repo"], strict=True)
+                       for d in done if sep in d and d.rsplit(sep, 1)[1] == tail and d != r["key"])
     return False
 
 

@@ -2203,6 +2203,26 @@ class RepoRename(Run):
         self.assertEqual(len(fake.leak_issues()), 1)
         self.assertFalse(fake.ledgers()["[漏れの記録] 2026-09"][0].get("notified"))  # 次回に再試行
 
+    def test_both_keys_already_present_are_merged(self):  # 両方（途中で二重になっても、次の回でまとめる）
+        old = self.rec("o/old@abcdefb", serious=True, notified=True)
+        new = self.rec("o/new@abcdefb", verdict="unjudged")
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month([old, new], "2026-09")}])
+        fake.api = {"api repos/o/old": json.dumps({"full_name": "o/new", "owner": {"login": "o"}})}
+        self.go(fake, [cand("o/new@abcdefb", "2026-09-30T00:00:00Z")])
+        got = {r["key"]: r for rs in fake.ledgers().values() for r in rs}
+        self.assertEqual(list(got), ["o/new@abcdefb"])
+        self.assertEqual(got["o/new@abcdefb"]["verdict"], "judged")
+        self.assertTrue(got["o/new@abcdefb"]["notified"])
+
+    def test_issue_mark_of_renamed_repo_is_matched(self):  # own-review（Issue の候補の目印も照合する）
+        rec = {"key": "o/new#5", "repo": "o/new", "kind": "issue", "sha": "", "date": "2026-09-30T00:00:00Z", "message": "bug",
+               "verdict": "judged", "serious": True, "notified": False, "suspects": [10]}
+        fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month([rec], "2026-09")},
+                           {"number": 2, "title": "[漏れ] o/old: bug", "body": "本文\n" + lm.leak_mark("o/old#5"), "labels": ["type:fix"]}])
+        fake.api = {"api repos/o/old": json.dumps({"full_name": "o/new", "owner": {"login": "o"}})}
+        self.go(fake, [])
+        self.assertEqual(len(fake.leak_issues()), 1)
+
     def test_migrated_record_follows_the_rekey(self):  # Codex P1（移し替えの覚え書きも付け替える）
         old = self.rec("o/old@abcdef9", verdict="secret", rationale=lm.OLD_SECRET_RATIONALE)
         fake = FakeGitHub([{"number": 1, "title": "[漏れの記録] 2026-09", "body": lm.render_month([old], "2026-09")}])
