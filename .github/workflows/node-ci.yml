@@ -681,9 +681,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Action の ref は Action のコードだけを選び、CLI は version 未指定だと最新版が入る。
+      # 2026-11-14 に CLI 3.43.0 と古い Action の組み合わせで全リポジトリの quality が落ちたため、
+      # Action と CLI を同じ版に固定する（更新するときは両方を同時に上げる）。
       - name: Fallow (コード健全性)
-        uses: fallow-rs/fallow@3cf8074a0e2e91c895c0a4224ba1c3bec4630d65 # v3.14.0
+        uses: fallow-rs/fallow@8cc305d74aeb77b7ab316388f8ab41cce20a394f # v3.43.1
         with:
+          version: 3.43.1
           format: markdown
           fail-on-issues: ${{ needs.detect.outputs.fallow-strict }}
 
