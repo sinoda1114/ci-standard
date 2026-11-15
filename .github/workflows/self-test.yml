@@ -22,6 +22,20 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: DEBUG-TEMP python yaml recursion
+        run: |
+          python3 -I - <<'PY'
+          import sys, yaml, sysconfig
+          print(sys.version, sys.getrecursionlimit(), yaml.__version__, yaml.__file__, getattr(yaml,'__with_libyaml__',None))
+          for n in (1000, 5000, 20000, 100000):
+              try:
+                  yaml.compose("["*n+"]"*n+"\n", Loader=yaml.SafeLoader); print(n, "parsed OK")
+              except RecursionError: print(n, "RecursionError")
+          import json
+          try:
+              json.loads("["*100000+"]"*100000); print("json OK")
+          except RecursionError: print("json RecursionError")
+          PY
       - name: シェル構文
         run: for f in scripts/*.sh scripts/pr-triage/*.sh; do bash -n "$f"; done
       - name: YAML 構文
