@@ -682,7 +682,7 @@ jobs:
           fetch-depth: 0
 
       - name: Fallow (コード健全性)
-        uses: fallow-rs/fallow@3cf8074a0e2e91c895c0a4224ba1c3bec4630d65 # v3.14.0
+        uses: fallow-rs/fallow@8b83a29646e29fcecb4c5c533de08e3fcf9cfcb3 # v3.43.2
         with:
           format: markdown
           fail-on-issues: ${{ needs.detect.outputs.fallow-strict }}
